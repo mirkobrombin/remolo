@@ -20,6 +20,11 @@ type CLI struct {
 	Exec     ExecCmd     `cmd:"" help:"Run a one-shot command on the host"`
 	Put      PutCmd      `cmd:"" help:"Upload a file to the host (resumable)"`
 	Get      GetCmd      `cmd:"" help:"Download a file from the host (resumable)"`
+	Alias    AliasCmd    `cmd:"" help:"Manage saved host aliases (use a name instead of a token)"`
+	Group    GroupCmd    `cmd:"" help:"Manage host groups for fleet exec (remolo exec @group)"`
+	Enroll   EnrollCmd   `cmd:"" help:"Enroll this client key with a host (connect later without a token)"`
+	Revoke   RevokeCmd   `cmd:"" help:"Revoke an enrolled client key (run on the host)"`
+	Token    TokenCmd    `cmd:"" help:"Inspect a token without connecting"`
 	cli.Base
 }
 
