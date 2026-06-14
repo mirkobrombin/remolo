@@ -17,6 +17,9 @@ import (
 type CLI struct {
 	Host     HostCmd     `cmd:"" help:"Start a remolo host and print a shareable session token"`
 	Connect  ConnectCmd  `cmd:"" help:"Connect to a host with a token and open an interactive shell"`
+	Exec     ExecCmd     `cmd:"" help:"Run a one-shot command on the host"`
+	Put      PutCmd      `cmd:"" help:"Upload a file to the host (resumable)"`
+	Get      GetCmd      `cmd:"" help:"Download a file from the host (resumable)"`
 	cli.Base
 }
 
@@ -26,6 +29,14 @@ func main() {
 	// cannot raise net.core.rmem_max without root anyway).
 	if os.Getenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING") == "" {
 		os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
+	}
+
+	// `exec` is special: the command tail may contain dash-flags (ls -la) and an
+	// optional `--` separator, which the declarative flag parser would reject.
+	// Intercept it and pass the tail through verbatim.
+	argv := os.Args[1:]
+	if len(argv) >= 1 && argv[0] == "exec" {
+		os.Exit(runExecRaw(argv[1:]))
 	}
 
 	app, err := cli.New(&CLI{}, cli.WithVersion(session.Version))
