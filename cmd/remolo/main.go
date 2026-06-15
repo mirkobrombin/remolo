@@ -20,6 +20,8 @@ type CLI struct {
 	Exec     ExecCmd     `cmd:"" help:"Run a one-shot command on the host"`
 	Put      PutCmd      `cmd:"" help:"Upload a file to the host (resumable)"`
 	Get      GetCmd      `cmd:"" help:"Download a file from the host (resumable)"`
+	Sessions SessionsCmd `cmd:"" help:"List active reusable connections (mux daemons)"`
+	Mux      MuxCmd      `cmd:"" help:"Inspect/close connection-sharing mux daemons"`
 	Alias    AliasCmd    `cmd:"" help:"Manage saved host aliases (use a name instead of a token)"`
 	Group    GroupCmd    `cmd:"" help:"Manage host groups for fleet exec (remolo exec @group)"`
 	Enroll   EnrollCmd   `cmd:"" help:"Enroll this client key with a host (connect later without a token)"`
