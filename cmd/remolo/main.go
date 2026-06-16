@@ -20,6 +20,9 @@ type CLI struct {
 	Exec     ExecCmd     `cmd:"" help:"Run a one-shot command on the host"`
 	Put      PutCmd      `cmd:"" help:"Upload a file to the host (resumable)"`
 	Get      GetCmd      `cmd:"" help:"Download a file from the host (resumable)"`
+	Sync     SyncCmd     `cmd:"" help:"Incremental directory sync (rsync-like)"`
+	Mount    MountCmd    `cmd:"" help:"Mount the host filesystem locally via FUSE"`
+	Fs       FsCmd       `cmd:"" help:"Interactive remote file browser (ls/cd/get/put)"`
 	Sessions SessionsCmd `cmd:"" help:"List active reusable connections (mux daemons)"`
 	Mux      MuxCmd      `cmd:"" help:"Inspect/close connection-sharing mux daemons"`
 	Alias    AliasCmd    `cmd:"" help:"Manage saved host aliases (use a name instead of a token)"`
