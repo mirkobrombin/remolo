@@ -22,7 +22,10 @@ type CLI struct {
 	Get      GetCmd      `cmd:"" help:"Download a file from the host (resumable)"`
 	Sync     SyncCmd     `cmd:"" help:"Incremental directory sync (rsync-like)"`
 	Mount    MountCmd    `cmd:"" help:"Mount the host filesystem locally via FUSE"`
+	Info     InfoCmd     `cmd:"" help:"Show host system information over RPC"`
+	Rest     RestCmd     `cmd:"" help:"Expose a local REST API proxying to the host"`
 	Fs       FsCmd       `cmd:"" help:"Interactive remote file browser (ls/cd/get/put)"`
+	Forward  ForwardCmd  `cmd:"" help:"Port forwarding: -L local, -D SOCKS5 (over the remolo connection)"`
 	Sessions SessionsCmd `cmd:"" help:"List active reusable connections (mux daemons)"`
 	Mux      MuxCmd      `cmd:"" help:"Inspect/close connection-sharing mux daemons"`
 	Alias    AliasCmd    `cmd:"" help:"Manage saved host aliases (use a name instead of a token)"`
