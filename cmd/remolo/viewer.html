@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>remolo desktop</title>
+<style>
+  @font-face { font-family:'Material Symbols Outlined'; font-style:normal; font-weight:400;
+    src:url(/assets/icons.woff2) format('woff2'); }
+  .mi { font-family:'Material Symbols Outlined'; font-size:20px; line-height:1; font-weight:400;
+    -webkit-font-feature-settings:'liga'; vertical-align:middle; }
+  :root { --bg:#0d0f12; --panel:#15181d; --panel2:#1d2128; --line:#2b313a; --fg:#d2d6dc;
+    --accent:#5fdd7a; --dim:#737b86; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); overflow:hidden;
+    font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #stage { position:absolute; inset:0; overflow:hidden; background:#000; }
+  #screen { position:absolute; top:0; left:0; transform-origin:top left; user-select:none; }
+  #stage.controlling #screen { cursor:none; }
+
+  /* Unified top bar (Windows-remote style), centered, collapsible */
+  #bar { position:fixed; top:0; left:50%; transform:translateX(-50%); z-index:10;
+    display:flex; align-items:center; gap:4px; padding:5px 6px;
+    background:rgba(21,24,29,.96); border:1px solid var(--line); border-top:none;
+    border-radius:0 0 12px 12px; box-shadow:0 6px 24px rgba(0,0,0,.5); transition:padding .15s; }
+  #bar.collapsed #barInner { display:none; }
+  #bar.collapsed { padding:2px 14px; }
+  #barInner { display:flex; align-items:center; gap:4px; flex-wrap:nowrap; }
+  .brand { color:var(--accent); font-weight:700; letter-spacing:.5px; padding:0 6px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); margin:0 2px; }
+  .dot.on { background:var(--accent); box-shadow:0 0 8px var(--accent); }
+  .sep { width:1px; height:22px; background:var(--line); margin:0 3px; }
+  .ib { display:inline-flex; align-items:center; gap:5px; background:var(--panel2); color:var(--fg);
+    border:1px solid var(--line); border-radius:8px; padding:5px 8px; cursor:pointer; font:inherit; }
+  .ib:hover { border-color:var(--accent); color:#fff; }
+  .ib.on { background:var(--accent); color:#0b0e0c; border-color:var(--accent); }
+  .ib:active { transform:translateY(1px); }
+  select { background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:8px;
+    padding:5px; font:inherit; cursor:pointer; }
+  input.num { width:42px; background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:5px; font:inherit; }
+  .lbl { color:var(--dim); font-size:11px; }
+  /* shortcut popover */
+  #scWrap { position:relative; }
+  #scMenu { display:none; position:absolute; top:38px; left:0; background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:6px; gap:4px; flex-wrap:wrap; width:230px; box-shadow:0 8px 30px rgba(0,0,0,.5); }
+  #scMenu.show { display:flex; }
+  #scMenu .ib { padding:5px 7px; }
+
+  /* On-screen keyboard: floating, draggable (pill), scalable */
+  #kbd { position:fixed; left:50%; top:auto; bottom:18px; transform:translateX(-50%) scale(1);
+    transform-origin:top center; z-index:11; display:none;
+    background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:6px 8px 8px;
+    box-shadow:0 12px 44px rgba(0,0,0,.6); }
+  #kbd.show { display:block; }
+  #kbd .bar { display:flex; align-items:center; justify-content:center; gap:8px; padding:2px 0 6px; }
+  #kbd .pill { width:46px; height:6px; border-radius:3px; background:var(--line); cursor:move; }
+  #kbd .pill:hover { background:var(--accent); }
+  #kbd .zoom { display:inline-flex; gap:4px; }
+  #kbd .zoom .mi { font-size:18px; }
+  #kbd .row { display:flex; gap:4px; margin:4px 0; justify-content:center; }
+  #kbd .k { min-width:30px; height:30px; padding:0 6px; display:flex; align-items:center; justify-content:center;
+    background:var(--panel2); border:1px solid var(--line); border-radius:6px; cursor:pointer; font-size:12px; }
+  #kbd .k:hover { border-color:var(--accent); }
+  #kbd .k.mod.armed { background:var(--accent); color:#0b0e0c; border-color:var(--accent); }
+  #kbd .k.wide { min-width:58px; } #kbd .k.xwide { min-width:150px; }
+
+  #cursor { position:absolute; z-index:4; width:14px; height:14px; margin:-7px 0 0 -7px; border-radius:50%;
+    border:2px solid var(--accent); box-shadow:0 0 0 1px rgba(0,0,0,.7), 0 0 7px var(--accent);
+    display:none; pointer-events:none; }
+  #stage.controlling #cursor { display:block; }
+  #hint { position:fixed; bottom:10px; left:50%; transform:translateX(-50%); z-index:9;
+    color:var(--dim); font-size:11px; background:rgba(0,0,0,.5); padding:3px 10px; border-radius:6px;
+    pointer-events:none; transition:opacity .3s; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <img id="screen" src="/stream" draggable="false">
+  <div id="cursor"></div>
+</div>
+
+<div id="bar">
+  <div id="barInner">
+    <span class="brand">remolo</span>
+    <span class="dot" id="dot"></span>
+    <button class="ib" id="ctlBtn" title="Take control (F8 to release)"><span class="mi">mouse</span></button>
+    <div class="sep"></div>
+    <span class="mi" title="Screen" style="color:var(--dim)">monitor</span>
+    <select id="monSel"><option value="-1">all</option></select>
+    <input class="num" id="monCount" type="number" min="1" max="6" value="3" title="Monitor count">
+    <div class="sep"></div>
+    <div id="scWrap">
+      <button class="ib" id="scBtn" title="Send shortcut"><span class="mi">bolt</span></button>
+      <div id="scMenu">
+        <button class="ib" data-combo="ControlLeft,AltLeft,Delete">Ctrl-Alt-Del</button>
+        <button class="ib" data-combo="AltLeft,Tab">Alt-Tab</button>
+        <button class="ib" data-combo="MetaLeft">Super</button>
+        <button class="ib" data-combo="ControlLeft,KeyC">Ctrl-C</button>
+        <button class="ib" data-combo="ControlLeft,KeyV">Ctrl-V</button>
+        <button class="ib" data-combo="ControlLeft,KeyZ">Ctrl-Z</button>
+        <button class="ib" data-combo="Escape">Esc</button>
+        <button class="ib" data-combo="PrintScreen">PrtSc</button>
+      </div>
+    </div>
+    <button class="ib" id="kbdBtn" title="On-screen keyboard"><span class="mi">keyboard</span></button>
+    <button class="ib" id="pasteBtn" title="Type text into the remote"><span class="mi">content_paste</span></button>
+    <div class="sep"></div>
+    <span class="mi" title="Quality" style="color:var(--dim)">tune</span>
+    <select id="qSel" title="Image quality">
+      <option value="50">low</option><option value="70">med</option>
+      <option value="85" selected>high</option><option value="95">max</option>
+    </select>
+    <button class="ib" id="fsBtn" title="Fullscreen"><span class="mi">fullscreen</span></button>
+    <span id="stat" class="lbl" style="padding:0 6px">live</span>
+  </div>
+  <button class="ib" id="collapseBtn" title="Collapse" style="background:none;border:none;padding:4px 6px">
+    <span class="mi" id="collapseIcon">expand_less</span>
+  </button>
+</div>
+
+<div id="kbd">
+  <div class="bar">
+    <span class="zoom"><button class="ib" id="kbdZoomOut" title="Smaller"><span class="mi">zoom_out</span></button></span>
+    <div class="pill" id="kbdPill" title="Drag to move"></div>
+    <span class="zoom"><button class="ib" id="kbdZoomIn" title="Bigger"><span class="mi">zoom_in</span></button>
+      <button class="ib" id="kbdClose" title="Close"><span class="mi">close</span></button></span>
+  </div>
+</div>
+
+<div id="hint">click the screen to control, F8 releases, Alt+wheel switches screen</div>
+
+<script>
+const stage = document.getElementById('stage');
+const screen = document.getElementById('screen');
+const dot = document.getElementById('dot');
+const ctlBtn = document.getElementById('ctlBtn');
+const monSel = document.getElementById('monSel');
+const monCount = document.getElementById('monCount');
+const qSel = document.getElementById('qSel');
+const stat = document.getElementById('stat');
+const kbd = document.getElementById('kbd');
+const hint = document.getElementById('hint');
+
+let controlling = false, monitors = 3, selected = -1;
+let vx = 0.5, vy = 0.5; // virtual absolute cursor (fraction of full screen)
+
+function post(ev){ fetch('/input',{method:'POST',body:JSON.stringify(ev),keepalive:true}).catch(()=>{}); }
+function clamp01(n){ return n < 0 ? 0 : n > 1 ? 1 : n; }
+function combo(codes){ for(const c of codes) post({type:'key',code:c,down:true});
+  for(const c of [...codes].reverse()) post({type:'key',code:c,down:false}); }
+
+// Control state is set immediately (so input always flows); Pointer Lock is a
+// best-effort extra that keeps the cursor from escaping when it engages.
+function setControl(on){
+  controlling = on;
+  stage.classList.toggle('controlling', on);
+  dot.classList.toggle('on', on);
+  ctlBtn.classList.toggle('on', on);
+  hint.style.opacity = on ? '0' : '1';
+  if (on) { placeCursor(); try { if (screen.requestPointerLock) screen.requestPointerLock(); } catch(e){} }
+  else if (document.pointerLockElement === screen) { try { document.exitPointerLock(); } catch(e){} }
+}
+// Losing the lock (Esc) while controlling releases control.
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement !== screen && controlling) setControl(false);
+});
+function locked(){ return document.pointerLockElement === screen; }
+
+// --- monitor crop (visual; input maps via the img rect) ---
+function rebuildMon(){
+  monitors = Math.max(1, Math.min(6, parseInt(monCount.value)||1));
+  monSel.innerHTML = '<option value="-1">all</option>';
+  for (let i=0;i<monitors;i++){ const o=document.createElement('option'); o.value=i; o.textContent='screen '+(i+1); monSel.appendChild(o); }
+  if (selected>=monitors) selected=-1; monSel.value=String(selected); layout();
+}
+function layout(){
+  const r = stage.getBoundingClientRect();
+  const W = screen.naturalWidth||1920, H = screen.naturalHeight||1080;
+  let s,tx,ty;
+  if (selected<0){ s=Math.min(r.width/W,r.height/H); tx=(r.width-W*s)/2; ty=(r.height-H*s)/2; }
+  else { const mw=W/monitors; s=Math.min(r.width/mw,r.height/H); tx=(r.width-mw*s)/2 - selected*mw*s; ty=(r.height-H*s)/2; }
+  screen.style.width=(W*s)+'px'; screen.style.height=(H*s)+'px';
+  screen.style.transform='translate('+tx+'px,'+ty+'px)';
+  if (typeof placeCursor === 'function') placeCursor();
+}
+screen.addEventListener('load', layout);
+window.addEventListener('resize', layout);
+monSel.onchange = () => { selected=parseInt(monSel.value); layout(); };
+monCount.onchange = rebuildMon;
+function cycleScreen(dir){
+  // order: all(-1), 0, 1, ... n-1, then wrap to all
+  selected = selected + dir;
+  if (selected < -1) selected = monitors - 1;
+  if (selected >= monitors) selected = -1;
+  monSel.value = String(selected); layout();
+}
+
+// --- mouse ---
+// updatePos keeps a virtual absolute cursor: relative deltas under Pointer Lock,
+// absolute position otherwise. Works whether or not the lock engaged.
+const cursor = document.getElementById('cursor');
+function placeCursor(){
+  const sr = screen.getBoundingClientRect(), st = stage.getBoundingClientRect();
+  cursor.style.left = (sr.left - st.left + vx * sr.width) + 'px';
+  cursor.style.top  = (sr.top - st.top + vy * sr.height) + 'px';
+}
+function updatePos(e){
+  const r = screen.getBoundingClientRect();
+  if (locked()){ vx = clamp01(vx + e.movementX / r.width); vy = clamp01(vy + e.movementY / r.height); }
+  else { vx = clamp01((e.clientX - r.left) / r.width); vy = clamp01((e.clientY - r.top) / r.height); }
+  placeCursor();
+}
+// Click the screen to take control.
+screen.addEventListener('mousedown', e => { if (!controlling) setControl(true); });
+document.addEventListener('mousemove', e => { if (!controlling) return; updatePos(e); post({type:'mousemove', fx:vx, fy:vy}); });
+document.addEventListener('mousedown', e => { if (!controlling) return; e.preventDefault(); updatePos(e); post({type:'mousebutton',button:e.button,down:true,fx:vx,fy:vy}); });
+document.addEventListener('mouseup', e => { if (!controlling) return; e.preventDefault(); updatePos(e); post({type:'mousebutton',button:e.button,down:false,fx:vx,fy:vy}); });
+document.addEventListener('contextmenu', e => { if (controlling) e.preventDefault(); });
+document.addEventListener('wheel', e => {
+  // Alt+wheel cycles screens locally; otherwise forward to the remote.
+  if (e.altKey){ e.preventDefault(); cycleScreen(e.deltaY > 0 ? 1 : -1); return; }
+  if (controlling){ e.preventDefault(); post({type:'wheel',dy:e.deltaY}); }
+}, {passive:false});
+
+// --- keyboard ---
+window.addEventListener('keydown', e => {
+  if (e.code==='F8'){ e.preventDefault(); setControl(!controlling); return; }
+  if (!controlling) return; e.preventDefault(); post({type:'key',code:e.code,down:true});
+});
+window.addEventListener('keyup', e => { if(!controlling||e.code==='F8') return; e.preventDefault(); post({type:'key',code:e.code,down:false}); });
+
+// --- bar controls ---
+ctlBtn.onclick = () => setControl(!controlling);
+const scMenu = document.getElementById('scMenu');
+document.getElementById('scBtn').onclick = () => scMenu.classList.toggle('show');
+scMenu.querySelectorAll('button[data-combo]').forEach(b => b.onclick = () => { combo(b.dataset.combo.split(',')); scMenu.classList.remove('show'); });
+document.getElementById('fsBtn').onclick = () => { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(()=>{}); };
+document.getElementById('pasteBtn').onclick = () => { const t = prompt('Type text to send to the remote:'); if (t) typeText(t); };
+qSel.onchange = () => fetch('/quality?q='+qSel.value, {method:'POST'}).catch(()=>{});
+const bar = document.getElementById('bar'), collapseIcon = document.getElementById('collapseIcon');
+document.getElementById('collapseBtn').onclick = () => {
+  bar.classList.toggle('collapsed');
+  collapseIcon.textContent = bar.classList.contains('collapsed') ? 'expand_more' : 'expand_less';
+};
+
+// --- on-screen keyboard (generated) ---
+const KBROWS = [
+  ['Escape:Esc','F1','F2','F3','F4','F5','F6','F7','F8:F8','F9','F10','F11','F12'],
+  ['Backquote:`','Digit1:1','Digit2:2','Digit3:3','Digit4:4','Digit5:5','Digit6:6','Digit7:7','Digit8:8','Digit9:9','Digit0:0','Minus:-','Equal:=','Backspace:Bksp@wide'],
+  ['Tab:Tab@wide','KeyQ:q','KeyW:w','KeyE:e','KeyR:r','KeyT:t','KeyY:y','KeyU:u','KeyI:i','KeyO:o','KeyP:p','BracketLeft:[','BracketRight:]','Backslash:bsl'],
+  ['CapsLock:Caps@wide#mod','KeyA:a','KeyS:s','KeyD:d','KeyF:f','KeyG:g','KeyH:h','KeyJ:j','KeyK:k','KeyL:l','Semicolon:;','Quote:apos','Enter:Enter@wide'],
+  ['ShiftLeft:Shift@wide#mod','KeyZ:z','KeyX:x','KeyC:c','KeyV:v','KeyB:b','KeyN:n','KeyM:m','Comma:,','Period:.','Slash:/','ArrowUp:Up'],
+  ['ControlLeft:Ctrl@wide#mod','MetaLeft:Super@wide#mod','AltLeft:Alt@wide#mod','Space:space@xwide','AltRight:Alt#mod','ArrowLeft:Lt','ArrowDown:Dn','ArrowRight:Rt'],
+];
+const armed = new Set();
+function buildKbd(){
+  KBROWS.forEach(row => {
+    const div = document.createElement('div'); div.className='row';
+    row.forEach(spec => {
+      let mod=false,size='';
+      const hi=spec.indexOf('#'); if(hi>=0){ mod=spec.slice(hi+1)==='mod'; spec=spec.slice(0,hi); }
+      const at=spec.indexOf('@'); if(at>=0){ size=spec.slice(at+1); spec=spec.slice(0,at); }
+      let code=spec,label=spec; const co=spec.indexOf(':'); if(co>=0){ code=spec.slice(0,co); label=spec.slice(co+1); }
+      if(label==='apos') label="'"; if(label==='bsl') label='\\';
+      const k=document.createElement('div');
+      k.className='k'+(mod?' mod':'')+(size?' '+size:''); k.textContent=label;
+      k.dataset.code=code; k.dataset.mod=mod?'1':''; k.onclick=()=>onKbdKey(k);
+      div.appendChild(k);
+    });
+    kbd.appendChild(div);
+  });
+}
+function onKbdKey(k){
+  const code=k.dataset.code;
+  if (k.dataset.mod){ if(armed.has(code)){armed.delete(code);k.classList.remove('armed');} else {armed.add(code);k.classList.add('armed');} return; }
+  combo([...armed, code]); armed.clear();
+  kbd.querySelectorAll('.k.mod.armed').forEach(e=>e.classList.remove('armed'));
+}
+buildKbd();
+document.getElementById('kbdBtn').onclick = function(){ kbd.classList.toggle('show'); this.classList.toggle('on'); };
+document.getElementById('kbdClose').onclick = () => { kbd.classList.remove('show'); document.getElementById('kbdBtn').classList.remove('on'); };
+
+// keyboard scale + drag (via pill)
+let kbScale=1, kbLeft=null, kbTop=null;
+function applyKbd(){
+  if (kbLeft===null){ kbd.style.transform='translateX(-50%) scale('+kbScale+')'; }
+  else { kbd.style.left=kbLeft+'px'; kbd.style.top=kbTop+'px'; kbd.style.bottom='auto';
+    kbd.style.transform='scale('+kbScale+')'; }
+}
+document.getElementById('kbdZoomIn').onclick = () => { kbScale=Math.min(2.2,kbScale+0.15); applyKbd(); };
+document.getElementById('kbdZoomOut').onclick = () => { kbScale=Math.max(0.6,kbScale-0.15); applyKbd(); };
+(function(){ const pill=document.getElementById('kbdPill'); let dx=0,dy=0,drag=false;
+  pill.addEventListener('mousedown', e => { drag=true; const r=kbd.getBoundingClientRect(); dx=e.clientX-r.left; dy=e.clientY-r.top; e.preventDefault(); });
+  window.addEventListener('mousemove', e => { if(drag){ kbLeft=e.clientX-dx; kbTop=e.clientY-dy; applyKbd(); } });
+  window.addEventListener('mouseup', () => drag=false);
+})();
+
+// type ASCII via key events (+shift)
+function charToKey(ch){
+  if (ch>='a'&&ch<='z') return {code:'Key'+ch.toUpperCase()};
+  if (ch>='A'&&ch<='Z') return {code:'Key'+ch,shift:true};
+  if (ch>='1'&&ch<='9') return {code:'Digit'+ch};
+  const m={' ':'Space','0':'Digit0','\n':'Enter','\t':'Tab','-':'Minus','=':'Equal','[':'BracketLeft',']':'BracketRight','\\':'Backslash',';':'Semicolon',"'":'Quote','`':'Backquote',',':'Comma','.':'Period','/':'Slash'};
+  if (m[ch]) return {code:m[ch]};
+  const sh={'!':'Digit1','@':'Digit2','#':'Digit3','$':'Digit4','%':'Digit5','^':'Digit6','&':'Digit7','*':'Digit8','(':'Digit9',')':'Digit0','_':'Minus','+':'Equal','{':'BracketLeft','}':'BracketRight','|':'Backslash',':':'Semicolon','"':'Quote','~':'Backquote','<':'Comma','>':'Period','?':'Slash'};
+  if (sh[ch]) return {code:sh[ch],shift:true};
+  return null;
+}
+function typeText(t){ for(const ch of t){ const k=charToKey(ch); if(!k) continue; combo(k.shift?['ShiftLeft',k.code]:[k.code]); } }
+
+screen.addEventListener('load', () => { stat.textContent = monitors+' screen(s)'; });
+screen.addEventListener('error', () => { stat.textContent = 'stream ended'; });
+rebuildMon();
+</script>
+</body>
+</html>

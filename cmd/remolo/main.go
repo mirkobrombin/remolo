@@ -17,6 +17,8 @@ import (
 type CLI struct {
 	Host     HostCmd     `cmd:"" help:"Start a remolo host and print a shareable session token"`
 	Connect  ConnectCmd  `cmd:"" help:"Connect to a host with a token and open an interactive shell"`
+	Desktop  DesktopCmd  `cmd:"" help:"Open a live interactive remote desktop in the browser"`
+	Snapshot SnapshotCmd `cmd:"" help:"Capture N screenshots of the host screen as PNG files"`
 	Exec     ExecCmd     `cmd:"" help:"Run a one-shot command on the host"`
 	Put      PutCmd      `cmd:"" help:"Upload a file to the host (resumable)"`
 	Get      GetCmd      `cmd:"" help:"Download a file from the host (resumable)"`
