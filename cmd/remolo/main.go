@@ -26,6 +26,7 @@ type CLI struct {
 	Mount    MountCmd    `cmd:"" help:"Mount the host filesystem locally via FUSE"`
 	Info     InfoCmd     `cmd:"" help:"Show host system information over RPC"`
 	Rest     RestCmd     `cmd:"" help:"Expose a local REST API proxying to the host"`
+	Webterm  WebtermCmd  `cmd:"" help:"Serve a browser terminal (xterm.js) for the remote shell"`
 	Fs       FsCmd       `cmd:"" help:"Interactive remote file browser (ls/cd/get/put)"`
 	Forward  ForwardCmd  `cmd:"" help:"Port forwarding: -L local, -D SOCKS5 (over the remolo connection)"`
 	Sessions SessionsCmd `cmd:"" help:"List active reusable connections (mux daemons)"`
