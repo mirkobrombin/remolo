@@ -33,9 +33,11 @@ type CLI struct {
 	Mux      MuxCmd      `cmd:"" help:"Inspect/close connection-sharing mux daemons"`
 	Alias    AliasCmd    `cmd:"" help:"Manage saved host aliases (use a name instead of a token)"`
 	Group    GroupCmd    `cmd:"" help:"Manage host groups for fleet exec (remolo exec @group)"`
+	Service  ServiceCmd  `cmd:"" help:"Install/remove remolo host as a background service"`
 	Enroll   EnrollCmd   `cmd:"" help:"Enroll this client key with a host (connect later without a token)"`
 	Revoke   RevokeCmd   `cmd:"" help:"Revoke an enrolled client key (run on the host)"`
 	Token    TokenCmd    `cmd:"" help:"Inspect a token without connecting"`
+
 	cli.Base
 }
 
