@@ -1,0 +1,30 @@
+# nfpm config to build .deb and .rpm packages from the prebuilt binaries.
+# Usage (per arch, after scripts/build.sh):
+#   ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+#   ARCH=arm64 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+name: remolo
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: Mirko Brombin <brombin94@gmail.com>
+description: |
+  Reach a shell, files and the screen of another machine with one token.
+  Start a host, share the token it prints, connect from anywhere, including
+  from behind NAT. Encrypted end to end, with nothing to configure.
+homepage: https://github.com/mirkobrombin/remolo
+license: MIT
+contents:
+  - src: ./dist/remolo-linux-${ARCH}
+    dst: /usr/bin/remolo
+  - src: ./dist/remolo-relay-linux-${ARCH}
+    dst: /usr/bin/remolo-relay
+  - src: ./dist/remolo-rendezvous-linux-${ARCH}
+    dst: /usr/bin/remolo-rendezvous
+  - src: ./docs/remolo.1
+    dst: /usr/share/man/man1/remolo.1
+  - src: ./packaging/systemd/remolo-relay.service
+    dst: /usr/lib/systemd/system/remolo-relay.service
+  - src: ./packaging/systemd/remolo-rendezvous.service
+    dst: /usr/lib/systemd/system/remolo-rendezvous.service

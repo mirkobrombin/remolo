@@ -1,0 +1,28 @@
+# Maintainer: Mirko Brombin <brombin94@gmail.com>
+pkgname=remolo
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Reach a shell, files and the screen of another machine with one token"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mirkobrombin/remolo"
+license=('MIT')
+makedepends=('go')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/mirkobrombin/remolo/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CGO_ENABLED=0
+  go build -trimpath -ldflags "-s -w -X github.com/mirkobrombin/remolo/internal/session.Version=$pkgver" -o remolo ./cmd/remolo
+  go build -trimpath -ldflags "-s -w" -o remolo-relay ./cmd/remolo-relay
+  go build -trimpath -ldflags "-s -w" -o remolo-rendezvous ./cmd/remolo-rendezvous
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 remolo "$pkgdir/usr/bin/remolo"
+  install -Dm755 remolo-relay "$pkgdir/usr/bin/remolo-relay"
+  install -Dm755 remolo-rendezvous "$pkgdir/usr/bin/remolo-rendezvous"
+  install -Dm644 docs/remolo.1 "$pkgdir/usr/share/man/man1/remolo.1"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+}

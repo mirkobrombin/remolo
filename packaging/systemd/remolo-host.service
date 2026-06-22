@@ -1,0 +1,18 @@
+[Unit]
+Description=remolo host (remote control endpoint)
+Documentation=https://github.com/mirkobrombin/remolo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Flags are read from %h/.config/remolo/host.env (REMOLO_HOST_ARGS).
+EnvironmentFile=-%h/.config/remolo/host.env
+ExecStart=%h/.local/bin/remolo host $REMOLO_HOST_ARGS
+Restart=on-failure
+RestartSec=3
+# The session token is written to the journal; read it with:
+#   journalctl --user -u remolo-host -f
+
+[Install]
+WantedBy=default.target
