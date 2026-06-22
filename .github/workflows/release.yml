@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "kind=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+            echo "kind=nightly" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build all binaries (CGO-free, amd64 + arm64)
+        run: ./scripts/build.sh "${{ steps.ver.outputs.version }}"
+
+      - name: SBOM (module inventory)
+        run: go list -m -json all > dist/sbom-modules.json
+
+      - name: Packages (deb/rpm, stable releases)
+        if: steps.ver.outputs.kind == 'stable'
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          export VERSION="${GITHUB_REF_NAME#v}"
+          for arch in amd64 arm64; do
+            ARCH=$arch nfpm package -f packaging/nfpm.yaml -p deb -t dist/ || true
+            ARCH=$arch nfpm package -f packaging/nfpm.yaml -p rpm -t dist/ || true
+          done
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Publish stable release (on tag)
+        if: steps.ver.outputs.kind == 'stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "remolo ${GITHUB_REF_NAME}" \
+            --generate-notes
+
+      - name: Publish rolling nightly release (on push to default branch)
+        if: steps.ver.outputs.kind == 'nightly'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Roll the 'nightly' tag and release forward to this commit.
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly dist/* \
+            --prerelease \
+            --target "${GITHUB_SHA}" \
+            --title "Nightly (${{ steps.ver.outputs.version }})" \
+            --notes "Rolling build from ${GITHUB_SHA}. Verify downloads against SHA256SUMS.txt."
