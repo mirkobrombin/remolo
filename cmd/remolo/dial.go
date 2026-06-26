@@ -51,7 +51,9 @@ func openChannel(ctx context.Context, tok *token.Token, open protocol.Open, opts
 			mark = "✓"
 			extra = fmt.Sprintf(" RTT %s", r.RTT.Round(100*time.Microsecond))
 		}
-		attempts = append(attempts, fmt.Sprintf("[%s %s %s%s]", r.Quality, r.Label, mark, extra))
+		// The label already names the rung ("direct 10.0.0.2:41000", "relay ..."),
+		// so printing the quality alongside it would just stutter.
+		attempts = append(attempts, fmt.Sprintf("[%s %s%s]", r.Label, mark, extra))
 	}
 
 	cl, err := session.ConnectWith(ctx, tok, opts, onResult)
