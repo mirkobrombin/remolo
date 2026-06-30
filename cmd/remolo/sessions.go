@@ -38,14 +38,14 @@ func printSessions() error {
 		fmt.Println("No active sessions.")
 		return nil
 	}
-	fmt.Printf("%-18s %-22s %-12s %-10s %s\n", "SESSION", "HOST", "ROUTE", "PID", "ETA")
+	fmt.Printf("%-18s %-20s %-30s %-9s %s\n", "SESSION", "HOST", "ROUTE", "PID", "UPTIME")
 	for _, s := range sessions {
 		id := s.SessionID
 		if len(id) > 16 {
 			id = id[:16]
 		}
-		age := time.Since(s.Started).Round(time.Second)
-		fmt.Printf("%-18s %-22s %-12s %-10d %s\n", id, hostLabel(s), s.Route, s.PID, age)
+		up := time.Since(s.Started).Round(time.Second)
+		fmt.Printf("%-18s %-20s %-30s %-9d %s\n", id, hostLabel(s), s.Route, s.PID, up)
 	}
 	return nil
 }
