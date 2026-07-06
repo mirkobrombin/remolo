@@ -276,6 +276,14 @@ func (h *Host) handleConn(ctx context.Context, conn transport.Conn) {
 	}
 	switch mode[0] {
 	case 'P':
+		// Enforce the TTL host-side too. The client refuses an expired token,
+		// but a leaked PSK presented straight to the host would otherwise be
+		// accepted forever, making --ttl advisory.
+		if h.tok.Expired() {
+			h.log.Warning("remolo: expired token presented by %s", remote)
+			conn.Close("token expired")
+			return
+		}
 		if _, err := crypto.ServerHandshake(ctrl, h.tok.PSK, h.id.PublicKey()); err != nil {
 			h.log.Warning("remolo: authentication failed from %s: %v", remote, err)
 			conn.Close("authentication failed")
