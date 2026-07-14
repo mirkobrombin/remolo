@@ -9,7 +9,7 @@ Type=simple
 # Override the listen address with: systemctl edit remolo-relay
 # and set Environment=REMOLO_RELAY_ADDR=:8788
 Environment=REMOLO_RELAY_ADDR=:8788
-ExecStart=/usr/local/bin/remolo-relay -addr ${REMOLO_RELAY_ADDR}
+ExecStart=/usr/bin/remolo-relay -addr ${REMOLO_RELAY_ADDR}
 Restart=on-failure
 RestartSec=3
 DynamicUser=yes
