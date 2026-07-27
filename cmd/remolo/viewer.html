@@ -132,7 +132,7 @@
 
 <script>
 const stage = document.getElementById('stage');
-const screen = document.getElementById('screen');
+const scr = document.getElementById('screen');
 const dot = document.getElementById('dot');
 const ctlBtn = document.getElementById('ctlBtn');
 const monSel = document.getElementById('monSel');
@@ -158,14 +158,14 @@ function setControl(on){
   dot.classList.toggle('on', on);
   ctlBtn.classList.toggle('on', on);
   hint.style.opacity = on ? '0' : '1';
-  if (on) { placeCursor(); try { if (screen.requestPointerLock) screen.requestPointerLock(); } catch(e){} }
-  else if (document.pointerLockElement === screen) { try { document.exitPointerLock(); } catch(e){} }
+  if (on) { placeCursor(); try { if (scr.requestPointerLock) scr.requestPointerLock(); } catch(e){} }
+  else if (document.pointerLockElement === scr) { try { document.exitPointerLock(); } catch(e){} }
 }
 // Losing the lock (Esc) while controlling releases control.
 document.addEventListener('pointerlockchange', () => {
-  if (document.pointerLockElement !== screen && controlling) setControl(false);
+  if (document.pointerLockElement !== scr && controlling) setControl(false);
 });
-function locked(){ return document.pointerLockElement === screen; }
+function locked(){ return document.pointerLockElement === scr; }
 
 // --- monitor crop (visual; input maps via the img rect) ---
 function rebuildMon(){
@@ -176,15 +176,15 @@ function rebuildMon(){
 }
 function layout(){
   const r = stage.getBoundingClientRect();
-  const W = screen.naturalWidth||1920, H = screen.naturalHeight||1080;
+  const W = scr.naturalWidth||1920, H = scr.naturalHeight||1080;
   let s,tx,ty;
   if (selected<0){ s=Math.min(r.width/W,r.height/H); tx=(r.width-W*s)/2; ty=(r.height-H*s)/2; }
   else { const mw=W/monitors; s=Math.min(r.width/mw,r.height/H); tx=(r.width-mw*s)/2 - selected*mw*s; ty=(r.height-H*s)/2; }
-  screen.style.width=(W*s)+'px'; screen.style.height=(H*s)+'px';
-  screen.style.transform='translate('+tx+'px,'+ty+'px)';
+  scr.style.width=(W*s)+'px'; scr.style.height=(H*s)+'px';
+  scr.style.transform='translate('+tx+'px,'+ty+'px)';
   if (typeof placeCursor === 'function') placeCursor();
 }
-screen.addEventListener('load', layout);
+scr.addEventListener('load', layout);
 window.addEventListener('resize', layout);
 monSel.onchange = () => { selected=parseInt(monSel.value); layout(); };
 monCount.onchange = rebuildMon;
@@ -201,18 +201,18 @@ function cycleScreen(dir){
 // absolute position otherwise. Works whether or not the lock engaged.
 const cursor = document.getElementById('cursor');
 function placeCursor(){
-  const sr = screen.getBoundingClientRect(), st = stage.getBoundingClientRect();
+  const sr = scr.getBoundingClientRect(), st = stage.getBoundingClientRect();
   cursor.style.left = (sr.left - st.left + vx * sr.width) + 'px';
   cursor.style.top  = (sr.top - st.top + vy * sr.height) + 'px';
 }
 function updatePos(e){
-  const r = screen.getBoundingClientRect();
+  const r = scr.getBoundingClientRect();
   if (locked()){ vx = clamp01(vx + e.movementX / r.width); vy = clamp01(vy + e.movementY / r.height); }
   else { vx = clamp01((e.clientX - r.left) / r.width); vy = clamp01((e.clientY - r.top) / r.height); }
   placeCursor();
 }
 // Click the screen to take control.
-screen.addEventListener('mousedown', e => { if (!controlling) setControl(true); });
+scr.addEventListener('mousedown', e => { if (!controlling) setControl(true); });
 document.addEventListener('mousemove', e => { if (!controlling) return; updatePos(e); post({type:'mousemove', fx:vx, fy:vy}); });
 document.addEventListener('mousedown', e => { if (!controlling) return; e.preventDefault(); updatePos(e); post({type:'mousebutton',button:e.button,down:true,fx:vx,fy:vy}); });
 document.addEventListener('mouseup', e => { if (!controlling) return; e.preventDefault(); updatePos(e); post({type:'mousebutton',button:e.button,down:false,fx:vx,fy:vy}); });
@@ -309,8 +309,8 @@ function charToKey(ch){
 }
 function typeText(t){ for(const ch of t){ const k=charToKey(ch); if(!k) continue; combo(k.shift?['ShiftLeft',k.code]:[k.code]); } }
 
-screen.addEventListener('load', () => { stat.textContent = monitors+' screen(s)'; });
-screen.addEventListener('error', () => { stat.textContent = 'stream ended'; });
+scr.addEventListener('load', () => { stat.textContent = monitors+' screen(s)'; });
+scr.addEventListener('error', () => { stat.textContent = 'stream ended'; });
 rebuildMon();
 </script>
 </body>
