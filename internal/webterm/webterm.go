@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/mirkobrombin/remolo/internal/brand"
 	"github.com/mirkobrombin/remolo/internal/protocol"
 )
 
@@ -96,6 +97,11 @@ func Serve(ctx context.Context, opt Options, open OpenPTY) (url string, wait fun
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/favicon.png", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "max-age=86400")
+		_, _ = w.Write(brand.Icon)
+	})
 	mux.HandleFunc("/output", s.handleOutput)
 	mux.HandleFunc("/input", s.handleInput)
 	mux.HandleFunc("/resize", s.handleResize)

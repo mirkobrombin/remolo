@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/mirkobrombin/go-cli-builder/v2/pkg/cli"
+	"github.com/mirkobrombin/remolo/internal/brand"
 	"github.com/mirkobrombin/remolo/internal/desktop"
 	"github.com/mirkobrombin/remolo/internal/protocol"
 	"github.com/mirkobrombin/remolo/internal/session"
@@ -95,6 +96,11 @@ func (c *DesktopCmd) Run() error {
 		w.Header().Set("Content-Type", "font/woff2")
 		w.Header().Set("Cache-Control", "max-age=86400")
 		w.Write(iconFont)
+	})
+	mux.HandleFunc("/favicon.png", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "max-age=86400")
+		w.Write(brand.Icon)
 	})
 	mux.HandleFunc("/quality", func(w http.ResponseWriter, r *http.Request) {
 		if q, err := strconv.Atoi(r.URL.Query().Get("q")); err == nil {
