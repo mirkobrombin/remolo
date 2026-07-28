@@ -1,5 +1,8 @@
 <div align="center">
-  <h1>remolo</h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/logo-dark.png">
+    <img src="brand/logo-light.png" alt="remolo" width="340">
+  </picture>
   <p>Get a shell, your files and the screen of another machine by pasting one token. Works behind NAT.</p>
 </div>
 
