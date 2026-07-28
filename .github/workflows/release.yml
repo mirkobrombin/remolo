@@ -28,6 +28,12 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             echo "kind=stable" >> "$GITHUB_OUTPUT"
+            # A semver pre-release tag (v1.2.3-alpha.1) must not be published as
+            # the latest stable release.
+            case "${GITHUB_REF_NAME}" in
+              *-*) echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT" ;;
+              *)   echo "prerelease=" >> "$GITHUB_OUTPUT" ;;
+            esac
           else
             echo "version=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
             echo "kind=nightly" >> "$GITHUB_OUTPUT"
@@ -60,6 +66,7 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" dist/* \
             --title "remolo ${GITHUB_REF_NAME}" \
+            ${{ steps.ver.outputs.prerelease }} \
             --generate-notes
 
       - name: Publish rolling nightly release (on push to default branch)
