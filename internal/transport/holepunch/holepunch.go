@@ -15,7 +15,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/pion/stun"
+	"github.com/pion/stun/v3"
 )
 
 // defaultSTUNTimeout bounds a single BINDING transaction when the caller's
