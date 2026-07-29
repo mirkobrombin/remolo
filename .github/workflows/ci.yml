@@ -72,3 +72,29 @@ jobs:
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: Cross-compile matrix (CGO-free)
         run: ./scripts/build.sh
+
+  scan:
+    name: euprovguard scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download euprovguard
+        run: |
+          curl -sL https://github.com/fabricatorsltd/euprovguard/releases/download/v1.1.0/euprovguard-linux-amd64 -o euprovguard
+          chmod +x euprovguard
+      - name: Scan
+        run: |
+          ./euprovguard -path . -bundle compliance-report > scan.log 2>&1
+          cat scan.log
+      - name: Check for CVEs
+        run: |
+          if grep -q "CVEs: [1-9]" scan.log; then
+            echo "::error::CVEs found by euprovguard"
+            exit 1
+          fi
+      - name: Upload compliance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-reports
+          path: compliance-report.*
