@@ -1,0 +1,109 @@
+package remolo.session
+
+import remolo.filetransfer
+import remolo.mux
+import remolo.protocol
+
+task PutFile(
+    $handle mux.Handle,
+    $localPath String,
+    $remotePath String
+) Result<void, Error> {
+    const opening = spawn mux.OpenChannel(
+        $handle,
+        $protocol.NewOpen(.File)
+    )
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        discard localPath
+        discard remotePath
+        return .Err(.Multiplex)
+    }
+    const transferring = spawn filetransfer.Put(
+        $stream,
+        $localPath,
+        $remotePath
+    )
+    const result = $transferring.wait()
+    match result {
+        Ok: .Ok
+        Err(error): {
+            discard error
+            .Err(.FileTransfer)
+        }
+    }
+}
+
+task GetFile(
+    $handle mux.Handle,
+    $remotePath String,
+    $localPath String
+) Result<u64, Error> {
+    const opening = spawn mux.OpenChannel(
+        $handle,
+        $protocol.NewOpen(.File)
+    )
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        discard remotePath
+        discard localPath
+        return .Err(.Multiplex)
+    }
+    const transferring = spawn filetransfer.Get(
+        $stream,
+        $remotePath,
+        $localPath
+    )
+    const result = $transferring.wait()
+    match result {
+        Ok(value): .Ok(value)
+        Err(error): {
+            discard error
+            .Err(.FileTransfer)
+        }
+    }
+}
+
+task ServeFile(
+    $handle mux.Handle,
+    $rootPath String,
+    allowWrite bool
+) Result<void, Error> {
+    const accepting = spawn mux.AcceptChannel($handle)
+    const accepted = $accepting.wait()
+    const channel = accepted else error {
+        discard error
+        discard rootPath
+        return .Err(.Multiplex)
+    }
+    const mux.AcceptedChannel { Open Stream } = channel
+    if !fileKind(Open.Kind) {
+        discard Open
+        discard Stream
+        discard rootPath
+        return .Err(.Protocol)
+    }
+    discard Open
+    const serving = spawn filetransfer.Serve(
+        $Stream,
+        $rootPath,
+        allowWrite
+    )
+    const result = $serving.wait()
+    match result {
+        Ok: .Ok
+        Err(error): {
+            discard error
+            .Err(.FileTransfer)
+        }
+    }
+}
+
+fn fileKind(value protocol.Kind) bool {
+    match value {
+        File: true
+        _: false
+    }
+}

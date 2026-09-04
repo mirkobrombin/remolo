@@ -17,6 +17,7 @@ enum Error {
     Protocol
     Authentication
     Execution
+    FileTransfer
     Storage
 }
 

@@ -1,0 +1,31 @@
+package remolo.filetransfer
+
+import remolo.mux
+import std.fs
+
+enum Error {
+    Filesystem
+    Protocol
+    Storage
+    ReadOnly
+    Integrity
+    Remote
+    InvalidRequest
+}
+
+struct rootHashOutcome {
+    Root own fs.RootWriter
+    Value Result<String, Error>
+}
+
+struct receiveOutcome {
+    Reader own mux.Reader
+    File own fs.File
+    Value Result<u64, Error>
+}
+
+struct ackOutcome {
+    Reader own mux.Reader
+    Value Result<String, Error>
+}
+

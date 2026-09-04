@@ -3,6 +3,8 @@ package remolo.session
 import remolo.protocol
 import std.bytes
 import std.collections
+import std.fs
+import std.text
 import std.time
 
 fn testCapabilities() protocol.Capabilities {
@@ -116,6 +118,170 @@ test "client authentication rejects a changed token secret" {
     expect(host.Close())
 }
 
+test "file transfer uploads, resumes, and rejects writes by policy" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const connected = $connecting.wait()
+    const client = connected else error { panic(sessionFailure(error)) }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const localCreated = fs.CreateTempDirectory(".", "remolo-local-") else {
+        fail("local temporary directory creation failed")
+    }
+    const local = fs.Canonicalize(localCreated) else {
+        fail("local temporary directory resolution failed")
+    }
+    const remoteCreated = fs.CreateTempDirectory(".", "remolo-remote-") else {
+        fail("remote temporary directory creation failed")
+    }
+    const remote = fs.Canonicalize(remoteCreated) else {
+        fail("remote temporary directory resolution failed")
+    }
+    const payload = transferPayload()
+    const source = local + "/source.bin"
+    fs.WriteTextAtomic(source, payload, 262144) else {
+        fail("source write failed")
+    }
+    const remoteNested = remote + "/nested"
+    fs.CreateDirectory(remoteNested) else {
+        fail("remote directory creation failed")
+    }
+    fs.WriteTextAtomic(
+        remoteNested + "/upload.bin",
+        payload + "stale tail",
+        262144
+    ) else {
+        fail("stale remote write failed")
+    }
+
+    const servingPut = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const putting = spawn PutFile(
+        $client.Handle(),
+        $text.Copy(source),
+        $"nested/upload.bin"
+    )
+    const put = $putting.wait()
+    put else error { panic(sessionFailure(error)) }
+    const servedPut = $servingPut.wait()
+    servedPut else error { panic(sessionFailure(error)) }
+
+    const prefixLength u64 = 40960
+    const prefix = text.Slice(payload, 0, prefixLength) else {
+        fail("resume prefix failed")
+    }
+    const destination = local + "/download.bin"
+    fs.WriteTextAtomic(destination, prefix, 262144) else {
+        fail("resume prefix write failed")
+    }
+    const servingGet = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const getting = spawn GetFile(
+        $client.Handle(),
+        $"nested/upload.bin",
+        $text.Copy(destination)
+    )
+    const get = $getting.wait()
+    const total = get else error { panic(sessionFailure(error)) }
+    const servedGet = $servingGet.wait()
+    servedGet else error { panic(sessionFailure(error)) }
+    expect(total == text.ByteLen(payload))
+    const downloaded = fs.ReadBytesSync(destination, 262144) else {
+        fail("download read failed")
+    }
+    const downloadedText = downloaded.Text() else {
+        fail("download text failed")
+    }
+    expect(downloadedText == payload)
+
+    const servingRejected = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        false
+    )
+    const rejectedPut = spawn PutFile(
+        $client.Handle(),
+        $source,
+        $"rejected.bin"
+    )
+    const rejected = $rejectedPut.wait()
+    match rejected {
+        Ok: fail("read-only host accepted an upload")
+        Err(error): expect(fileTransferFailure(error))
+    }
+    const servedRejected = $servingRejected.wait()
+    match servedRejected {
+        Ok: fail("read-only host reported success")
+        Err(error): expect(fileTransferFailure(error))
+    }
+
+    const servingTraversal = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const traversing = spawn GetFile(
+        $client.Handle(),
+        $"../outside.bin",
+        $(local + "/outside.bin")
+    )
+    const traversal = $traversing.wait()
+    match traversal {
+        Ok(value): {
+            discard value
+            fail("path traversal was accepted")
+        }
+        Err(error): expect(fileTransferFailure(error))
+    }
+    const servedTraversal = $servingTraversal.wait()
+    match servedTraversal {
+        Ok: fail("path traversal reported success")
+        Err(error): expect(fileTransferFailure(error))
+    }
+
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    fs.RemoveTree(local, 16, 4) else { fail("local cleanup failed") }
+    fs.RemoveTree(remote, 16, 4) else { fail("remote cleanup failed") }
+}
+
+fn transferPayload() String {
+    var builder = text.NewBuilder()
+    var blocks u64 = 0
+    while blocks < 4097 {
+        const written = builder.Write("0123456789abcdef0123456789abcdef") else {
+            fail("payload builder failed")
+        }
+        discard written
+        blocks += 1
+    }
+    const result = builder.Finish() else { fail("payload finish failed") }
+    result
+}
+
+fn fileTransferFailure(error Error) bool {
+    match error {
+        FileTransfer: true
+        _: false
+    }
+}
+
 fn authenticationFailure(error Error) bool {
     match error {
         Authentication: true
@@ -132,6 +298,7 @@ fn sessionFailure(error Error) String {
         Protocol: "session: protocol"
         Authentication: "session: authentication"
         Execution: "session: execution"
+        FileTransfer: "session: file transfer"
         Storage: "session: storage"
     }
 }

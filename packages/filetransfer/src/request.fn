@@ -1,0 +1,130 @@
+package remolo.filetransfer
+
+import std.bytes
+import std.format
+import std.json
+import std.parse
+import std.text
+
+struct Request {
+    Operation String
+    Path String
+    Offset u64
+    Size u64
+    SHA256 String
+}
+
+fn encodeRequest(value Request) Result<own bytes.Bytes, Error> {
+    var object = json.NewObject()
+    setText(&object, "op", value.Operation) else {
+        return .Err(.Storage)
+    }
+    setText(&object, "path", value.Path) else {
+        return .Err(.Storage)
+    }
+    setU64(&object, "offset", value.Offset) else {
+        return .Err(.Storage)
+    }
+    setU64(&object, "size", value.Size) else {
+        return .Err(.Storage)
+    }
+    setText(&object, "sha256", value.SHA256) else {
+        return .Err(.Storage)
+    }
+    const encoded = json.Stringify($ .Object(object)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(bytes.FromText(encoded))
+}
+
+fn decodeRequest(source bytes.Bytes) Result<Request, Error> {
+    const encoded = source.Text() else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    const parsed = json.Parse(encoded) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    var object = match parsed {
+        Object(value): value
+        _: { return .Err(.Protocol) }
+    }
+    const operation = takeText(&object, "op") else {
+        return .Err(.InvalidRequest)
+    }
+    const path = takeText(&object, "path") else {
+        return .Err(.InvalidRequest)
+    }
+    const offset = takeU64(&object, "offset") else {
+        return .Err(.InvalidRequest)
+    }
+    const size = takeU64(&object, "size") else {
+        return .Err(.InvalidRequest)
+    }
+    const sha256 = takeText(&object, "sha256") else {
+        return .Err(.InvalidRequest)
+    }
+    if text.IsEmpty(path) return .Err(.InvalidRequest)
+    if operation != "put" && operation != "get" {
+        return .Err(.InvalidRequest)
+    }
+    .Ok(Request {
+        Operation = operation
+        Path = path
+        Offset = offset
+        Size = size
+        SHA256 = sha256
+    })
+}
+
+fn setText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, Error> {
+    object.Set($text.Copy(key), $ .Text(text.Copy(value))) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setU64(
+    &object json.Object,
+    key String,
+    value u64
+) Result<void, Error> {
+    object.Set($text.Copy(key), $ .Number(format.U64(value))) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn takeText(&object json.Object, key String) Result<String, Error> {
+    match object.Take(key) {
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.InvalidRequest)
+        }
+        None: .Err(.InvalidRequest)
+    }
+}
+
+fn takeU64(&object json.Object, key String) Result<u64, Error> {
+    match object.Take(key) {
+        Some(value): match value {
+            Number(found): {
+                const parsed = parse.U64(found) else error {
+                    discard error
+                    return .Err(.InvalidRequest)
+                }
+                .Ok(parsed)
+            }
+            _: .Err(.InvalidRequest)
+        }
+        None: .Err(.InvalidRequest)
+    }
+}

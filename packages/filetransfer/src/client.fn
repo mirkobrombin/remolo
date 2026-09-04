@@ -1,0 +1,226 @@
+package remolo.filetransfer
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.fs
+import std.text
+
+task Put(
+    $stream mux.Stream,
+    $localPath String,
+    $remotePath String
+) Result<void, Error> {
+    if text.IsEmpty(remotePath) {
+        discard stream
+        discard localPath
+        discard remotePath
+        return .Err(.InvalidRequest)
+    }
+    const opening = spawn fs.OpenFile($text.Copy(localPath), .Read)
+    const opened = $opening.wait()
+    const source = opened else error {
+        discard error
+        discard stream
+        discard localPath
+        discard remotePath
+        return .Err(.Filesystem)
+    }
+    const sizing = spawn fs.SizeFile($source)
+    const sized = $sizing.wait()
+    const fs.FileSizeOutcome { File Value } = sized
+    const size = Value else error {
+        discard error
+        discard File
+        discard stream
+        discard localPath
+        discard remotePath
+        return .Err(.Filesystem)
+    }
+    const hashing = spawn hashFile($localPath)
+    const hashed = $hashing.wait()
+    const checksum = hashed else error {
+        discard File
+        discard stream
+        discard remotePath
+        return .Err(error)
+    }
+    const request = encodeRequest(Request {
+        Operation = "put"
+        Path = remotePath
+        Offset = 0
+        Size = size
+        SHA256 = text.Copy(checksum)
+    }) else error {
+        discard File
+        discard stream
+        return .Err(error)
+    }
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const requested = spawn writeFrame($Writer, .JSON, $request)
+    const requestResult = $requested.wait()
+    const requestWriter = requestResult else error {
+        discard Reader
+        discard File
+        return .Err(error)
+    }
+    const streaming = spawn sendFile($requestWriter, $File)
+    const streamResult = $streaming.wait()
+    const dataWriter = streamResult else error {
+        discard Reader
+        return .Err(error)
+    }
+    const eof = spawn writeFrame($dataWriter, .EOF, $bytes.FromText(""))
+    const eofResult = $eof.wait()
+    const eofWriter = eofResult else error {
+        discard Reader
+        return .Err(error)
+    }
+    const reading = spawn readAck($Reader)
+    const ack = $reading.wait()
+    const ackOutcome { Reader as restored Value as ackValue } = ack
+    discard restored
+    const remoteChecksum = ackValue else error {
+        discard eofWriter
+        return .Err(error)
+    }
+    const closing = spawn mux.CloseWriter($eofWriter)
+    const closed = $closing.wait()
+    closed else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    if remoteChecksum != checksum return .Err(.Integrity)
+    .Ok
+}
+
+task Get(
+    $stream mux.Stream,
+    $remotePath String,
+    $localPath String
+) Result<u64, Error> {
+    if text.IsEmpty(remotePath) {
+        discard stream
+        discard remotePath
+        discard localPath
+        return .Err(.InvalidRequest)
+    }
+    const offset = existingSize(localPath) else error {
+        discard stream
+        discard remotePath
+        discard localPath
+        return .Err(error)
+    }
+    const opening = spawn fs.OpenFile($text.Copy(localPath), .Write)
+    const opened = $opening.wait()
+    const destination = opened else error {
+        discard error
+        discard stream
+        discard remotePath
+        discard localPath
+        return .Err(.Filesystem)
+    }
+    const seeking = spawn fs.SeekFile($destination, offset)
+    const sought = $seeking.wait()
+    const fs.FileOutcome { File Value } = sought
+    Value else error {
+        discard error
+        discard File
+        discard stream
+        discard remotePath
+        discard localPath
+        return .Err(.Filesystem)
+    }
+    const request = encodeRequest(Request {
+        Operation = "get"
+        Path = remotePath
+        Offset = offset
+        Size = 0
+        SHA256 = ""
+    }) else error {
+        discard File
+        discard stream
+        discard localPath
+        return .Err(error)
+    }
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const requested = spawn writeFrame($Writer, .JSON, $request)
+    const requestResult = $requested.wait()
+    const requestWriter = requestResult else error {
+        discard Reader
+        discard File
+        discard localPath
+        return .Err(error)
+    }
+    const receiving = spawn receiveFile($Reader, $File)
+    const received = $receiving.wait()
+    const receiveOutcome {
+        Reader as dataReader
+        File as writtenFile
+        Value as receiveValue
+    } = received
+    const written = receiveValue else error {
+        discard dataReader
+        discard writtenFile
+        discard requestWriter
+        discard localPath
+        return .Err(error)
+    }
+    const syncing = spawn fs.SyncFile($writtenFile)
+    const synced = $syncing.wait()
+    const fs.FileOutcome { File as syncedFile Value as syncValue } = synced
+    syncValue else error {
+        discard error
+        discard syncedFile
+        discard dataReader
+        discard requestWriter
+        discard localPath
+        return .Err(.Filesystem)
+    }
+    var completedFile = syncedFile
+    discard completedFile.Close()
+    discard completedFile
+    const ackReading = spawn readAck($dataReader)
+    const ack = $ackReading.wait()
+    const ackOutcome { Reader as restored Value as ackValue } = ack
+    discard restored
+    const expected = ackValue else error {
+        discard requestWriter
+        discard localPath
+        return .Err(error)
+    }
+    const closing = spawn mux.CloseWriter($requestWriter)
+    const closed = $closing.wait()
+    closed else error {
+        discard error
+        discard localPath
+        return .Err(.Protocol)
+    }
+    const hashing = spawn hashFile($localPath)
+    const hashed = $hashing.wait()
+    const actual = hashed else error { return .Err(error) }
+    if actual != expected return .Err(.Integrity)
+    .Ok(offset + written)
+}
+
+
+fn existingSize(filePath String) Result<u64, Error> {
+    const kind = fs.Kind(filePath) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    match kind {
+        Missing: .Ok(0)
+        File: {
+            const size = fs.Size(filePath) else error {
+                discard error
+                return .Err(.Filesystem)
+            }
+            .Ok(size)
+        }
+        _: .Err(.Filesystem)
+    }
+}
+

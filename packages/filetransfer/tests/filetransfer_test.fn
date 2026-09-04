@@ -1,0 +1,54 @@
+package remolo.filetransfer
+
+import std.fs
+
+test "file request preserves transfer fields" {
+    const encoded = encodeRequest(Request {
+        Operation = "put"
+        Path = "nested/archive.bin"
+        Offset = 41
+        Size = 97
+        SHA256 = "abc123"
+    }) else error { panic(transferFailure(error)) }
+    const decoded = decodeRequest(encoded) else error {
+        panic(transferFailure(error))
+    }
+    expect(decoded.Operation == "put")
+    expect(decoded.Path == "nested/archive.bin")
+    expect(decoded.Offset == 41)
+    expect(decoded.Size == 97)
+    expect(decoded.SHA256 == "abc123")
+}
+
+test "file hash is lowercase hexadecimal" {
+    const created = fs.CreateTempDirectory(".", "remolo-transfer-") else {
+        fail("temporary directory creation failed")
+    }
+    const directory = fs.Canonicalize(created) else {
+        fail("temporary directory resolution failed")
+    }
+    const source = directory + "/source.txt"
+    fs.WriteTextAtomic(source, "Foundation", 64) else {
+        fail("source write failed")
+    }
+    const pending = spawn hashFile($source)
+    const result = $pending.wait()
+    const checksum = result else error {
+        panic(transferFailure(error))
+    }
+    expect(checksum ==
+        "df42a4d5d3537666f9ed0012c3a44999878842f8d92f2ac056e6df0ca4ac44d1")
+    fs.RemoveTree(directory, 8, 4) else { fail("temporary cleanup failed") }
+}
+
+fn transferFailure(error Error) String {
+    match error {
+        Filesystem: "filetransfer: filesystem"
+        Protocol: "filetransfer: protocol"
+        Storage: "filetransfer: storage"
+        ReadOnly: "filetransfer: read only"
+        Integrity: "filetransfer: integrity"
+        Remote: "filetransfer: remote"
+        InvalidRequest: "filetransfer: invalid request"
+    }
+}
