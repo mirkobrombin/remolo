@@ -1,0 +1,159 @@
+package remolo.codec
+
+import std.bytes
+import std.text
+
+enum CodecError {
+    InvalidEncoding
+    TooLarge
+    Storage
+}
+
+struct decodeState {
+    buffer u64
+    bits u64
+}
+
+fn EncodeCrockford(value bytes.Bytes) Result<String, CodecError> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = text.NewBuilder()
+    var buffer u64 = 0
+    var bits u64 = 0
+    var offset u64 = 0
+    while offset < length {
+        const byte = value.At(offset) else error {
+            discard error
+            return .Err(.Storage)
+        }
+        buffer = buffer << 8 | byte
+        bits += 8
+        while bits >= 5 {
+            bits -= 5
+            writeCodePoint(&output, alphabetAt(buffer >> bits & 31)) else error {
+                return .Err(error)
+            }
+            buffer = lowerBits(buffer, bits)
+        }
+        offset += 1
+    }
+    if bits > 0 {
+        writeCodePoint(&output, alphabetAt(buffer << (5 - bits) & 31)) else error {
+            return .Err(error)
+        }
+    }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn DecodeCrockford(value String, limit u64) Result<own bytes.Bytes, CodecError> {
+    const opened = bytes.NewBuilder(limit) else error {
+        discard error
+        return .Err(.TooLarge)
+    }
+    var output = opened
+    var buffer u64 = 0
+    var bits u64 = 0
+    var symbols u64 = 0
+    var offset u64 = 0
+    const length = text.ByteLen(value)
+    while offset < length {
+        const character = text.ByteAt(value, offset) else error {
+            discard error
+            return .Err(.InvalidEncoding)
+        }
+        if !separator(character) {
+            const digit = crockfordDigit(character) else error {
+                return .Err(error)
+            }
+            const advanced = appendDecodedDigit(
+                &output,
+                decodeState { buffer = buffer bits = bits },
+                digit
+            ) else error {
+                return .Err(error)
+            }
+            buffer = advanced.buffer
+            bits = advanced.bits
+            symbols += 1
+        }
+        offset += 1
+    }
+    const remainder = symbols % 8
+    if remainder == 1 || remainder == 3 || remainder == 6 || buffer != 0 {
+        return .Err(.InvalidEncoding)
+    }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn appendDecodedDigit(
+    &output bytes.Builder,
+    state decodeState,
+    digit u64
+) Result<decodeState, CodecError> {
+    const buffer = state.buffer << 5 | digit
+    if state.bits + 5 < 8 {
+        return .Ok(decodeState { buffer = buffer bits = state.bits + 5 })
+    }
+    const bits = state.bits + 5 - 8
+    output.WriteByte(buffer >> bits & 255) else error {
+        return .Err(builderError(error))
+    }
+    .Ok(decodeState { buffer = lowerBits(buffer, bits) bits = bits })
+}
+
+fn builderError(error bytes.Error) CodecError {
+    match error {
+        TooLarge: .TooLarge
+        _: .Storage
+    }
+}
+
+fn lowerBits(value u64, count u64) u64 {
+    if count == 0 return 0
+    value & ((1 << count) - 1)
+}
+
+fn separator(value u64) bool {
+    value == 45 || value == 32 || value == 9 || value == 10 || value == 13
+}
+
+fn crockfordDigit(value u64) Result<u64, CodecError> {
+    const upper = value - 32 if value >= 97 && value <= 122 else value
+    if upper == 79 return .Ok(0)
+    if upper == 73 || upper == 76 return .Ok(1)
+    if upper >= 48 && upper <= 57 return .Ok(upper - 48)
+    if upper >= 65 && upper <= 72 return .Ok(upper - 55)
+    if upper >= 74 && upper <= 75 return .Ok(upper - 56)
+    if upper >= 77 && upper <= 78 return .Ok(upper - 57)
+    if upper >= 80 && upper <= 84 return .Ok(upper - 58)
+    if upper >= 86 && upper <= 90 return .Ok(upper - 59)
+    .Err(.InvalidEncoding)
+}
+
+fn alphabetAt(index u64) u64 {
+    if index < 10 return index + 48
+    if index < 18 return index + 55
+    if index < 20 return index + 56
+    if index < 22 return index + 57
+    if index < 27 return index + 58
+    index + 59
+}
+
+fn writeCodePoint(&builder text.Builder, value u64) Result<void, CodecError> {
+    const written = builder.WriteCodePoint(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if !written return .Err(.Storage)
+    .Ok
+}
