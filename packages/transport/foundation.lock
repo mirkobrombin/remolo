@@ -1,0 +1,5 @@
+format foundation.lock/v1
+root remolo.transport 1.0.0
+target linux
+package remolo.protocol 1.0.0 sha256:ceed5d67bbfb0ceb32898430acda798dd7e7efefe04931885bfa6d3cb679798f path ../protocol
+edge remolo.transport remolo.protocol
