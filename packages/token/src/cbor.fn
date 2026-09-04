@@ -25,11 +25,8 @@ struct cborReader {
 
     fn ReadLength(&self, additional u64) Result<u64, TokenError> {
         if additional < 24 return .Ok(additional)
-        if additional == 24 return self.ReadByte()
-        if additional == 25 return self.ReadIntegerBytes(2)
-        if additional == 26 return self.ReadIntegerBytes(4)
-        if additional == 27 return self.ReadIntegerBytes(8)
-        .Err(.InvalidCBOR)
+        if additional > 27 return .Err(.InvalidCBOR)
+        self.ReadIntegerBytes(1 << (additional - 24))
     }
 
     fn ReadIntegerBytes(&self, count u64) Result<u64, TokenError> {
