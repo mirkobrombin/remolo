@@ -33,6 +33,58 @@ task ServePeer(
     .Ok
 }
 
+task ServeHost(
+    $host own Host,
+    $rootPath String,
+    allowWrite bool,
+    once bool
+) Result<void, Error> {
+    var active = host
+    const peers = worker.NewSupervisor()
+    while true {
+        const accepting = spawn Accept($active)
+        const accepted = $accepting.wait()
+        const HostAcceptOutcome { Host as restored Value } = accepted
+        active = restored
+        const peer = Value else error {
+            discard active
+            peers.Shutdown()
+            return .Err(error)
+        }
+        if once {
+            const serving = spawn ServePeer(
+                $peer,
+                $rootPath,
+                allowWrite
+            )
+            const result = $serving.wait()
+            discard active.Close()
+            discard active
+            peers.Shutdown()
+            return result
+        }
+        peers.Start(spawn runPeer(
+                $peer,
+                $text.Copy(rootPath),
+                allowWrite
+            ))
+    }
+    .Ok
+}
+
+task runPeer(
+    $peer own Peer,
+    $rootPath String,
+    allowWrite bool
+) void {
+    const serving = spawn ServePeer($peer, $rootPath, allowWrite)
+    const result = $serving.wait()
+    match result {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
 fn channelTask(
     $channel mux.AcceptedChannel,
     $rootPath String,

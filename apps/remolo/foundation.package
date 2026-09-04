@@ -1,0 +1,11 @@
+format foundation.package/v1
+name remolo.cli
+version 1.0.0
+language 1
+fcs standard
+source src
+test_source tests
+dependency remolo.dirsync 1.0.0 path ../../packages/dirsync
+dependency remolo.protocol 1.0.0 path ../../packages/protocol
+dependency remolo.session 1.0.0 path ../../packages/session
+dependency remolo.token 1.0.0 path ../../packages/token

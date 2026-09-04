@@ -7,6 +7,7 @@ import remolo.protocol
 import remolo.token
 import remolo.transport
 import std.bytes
+import std.text
 import std.time
 
 enum Error {
@@ -41,6 +42,16 @@ struct Host {
 struct ListeningHost {
     Host own Host
     Token own token.Token
+}
+
+struct HostOptions {
+    BindAddress String
+    AdvertiseAddress String
+    Port u64
+    IdentityPath String
+    Capabilities protocol.Capabilities
+    Expiry u64
+    Rendezvous String
 }
 
 struct Client {
@@ -146,6 +157,85 @@ fn ListenLocal(
             publicKey = hostKey
             capabilities = capabilities
             expiry = expiry
+        }
+        Token = credential
+    })
+}
+
+task Listen($options HostOptions) Result<ListeningHost, Error> {
+    const HostOptions {
+        BindAddress
+        AdvertiseAddress
+        Port
+        IdentityPath
+        Capabilities
+        Expiry
+        Rendezvous
+    } = options
+    const identityResult = if text.IsEmpty(IdentityPath) {
+        identity.Generate()
+    } else {
+        const loading = spawn identity.LoadOrCreate($IdentityPath)
+        const loaded = $loading.wait()
+        loaded
+    }
+    const generated = identityResult else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const hostKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const tokenKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const listener = transport.ListenSecure(
+        $BindAddress,
+        Port,
+        generated.PrivateKeyPEM
+    ) else error {
+        discard error
+        discard hostKey
+        discard tokenKey
+        return .Err(.Transport)
+    }
+    discard generated
+    const port = u16.From(listener.Port()) else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard tokenKey
+        return .Err(.Transport)
+    }
+    const candidates [1]token.Candidate = [
+        token.Candidate { IP = AdvertiseAddress Port = port }
+    ]
+    const credential = token.New(
+        $tokenKey,
+        candidates,
+        Expiry,
+        Rendezvous
+    ) else error {
+        discard error
+        discard listener
+        discard hostKey
+        return .Err(.Storage)
+    }
+    const psk = credential.PSK.Copy() else error {
+        discard error
+        discard listener
+        discard hostKey
+        return .Err(.Storage)
+    }
+    .Ok(ListeningHost {
+        Host = own Host {
+            listener = listener
+            psk = psk
+            publicKey = hostKey
+            capabilities = Capabilities
+            expiry = Expiry
         }
         Token = credential
     })

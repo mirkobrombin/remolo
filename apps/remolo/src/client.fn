@@ -1,0 +1,142 @@
+package remolo.cli
+
+import remolo.dirsync
+import remolo.protocol
+import remolo.session
+import remolo.token
+import std.collections
+import std.format
+
+fn connectToken(value String) Result<own session.Client, failure> {
+    const credential = token.Decode(value) else error {
+        discard error
+        return .Err(invalid("invalid session token"))
+    }
+    const connecting = spawn session.Connect($credential)
+    const result = $connecting.wait()
+    match result {
+        Ok(client): .Ok(client)
+        Err(error): {
+            discard error
+            .Err(failed("could not connect to the host"))
+        }
+    }
+}
+
+fn commandArguments(args [String], start usize) own collections.List<String> {
+    var result = collections.NewList<String>()
+    var index = len(args)
+    while index > start {
+        index -= 1
+        result.PushFront(argument(args, index))
+    }
+    result
+}
+
+fn runExec(args [String]) Result<i32, failure> {
+    if len(args) < 3 return .Err(invalid("exec requires a token and command"))
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    var descriptor = protocol.NewOpen(.Exec)
+    const empty = replace descriptor.Command with commandArguments(args, 2)
+    discard empty
+    const executing = spawn session.Execute(client.Handle(), $descriptor)
+    const result = $executing.wait()
+    const executed = result else error {
+        discard error
+        session.CloseClient($client)
+        return .Err(failed("remote command failed"))
+    }
+    writeStdoutBytes(executed.Stdout) else error {
+        session.CloseClient($client)
+        return .Err(error)
+    }
+    writeStderrBytes(executed.Stderr) else error {
+        session.CloseClient($client)
+        return .Err(error)
+    }
+    const code = executed.Exit.Code
+    session.CloseClient($client)
+    .Ok(code)
+}
+
+fn runPut(args [String]) Result<i32, failure> {
+    if len(args) != 4 {
+        return .Err(invalid("put requires TOKEN LOCAL REMOTE"))
+    }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const transferring = spawn session.PutFile(
+        client.Handle(),
+        argument(args, 2),
+        argument(args, 3)
+    )
+    const result = $transferring.wait()
+    session.CloseClient($client)
+    result else error {
+        discard error
+        return .Err(failed("upload failed"))
+    }
+    .Ok(0)
+}
+
+fn runGet(args [String]) Result<i32, failure> {
+    if len(args) != 4 {
+        return .Err(invalid("get requires TOKEN REMOTE LOCAL"))
+    }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const transferring = spawn session.GetFile(
+        client.Handle(),
+        argument(args, 2),
+        argument(args, 3)
+    )
+    const result = $transferring.wait()
+    session.CloseClient($client)
+    const received = result else error {
+        discard error
+        return .Err(failed("download failed"))
+    }
+    writeStdoutText(
+        "downloaded " + format.U64(received) + " bytes\n"
+    ) else error { return .Err(error) }
+    .Ok(0)
+}
+
+fn runSync(args [String]) Result<i32, failure> {
+    if len(args) < 4 {
+        return .Err(invalid("sync requires TOKEN LOCAL REMOTE"))
+    }
+    const parsed = parseSyncOptions(args, 4) else error {
+        return .Err(error)
+    }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const noExcludes [0]String = []
+    var options = dirsync.NewOptions(noExcludes)
+    options.Delete = parsed.delete
+    options.DryRun = parsed.dryRun
+    const syncing = if parsed.pull {
+        spawn session.PullDirectory(
+            client.Handle(),
+            argument(args, 3),
+            argument(args, 2),
+            $options
+        )
+    } else {
+        spawn session.PushDirectory(
+            client.Handle(),
+            argument(args, 2),
+            argument(args, 3),
+            $options
+        )
+    }
+    const result = $syncing.wait()
+    session.CloseClient($client)
+    const stats = result else error {
+        discard error
+        return .Err(failed("directory sync failed"))
+    }
+    writeStdoutText(
+        "transferred " + format.U64(stats.FilesTransferred) + "/" +
+        format.U64(stats.FilesConsidered) + " files, " +
+        format.U64(stats.BytesTransferred) + " bytes\n"
+    ) else error { return .Err(error) }
+    .Ok(0)
+}

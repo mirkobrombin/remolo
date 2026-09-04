@@ -1,0 +1,2 @@
+format foundation.workspace/v1
+member remolo apps/remolo

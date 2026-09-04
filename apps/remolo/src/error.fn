@@ -1,0 +1,50 @@
+package remolo.cli
+
+import std.bytes
+import std.io
+import std.text
+
+struct failure {
+    code i32
+    message String
+}
+
+fn invalid(message String) failure {
+    failure { code = 2 message = text.Copy(message) }
+}
+
+fn failed(message String) failure {
+    failure { code = 1 message = text.Copy(message) }
+}
+
+fn writeStdoutText(value String) Result<void, failure> {
+    io.WriteStdoutText(value) else error {
+        discard error
+        return .Err(failed("could not write to standard output"))
+    }
+    .Ok
+}
+
+fn writeStdoutBytes(value bytes.Bytes) Result<void, failure> {
+    io.WriteStdoutBytes(value) else error {
+        discard error
+        return .Err(failed("could not write to standard output"))
+    }
+    .Ok
+}
+
+fn writeStderrBytes(value bytes.Bytes) Result<void, failure> {
+    io.WriteStderrBytes(value) else error {
+        discard error
+        return .Err(failed("could not write to standard error"))
+    }
+    .Ok
+}
+
+fn writeError(value String) void {
+    const result = io.WriteStderrText(value)
+    match result {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}

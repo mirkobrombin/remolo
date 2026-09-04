@@ -1,0 +1,65 @@
+package remolo.cli
+
+enum cliCommand {
+    Host
+    Exec
+    Put
+    Get
+    Sync
+    Help
+}
+
+fn usage() String {
+    "usage:\n" +
+        "  remolo host [--bind HOST:PORT] [--advertise IP] [--ttl SECONDS] " +
+        "[--identity PATH] [--file-root PATH] [--ro] [--once]\n" +
+        "  remolo exec TOKEN COMMAND [ARG...]\n" +
+        "  remolo put TOKEN LOCAL REMOTE\n" +
+        "  remolo get TOKEN REMOTE LOCAL\n" +
+        "  remolo sync TOKEN LOCAL REMOTE [--pull] [--delete] [--dry-run]\n"
+}
+
+fn commandFor(value String) Option<cliCommand> {
+    if value == "host" return .Some(.Host)
+    if value == "exec" return .Some(.Exec)
+    if value == "put" return .Some(.Put)
+    if value == "get" return .Some(.Get)
+    if value == "sync" return .Some(.Sync)
+    if value == "help" || value == "--help" || value == "-h" {
+        return .Some(.Help)
+    }
+    .None
+}
+
+fn executeCommand(command cliCommand, args [String]) Result<i32, failure> {
+    match command {
+        Host: runHost(args)
+        Exec: runExec(args)
+        Put: runPut(args)
+        Get: runGet(args)
+        Sync: runSync(args)
+        Help: {
+            writeStdoutText(usage()) else error { return .Err(error) }
+            .Ok(0)
+        }
+    }
+}
+
+fn execute(args [String]) Result<i32, failure> {
+    if len(args) == 0 return .Err(invalid("expected a command"))
+    const name = argument(args, 0)
+    const command = commandFor(name)
+    match command {
+        Some(value): executeCommand(value, args)
+        None: .Err(invalid("unknown command: " + name))
+    }
+}
+
+fn main(args [String]) i32 {
+    const result = execute(args) else error {
+        writeError("remolo: " + error.message + "\n")
+        if error.code == 2 { writeError(usage()) }
+        return error.code
+    }
+    result
+}

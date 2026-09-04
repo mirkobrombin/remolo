@@ -23,6 +23,43 @@ fn testCapabilities() protocol.Capabilities {
     }
 }
 
+test "host listener uses configured identity and advertised endpoint" {
+    const directory = temporaryDirectory("remolo-host-")
+    const identityPath = directory + "/identity.pem"
+    const expiry = time.Now().Unix() + 3600
+    const pending = spawn Listen($HostOptions {
+        BindAddress = "127.0.0.1"
+        AdvertiseAddress = "10.0.0.8"
+        Port = 0
+        IdentityPath = text.Copy(identityPath)
+        Capabilities = testCapabilities()
+        Expiry = expiry
+        Rendezvous = ""
+    })
+    const listening = $pending.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    var credential = Token
+    expect(host.Port() > 0)
+    expect(credential.Expiry == expiry)
+    expect(credential.Candidates.Len() == 1)
+    const candidate = match credential.Candidates.PopFront() {
+        None: panic("advertised endpoint missing")
+        Some(value): value
+    }
+    expect(candidate.IP == "10.0.0.8")
+    expect(u64.From(candidate.Port) == host.Port())
+    expect(pathExists(identityPath))
+    expect(host.Close())
+    discard host
+    discard credential
+    fs.RemoveTree(directory, 16, 4) else {
+        fail("host listener cleanup failed")
+    }
+}
+
 test "client and host authenticate over pinned multiplexed TLS" {
     const expiry = time.Now().Unix() + 3600
     const listening = ListenLocal($testCapabilities(), expiry) else error {

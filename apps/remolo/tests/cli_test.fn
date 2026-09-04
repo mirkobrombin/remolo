@@ -1,0 +1,94 @@
+package remolo.cli
+
+test "host options preserve defaults" {
+    const args [1]String = ["host"]
+    const options = parseHostOptions(args) else {
+        fail("default host options failed")
+    }
+    expect(options.bindAddress == "0.0.0.0")
+    expect(options.advertiseAddress == "127.0.0.1")
+    expect(options.port == 0)
+    expect(options.ttl == 86400)
+    expect(!options.readOnly)
+    expect(!options.once)
+}
+
+test "host options parse their own flags" {
+    const args [14]String = [
+        "host",
+        "--bind",
+        "127.0.0.1:24001",
+        "--advertise",
+        "10.0.0.8",
+        "--ttl",
+        "90",
+        "--identity",
+        "host.pem",
+        "--file-root",
+        "files",
+        "--rendezvous",
+        "https://rendezvous.example",
+        "--once"
+    ]
+    const options = parseHostOptions(args) else {
+        fail("host option parsing failed")
+    }
+    expect(options.bindAddress == "127.0.0.1")
+    expect(options.advertiseAddress == "10.0.0.8")
+    expect(options.port == 24001)
+    expect(options.ttl == 90)
+    expect(options.identityPath == "host.pem")
+    expect(options.fileRoot == "files")
+    expect(options.rendezvous == "https://rendezvous.example")
+    expect(options.once)
+}
+
+test "host options reject foreign flags" {
+    const args [2]String = ["host", "--pull"]
+    const result = parseHostOptions(args)
+    match result {
+        Ok(options): {
+            discard options
+            fail("foreign host option was accepted")
+        }
+        Err(error): expect(error.code == 2)
+    }
+}
+
+test "sync flags are command specific" {
+    const args [7]String = [
+        "sync",
+        "token",
+        "local",
+        "remote",
+        "--pull",
+        "--delete",
+        "--dry-run"
+    ]
+    const options = parseSyncOptions(args, 4) else {
+        fail("sync option parsing failed")
+    }
+    expect(options.pull)
+    expect(options.delete)
+    expect(options.dryRun)
+}
+
+test "exec keeps the command tail in order" {
+    const args [5]String = ["exec", "token", "ls", "-l", "/tmp"]
+    var command = commandArguments(args, 2)
+    const first = command.PopFront()
+    const second = command.PopFront()
+    const third = command.PopFront()
+    match first {
+        None: fail("first command argument missing")
+        Some(value): expect(value == "ls")
+    }
+    match second {
+        None: fail("second command argument missing")
+        Some(value): expect(value == "-l")
+    }
+    match third {
+        None: fail("third command argument missing")
+        Some(value): expect(value == "/tmp")
+    }
+}
