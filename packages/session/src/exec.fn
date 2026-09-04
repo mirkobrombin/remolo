@@ -1,0 +1,291 @@
+package remolo.session
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.process
+import std.text
+
+struct ExecResult {
+    Exit protocol.Exit
+    Stdout own bytes.Bytes
+    Stderr own bytes.Bytes
+}
+
+task Execute(
+    $handle mux.Handle,
+    $descriptor protocol.Open
+) Result<ExecResult, Error> {
+    if !execKind(descriptor.Kind) return .Err(.Protocol)
+    const opening = spawn mux.OpenChannel($handle, $descriptor)
+    const openedResult = $opening.wait()
+    const opened = openedResult else error {
+        discard error
+        return .Err(.Multiplex)
+    }
+    const mux.Stream { ID Reader Writer } = opened
+    discard ID
+    const closing = spawn mux.CloseWriter($Writer)
+    const closed = $closing.wait()
+    closed else error {
+        discard Reader
+        return .Err(muxError(error))
+    }
+    const stdoutOpened = bytes.NewBuilder(protocol.MaxFramePayload()) else {
+        discard Reader
+        return .Err(.Storage)
+    }
+    const stderrOpened = bytes.NewBuilder(protocol.MaxFramePayload()) else {
+        discard Reader
+        return .Err(.Storage)
+    }
+    var stdout = stdoutOpened
+    var stderr = stderrOpened
+    var reader = Reader
+    var exit = protocol.Exit { Code = -1 Error = "connection closed" }
+    var finished = false
+    while !finished {
+        const reading = spawn mux.ReadFrame($reader)
+        const outcome = $reading.wait()
+        const mux.FrameReadOutcome { Reader as restored Value } = outcome
+        reader = restored
+        const frame = Value else error {
+            discard reader
+            discard stdout
+            discard stderr
+            return .Err(muxError(error))
+        }
+        const protocol.Frame { Type Payload } = frame
+        match Type {
+            Data: {
+                appendOutput(&stdout, Payload) else error {
+                    discard error
+                    discard reader
+                    discard stderr
+                    return .Err(.Storage)
+                }
+            }
+            Stderr: {
+                appendOutput(&stderr, Payload) else error {
+                    discard error
+                    discard reader
+                    discard stdout
+                    return .Err(.Storage)
+                }
+            }
+            Exit: {
+                const decoded = protocol.DecodeExit(Payload) else error {
+                    discard error
+                    discard reader
+                    discard stdout
+                    discard stderr
+                    return .Err(.Protocol)
+                }
+                exit = decoded
+                finished = true
+            }
+            _: {
+                discard Payload
+                discard reader
+                discard stdout
+                discard stderr
+                return .Err(.Protocol)
+            }
+        }
+    }
+    discard reader
+    const stdoutValue = stdout.Finish() else error {
+        discard error
+        discard stderr
+        return .Err(.Storage)
+    }
+    const stderrValue = stderr.Finish() else error {
+        discard error
+        discard stdoutValue
+        return .Err(.Storage)
+    }
+    .Ok(ExecResult {
+        Exit = exit
+        Stdout = stdoutValue
+        Stderr = stderrValue
+    })
+}
+
+task ServeExec($handle mux.Handle) Result<void, Error> {
+    const accepting = spawn mux.AcceptChannel($handle)
+    const acceptedResult = $accepting.wait()
+    const accepted = acceptedResult else error {
+        discard error
+        return .Err(.Multiplex)
+    }
+    const mux.AcceptedChannel { Open Stream } = accepted
+    if !execKind(Open.Kind) {
+        discard Open
+        discard Stream
+        return .Err(.Protocol)
+    }
+    const output = runCommand($Open) else error {
+        discard Stream
+        return .Err(error)
+    }
+    const process.Output { ExitCode Stdout Stderr } = output
+    const mux.Stream { ID Reader Writer } = Stream
+    discard ID
+    discard Reader
+    const stdoutSending = spawn sendFrame($Writer, .Data, $Stdout)
+    const stdoutResult = $stdoutSending.wait()
+    const stdoutWriter = stdoutResult else error {
+        discard Stderr
+        return .Err(error)
+    }
+    const stderrSending = spawn sendFrame($stdoutWriter, .Stderr, $Stderr)
+    const stderrResult = $stderrSending.wait()
+    const stderrWriter = stderrResult else error {
+        return .Err(error)
+    }
+    const exitPayload = protocol.EncodeExit(protocol.Exit {
+        Code = ExitCode
+        Error = ""
+    }) else error {
+        discard stderrWriter
+        discard error
+        return .Err(.Protocol)
+    }
+    const exitSending = spawn sendFrame($stderrWriter, .Exit, $exitPayload)
+    const exitResult = $exitSending.wait()
+    const exitWriter = exitResult else error {
+        return .Err(error)
+    }
+    const closing = spawn mux.CloseWriter($exitWriter)
+    const closed = $closing.wait()
+    match closed {
+        Ok: .Ok
+        Err(error): .Err(muxError(error))
+    }
+}
+
+fn runCommand(
+    $descriptor protocol.Open
+) Result<own process.Output, Error> {
+    const protocol.Open {
+        Kind
+        Cols
+        Rows
+        Command
+        Env
+        Term
+        Dir
+        Target
+        ResumeID
+    } = descriptor
+    discard Kind
+    discard Cols
+    discard Rows
+    discard Term
+    discard Target
+    discard ResumeID
+    var arguments = Command
+    const program = match arguments.PopFront() {
+        None: {
+            discard arguments
+            discard Env
+            return .Err(.Execution)
+        }
+        Some(value): value
+    }
+    var directory Option<String> = .None
+    if !text.IsEmpty(Dir) { directory = .Some(Dir) }
+    const opened = process.Open(program, $process.Options {
+        WorkingDirectory = directory
+        InheritEnvironment = true
+        OutputLimit = protocol.MaxFramePayload()
+    }) else error {
+        discard arguments
+        discard Env
+        return .Err(processError(error))
+    }
+    var command = opened
+    while !arguments.IsEmpty() {
+        const argument = optionString(arguments.PopFront())
+        command.AddArgument(argument) else error {
+            discard arguments
+            discard Env
+            return .Err(processError(error))
+        }
+    }
+    var environment = Env
+    while !environment.IsEmpty() {
+        const value = optionEnvironment(environment.PopFront())
+        command.AddEnvironment(value.Name + "=" + value.Value) else error {
+            discard environment
+            return .Err(processError(error))
+        }
+    }
+    const output = command.Capture() else error {
+        return .Err(processError(error))
+    }
+    .Ok(output)
+}
+
+task sendFrame(
+    $writer own mux.Writer,
+    frameType protocol.FrameType,
+    $payload own bytes.Bytes
+) Result<own mux.Writer, Error> {
+    const sending = spawn mux.WriteFrame($writer, frameType, $payload)
+    const outcome = $sending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Ok(Writer)
+        Err(error): {
+            discard Writer
+            .Err(muxError(error))
+        }
+    }
+}
+
+fn appendOutput(
+    &builder bytes.Builder,
+    value bytes.Bytes
+) Result<void, Error> {
+    builder.Write(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn execKind(value protocol.Kind) bool {
+    match value {
+        Exec: true
+        _: false
+    }
+}
+
+fn optionString($value Option<String>) String {
+    match value {
+        None: panic("command list invariant failed")
+        Some(found): found
+    }
+}
+
+fn optionEnvironment($value Option<protocol.Environment>) protocol.Environment {
+    match value {
+        None: panic("environment list invariant failed")
+        Some(found): found
+    }
+}
+
+fn processError(error process.Error) Error {
+    match error {
+        NotFound: .Execution
+        Permission: .Execution
+        InvalidArgument: .Execution
+        InvalidEnvironment: .Execution
+        InvalidWorkingDirectory: .Execution
+        OutputLimit: .Execution
+        ResourceLimit: .Execution
+        Io: .Execution
+        Closed: .Execution
+    }
+}

@@ -2,6 +2,7 @@ package remolo.session
 
 import remolo.protocol
 import std.bytes
+import std.collections
 import std.time
 
 fn testCapabilities() protocol.Capabilities {
@@ -43,9 +44,42 @@ test "client and host authenticate over pinned multiplexed TLS" {
     expect(capabilities.Hostname == "foundation-host")
     expect(capabilities.Version == "0.1.0")
     expect(bytes.ConstantTimeEqual(client.sessionKey, peer.sessionKey))
+    const serving = spawn ServeExec($peer.Handle())
+    const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const executed = $executing.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("stdout text failed") }
+    const stderr = Stderr.Text() else { fail("stderr text failed") }
+    expect(Exit.Code == 7)
+    expect(Exit.Error == "")
+    expect(stdout == "foundation-exec\n")
+    expect(stderr == "foundation-stderr\n")
     CloseClient($client)
     ClosePeer($peer)
     expect(host.Close())
+}
+
+fn execDescriptor() protocol.Open {
+    var command = collections.NewList<String>()
+    command.PushFront($"printf 'foundation-stderr\\n' >&2; " +
+        "printf 'foundation-exec\\n'; exit 7")
+    command.PushFront($"-c")
+    command.PushFront($"/bin/sh")
+    protocol.Open {
+        Kind = .Exec
+        Cols = 0
+        Rows = 0
+        Command = command
+        Env = collections.NewList<protocol.Environment>()
+        Term = ""
+        Dir = ""
+        Target = ""
+        ResumeID = ""
+    }
 }
 
 test "client authentication rejects a changed token secret" {
@@ -97,6 +131,7 @@ fn sessionFailure(error Error) String {
         Multiplex: "session: multiplex"
         Protocol: "session: protocol"
         Authentication: "session: authentication"
+        Execution: "session: execution"
         Storage: "session: storage"
     }
 }

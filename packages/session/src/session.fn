@@ -16,6 +16,7 @@ enum Error {
     Multiplex
     Protocol
     Authentication
+    Execution
     Storage
 }
 
