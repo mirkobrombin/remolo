@@ -14,6 +14,7 @@ enum Error {
     RemoteGoAway
     Reset
     Closed
+    Protocol
     Transport
 }
 

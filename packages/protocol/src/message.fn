@@ -70,6 +70,79 @@ struct Capabilities {
     Version String
 }
 
+fn CopyCapabilities(value Capabilities) Capabilities {
+    Capabilities {
+        OS = text.Copy(value.OS)
+        Arch = text.Copy(value.Arch)
+        PTY = value.PTY
+        Desktop = value.Desktop
+        Exec = value.Exec
+        File = value.File
+        Hostname = text.Copy(value.Hostname)
+        Version = text.Copy(value.Version)
+    }
+}
+
+fn EncodeCapabilities(
+    value Capabilities
+) Result<own bytes.Bytes, MessageError> {
+    var object = json.NewObject()
+    setText(&object, "os", value.OS) else error { return .Err(error) }
+    setText(&object, "arch", value.Arch) else error { return .Err(error) }
+    setBool(&object, "pty", value.PTY) else error { return .Err(error) }
+    setBool(&object, "desktop", value.Desktop) else error {
+        return .Err(error)
+    }
+    setBool(&object, "exec", value.Exec) else error { return .Err(error) }
+    setBool(&object, "file", value.File) else error { return .Err(error) }
+    setText(&object, "hostname", value.Hostname) else error {
+        return .Err(error)
+    }
+    setText(&object, "version", value.Version) else error {
+        return .Err(error)
+    }
+    encodeJSON($object)
+}
+
+fn DecodeCapabilities(
+    source bytes.Bytes
+) Result<Capabilities, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const os = requiredText(&object, "os") else error { return .Err(error) }
+    const arch = requiredText(&object, "arch") else error {
+        return .Err(error)
+    }
+    const pty = requiredBool(&object, "pty") else error {
+        return .Err(error)
+    }
+    const desktop = requiredBool(&object, "desktop") else error {
+        return .Err(error)
+    }
+    const exec = requiredBool(&object, "exec") else error {
+        return .Err(error)
+    }
+    const file = requiredBool(&object, "file") else error {
+        return .Err(error)
+    }
+    const hostname = requiredText(&object, "hostname") else error {
+        return .Err(error)
+    }
+    const version = requiredText(&object, "version") else error {
+        return .Err(error)
+    }
+    .Ok(Capabilities {
+        OS = os
+        Arch = arch
+        PTY = pty
+        Desktop = desktop
+        Exec = exec
+        File = file
+        Hostname = hostname
+        Version = version
+    })
+}
+
 struct ControlMessage {
     Type String
 }
@@ -297,6 +370,18 @@ fn setNumber(
     .Ok
 }
 
+fn setBool(
+    &object json.Object,
+    key String,
+    value bool
+) Result<void, MessageError> {
+    object.Set($text.Copy(key), $ .Bool(value)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
 fn setU16(
     &object json.Object,
     key String,
@@ -445,6 +530,20 @@ fn requiredI32(
                 }
                 .Ok(result)
             }
+            _: .Err(.InvalidField)
+        }
+    }
+}
+
+fn requiredBool(
+    &object json.Object,
+    key String
+) Result<bool, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Err(.InvalidField)
+        Some(value): match value {
+            Bool(found): .Ok(found)
             _: .Err(.InvalidField)
         }
     }

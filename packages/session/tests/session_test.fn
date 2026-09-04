@@ -1,0 +1,102 @@
+package remolo.session
+
+import remolo.protocol
+import std.bytes
+import std.time
+
+fn testCapabilities() protocol.Capabilities {
+    protocol.Capabilities {
+        OS = "linux"
+        Arch = "amd64"
+        PTY = true
+        Desktop = true
+        Exec = true
+        File = true
+        Hostname = "foundation-host"
+        Version = "0.1.0"
+    }
+}
+
+test "client and host authenticate over pinned multiplexed TLS" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+    const capabilities = client.Capabilities()
+    expect(capabilities.OS == "linux")
+    expect(capabilities.Arch == "amd64")
+    expect(capabilities.PTY)
+    expect(capabilities.Desktop)
+    expect(capabilities.Exec)
+    expect(capabilities.File)
+    expect(capabilities.Hostname == "foundation-host")
+    expect(capabilities.Version == "0.1.0")
+    expect(bytes.ConstantTimeEqual(client.sessionKey, peer.sessionKey))
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+}
+
+test "client authentication rejects a changed token secret" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    var credential = Token
+    const changed = bytes.Random(32) else { fail("secret generation failed") }
+    const original = replace credential.PSK with changed
+    discard original
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($credential)
+    const connected = $connecting.wait()
+    match connected {
+        Ok(client): {
+            CloseClient($client)
+            fail("changed token secret was accepted")
+        }
+        Err(error): expect(authenticationFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    match Value {
+        Ok(peer): {
+            ClosePeer($peer)
+            fail("host accepted changed token secret")
+        }
+        Err(error): { discard error }
+    }
+    expect(host.Close())
+}
+
+fn authenticationFailure(error Error) bool {
+    match error {
+        Authentication: true
+        _: false
+    }
+}
+
+fn sessionFailure(error Error) String {
+    match error {
+        Expired: "session: expired"
+        NoCandidate: "session: no candidate"
+        Transport: "session: transport"
+        Multiplex: "session: multiplex"
+        Protocol: "session: protocol"
+        Authentication: "session: authentication"
+        Storage: "session: storage"
+    }
+}

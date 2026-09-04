@@ -1,0 +1,630 @@
+package remolo.session
+
+import remolo.crypto
+import remolo.identity
+import remolo.mux
+import remolo.protocol
+import remolo.token
+import remolo.transport
+import std.bytes
+import std.time
+
+enum Error {
+    Expired
+    NoCandidate
+    Transport
+    Multiplex
+    Protocol
+    Authentication
+    Storage
+}
+
+struct Host {
+    listener own transport.SecureListener
+    psk own bytes.Bytes
+    publicKey own bytes.Bytes
+    capabilities protocol.Capabilities
+    expiry u64
+
+    fn Port(self) u64 {
+        self.listener.Port()
+    }
+
+    fn Close(&self) bool {
+        self.listener.Close()
+    }
+}
+
+struct ListeningHost {
+    Host own Host
+    Token own token.Token
+}
+
+struct Client {
+    session own mux.Session
+    handle mux.Handle
+    controlReader own mux.Reader
+    controlWriter own mux.Writer
+    sessionKey own bytes.Bytes
+    capabilities protocol.Capabilities
+
+    fn Capabilities(self) protocol.Capabilities {
+        protocol.CopyCapabilities(self.capabilities)
+    }
+
+    fn Handle(self) mux.Handle {
+        self.handle.Clone()
+    }
+}
+
+struct Peer {
+    session own mux.Session
+    handle mux.Handle
+    controlReader own mux.Reader
+    controlWriter own mux.Writer
+    sessionKey own bytes.Bytes
+
+    fn Handle(self) mux.Handle {
+        self.handle.Clone()
+    }
+}
+
+struct HostAcceptOutcome {
+    Host own Host
+    Value Result<own Peer, Error>
+}
+
+struct clientControl {
+    reader own mux.Reader
+    writer own mux.Writer
+    key own bytes.Bytes
+    capabilities protocol.Capabilities
+}
+
+struct hostControl {
+    reader own mux.Reader
+    writer own mux.Writer
+    key own bytes.Bytes
+}
+
+struct rawRead {
+    reader own mux.Reader
+    value own bytes.Bytes
+}
+
+fn ListenLocal(
+    $capabilities protocol.Capabilities,
+    expiry u64
+) Result<ListeningHost, Error> {
+    const generated = identity.Generate() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const hostKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const tokenKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const listener = transport.ListenSecure(
+        $"127.0.0.1",
+        0,
+        generated.PrivateKeyPEM
+    ) else error {
+        discard error
+        return .Err(.Transport)
+    }
+    const port = u16.From(listener.Port()) else error {
+        discard error
+        return .Err(.Transport)
+    }
+    const candidates [1]token.Candidate = [
+        token.Candidate { IP = "127.0.0.1" Port = port }
+    ]
+    const credential = token.New(
+        $tokenKey,
+        candidates,
+        expiry,
+        ""
+    ) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const psk = credential.PSK.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(ListeningHost {
+        Host = own Host {
+            listener = listener
+            psk = psk
+            publicKey = hostKey
+            capabilities = capabilities
+            expiry = expiry
+        }
+        Token = credential
+    })
+}
+
+task Connect($credential own token.Token) Result<own Client, Error> {
+    if credential.Expired() return .Err(.Expired)
+    const token.Token {
+        Version
+        HostPublicKey
+        PSK
+        Candidates
+        SessionID
+        Expiry
+        Rendezvous
+    } = credential
+    discard Version
+    discard SessionID
+    discard Expiry
+    discard Rendezvous
+    var candidates = Candidates
+    const candidate = match candidates.PopFront() {
+        None: {
+            discard HostPublicKey
+            discard PSK
+            return .Err(.NoCandidate)
+        }
+        Some(value): value
+    }
+    const token.Candidate { IP Port } = candidate
+    discard candidates
+    const transportKey = HostPublicKey.Copy() else error {
+        discard error
+        discard HostPublicKey
+        discard PSK
+        return .Err(.Storage)
+    }
+    const dialing = spawn transport.DialSecure(
+        $IP,
+        u64.From(Port),
+        $transportKey
+    )
+    const securedResult = $dialing.wait()
+    const secured = securedResult else error {
+        discard HostPublicKey
+        discard PSK
+        discard error
+        return .Err(.Transport)
+    }
+    var session = mux.NewClient($secured)
+    const handle = session.Handle()
+    const opening = spawn mux.OpenChannel(
+        $handle.Clone(),
+        $protocol.NewOpen(.Control)
+    )
+    const streamResult = $opening.wait()
+    const stream = streamResult else error {
+        mux.Close($session)
+        discard HostPublicKey
+        discard PSK
+        discard error
+        return .Err(.Multiplex)
+    }
+    const authenticating = spawn authenticateClient(
+        $stream,
+        $PSK,
+        $HostPublicKey
+    )
+    const controlResult = $authenticating.wait()
+    const control = controlResult else error {
+        mux.Close($session)
+        return .Err(error)
+    }
+    const clientControl {
+        reader
+        writer
+        key
+        capabilities
+    } = control
+    .Ok(own Client {
+        session = session
+        handle = handle
+        controlReader = reader
+        controlWriter = writer
+        sessionKey = key
+        capabilities = capabilities
+    })
+}
+
+task Accept($host own Host) HostAcceptOutcome {
+    const Host {
+        listener
+        psk
+        publicKey
+        capabilities
+        expiry
+    } = host
+    const accepting = spawn transport.AcceptSecure($listener)
+    const accepted = $accepting.wait()
+    const transport.SecureAcceptOutcome { Listener Value } = accepted
+    const restored = own Host {
+        listener = Listener
+        psk = psk
+        publicKey = publicKey
+        capabilities = capabilities
+        expiry = expiry
+    }
+    const secured = Value else error {
+        discard error
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Transport)
+        }
+    }
+    if time.Now().Unix() > expiry {
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Expired)
+        }
+    }
+    const authPSK = restored.psk.Copy() else error {
+        discard error
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const authKey = restored.publicKey.Copy() else error {
+        discard error
+        discard authPSK
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const encodedCaps = protocol.EncodeCapabilities(
+        restored.capabilities
+    ) else error {
+        discard error
+        discard authPSK
+        discard authKey
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Protocol)
+        }
+    }
+    const authenticating = spawn acceptPeer(
+        $secured,
+        $authPSK,
+        $authKey,
+        $encodedCaps
+    )
+    const peer = $authenticating.wait()
+    HostAcceptOutcome { Host = restored Value = peer }
+}
+
+fn CloseClient($client own Client) void {
+    const Client {
+        session
+        handle
+        controlReader
+        controlWriter
+        sessionKey
+        capabilities
+    } = client
+    discard handle
+    discard controlReader
+    discard controlWriter
+    discard sessionKey
+    discard capabilities
+    mux.Close($session)
+}
+
+fn ClosePeer($peer own Peer) void {
+    const Peer {
+        session
+        handle
+        controlReader
+        controlWriter
+        sessionKey
+    } = peer
+    discard handle
+    discard controlReader
+    discard controlWriter
+    discard sessionKey
+    mux.Close($session)
+}
+
+task acceptPeer(
+    $secured transport.SecureStream,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    $encodedCaps own bytes.Bytes
+) Result<own Peer, Error> {
+    var session = mux.NewServer($secured)
+    const handle = session.Handle()
+    const accepting = spawn mux.AcceptChannel($handle.Clone())
+    const acceptedResult = $accepting.wait()
+    const accepted = acceptedResult else error {
+        mux.Close($session)
+        discard error
+        return .Err(.Multiplex)
+    }
+    if !controlKind(accepted.Open.Kind) {
+        discard accepted
+        mux.Close($session)
+        return .Err(.Protocol)
+    }
+    const mux.AcceptedChannel { Open Stream } = accepted
+    discard Open
+    const authenticating = spawn authenticateHost(
+        $Stream,
+        $psk,
+        $publicKey,
+        $encodedCaps
+    )
+    const controlResult = $authenticating.wait()
+    const control = controlResult else error {
+        mux.Close($session)
+        return .Err(error)
+    }
+    const hostControl { reader writer key } = control
+    .Ok(own Peer {
+        session = session
+        handle = handle
+        controlReader = reader
+        controlWriter = writer
+        sessionKey = key
+    })
+}
+
+task authenticateClient(
+    $stream mux.Stream,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes
+) Result<clientControl, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const modePending = spawn writeRaw($Writer, $bytes.FromText("P"))
+    const startedWriterResult = $modePending.wait()
+    const startedWriter = startedWriterResult else error {
+        discard Reader
+        return .Err(error)
+    }
+    var writer = startedWriter
+    const clientNonce = crypto.GenerateNonce() else error {
+        discard Reader
+        discard writer
+        return .Err(handshakeError(error))
+    }
+    const nonceWire = clientNonce.Copy() else error {
+        discard error
+        discard Reader
+        discard writer
+        return .Err(.Storage)
+    }
+    const noncePending = spawn writeRaw($writer, $nonceWire)
+    const nonceWriterResult = $noncePending.wait()
+    const nonceWriter = nonceWriterResult else error {
+        discard Reader
+        return .Err(error)
+    }
+    writer = nonceWriter
+    const responsePending = spawn readRaw($Reader, 64)
+    const responseResult = $responsePending.wait()
+    const response = responseResult else error {
+        discard writer
+        return .Err(error)
+    }
+    const rawRead {
+        reader as responseReader
+        value as responseValue
+    } = response
+    var reader = responseReader
+    const finished = crypto.FinishClient(
+        psk,
+        publicKey,
+        clientNonce,
+        responseValue
+    ) else error {
+        discard reader
+        discard writer
+        return .Err(handshakeError(error))
+    }
+    const crypto.ClientFinish { Proof SessionKey } = finished
+    const proofPending = spawn writeRaw($writer, $Proof)
+    const proofWriterResult = $proofPending.wait()
+    const proofWriter = proofWriterResult else error {
+        discard reader
+        discard SessionKey
+        return .Err(error)
+    }
+    writer = proofWriter
+    const capsPending = spawn mux.ReadFrame($reader)
+    const capsOutcome = $capsPending.wait()
+    const mux.FrameReadOutcome { Reader as restored Value } = capsOutcome
+    const frame = Value else error {
+        discard restored
+        discard writer
+        discard SessionKey
+        return .Err(muxError(error))
+    }
+    const protocol.Frame { Type Payload } = frame
+    const capabilities = match Type {
+        JSON: protocol.DecodeCapabilities(Payload)
+        _: .Err(.InvalidFrame)
+    } else error {
+        discard restored
+        discard writer
+        discard SessionKey
+        discard error
+        return .Err(.Protocol)
+    }
+    .Ok(clientControl {
+        reader = restored
+        writer = writer
+        key = SessionKey
+        capabilities = capabilities
+    })
+}
+
+task authenticateHost(
+    $stream mux.Stream,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    $encodedCaps own bytes.Bytes
+) Result<hostControl, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const modePending = spawn readRaw($Reader, 1)
+    const modeResult = $modePending.wait()
+    const modeRead = modeResult else error {
+        discard Writer
+        return .Err(error)
+    }
+    const rawRead { reader as modeReader value as modeValue } = modeRead
+    var reader = modeReader
+    const mode = modeValue.At(0) else error {
+        discard error
+        discard reader
+        discard Writer
+        return .Err(.Protocol)
+    }
+    if mode != 80 {
+        discard reader
+        discard Writer
+        return .Err(.Authentication)
+    }
+    const noncePending = spawn readRaw($reader, 32)
+    const nonceResult = $noncePending.wait()
+    const nonceRead = nonceResult else error {
+        discard Writer
+        return .Err(error)
+    }
+    const rawRead { reader as nonceReader value as clientNonce } = nonceRead
+    reader = nonceReader
+    const hostNonce = crypto.GenerateNonce() else error {
+        discard reader
+        discard Writer
+        return .Err(handshakeError(error))
+    }
+    const response = crypto.HostResponse(
+        psk,
+        publicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        discard reader
+        discard Writer
+        return .Err(handshakeError(error))
+    }
+    const responsePending = spawn writeRaw($Writer, $response)
+    const startedWriterResult = $responsePending.wait()
+    const startedWriter = startedWriterResult else error {
+        discard reader
+        return .Err(error)
+    }
+    var writer = startedWriter
+    const proofPending = spawn readRaw($reader, 32)
+    const proofResult = $proofPending.wait()
+    const proofRead = proofResult else error {
+        discard writer
+        return .Err(error)
+    }
+    const rawRead { reader as proofReader value as proofValue } = proofRead
+    reader = proofReader
+    const sessionKey = crypto.FinishHost(
+        psk,
+        publicKey,
+        clientNonce,
+        hostNonce,
+        proofValue
+    ) else error {
+        discard reader
+        discard writer
+        return .Err(handshakeError(error))
+    }
+    const capsPending = spawn mux.WriteFrame($writer, .JSON, $encodedCaps)
+    const capsOutcome = $capsPending.wait()
+    const mux.WriteOutcome { Writer as restored Value } = capsOutcome
+    match Value {
+        Ok: .Ok(hostControl {
+            reader = reader
+            writer = restored
+            key = sessionKey
+        })
+        Err(error): {
+            discard reader
+            discard restored
+            discard sessionKey
+            .Err(muxError(error))
+        }
+    }
+}
+
+task writeRaw(
+    $writer own mux.Writer,
+    $value own bytes.Bytes
+) Result<own mux.Writer, Error> {
+    const pending = spawn mux.WriteAll($writer, $value)
+    const outcome = $pending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Ok(Writer)
+        Err(error): {
+            discard Writer
+            .Err(muxError(error))
+        }
+    }
+}
+
+task readRaw(
+    $reader own mux.Reader,
+    length u64
+) Result<rawRead, Error> {
+    const pending = spawn mux.ReadExact($reader, length)
+    const outcome = $pending.wait()
+    const mux.ReadOutcome { Reader Value } = outcome
+    match Value {
+        Ok(value): .Ok(rawRead { reader = Reader value = value })
+        Err(error): {
+            discard Reader
+            .Err(muxError(error))
+        }
+    }
+}
+
+fn controlKind(value protocol.Kind) bool {
+    match value {
+        Control: true
+        _: false
+    }
+}
+
+fn handshakeError(error crypto.HandshakeError) Error {
+    match error {
+        InvalidCredential: .Authentication
+        InvalidMessage: .Protocol
+        AuthenticationFailed: .Authentication
+        Storage: .Storage
+        EntropyUnavailable: .Storage
+    }
+}
+
+fn muxError(error mux.Error) Error {
+    match error {
+        InvalidVersion: .Multiplex
+        InvalidType: .Multiplex
+        InvalidFlags: .Multiplex
+        InvalidStream: .Multiplex
+        InvalidLength: .Multiplex
+        DuplicateStream: .Multiplex
+        StreamsExhausted: .Multiplex
+        ReceiveWindowExceeded: .Multiplex
+        RemoteGoAway: .Multiplex
+        Reset: .Multiplex
+        Closed: .Transport
+        Protocol: .Protocol
+        Transport: .Transport
+    }
+}

@@ -17,6 +17,7 @@ struct Reader {
     id u64
     inbox Receiver<streamEvent>
     control Sender<request>
+    pending own bytes.Bytes
 }
 
 @concurrent.Transferable()
@@ -235,7 +236,34 @@ task accept($control Sender<request>) Result<Stream, Error> {
 }
 
 task Read($reader own Reader) ReadOutcome {
-    const Reader { id inbox control } = reader
+    const Reader { id inbox control pending } = reader
+    const pendingLength = pending.Len() else error {
+        discard error
+        return ReadOutcome {
+            Reader = own Reader {
+                id = id
+                inbox = inbox
+                control = control
+                pending = pending
+            }
+            Value = .Err(.Transport)
+        }
+    }
+    if pendingLength > 0 {
+        discard control.send(.Consumed(value = consumedRequest {
+            id = id
+            length = pendingLength
+        }))
+        return ReadOutcome {
+            Reader = own Reader {
+                id = id
+                inbox = inbox
+                control = control
+                pending = bytes.FromText("")
+            }
+            Value = .Ok(pending)
+        }
+    }
     const received = inbox.receive()
     match received {
         Ok(event): match event {
@@ -243,7 +271,12 @@ task Read($reader own Reader) ReadOutcome {
                 const length = value.Len() else error {
                     discard error
                     return ReadOutcome {
-                        Reader = own Reader { id = id inbox = inbox control = control }
+                        Reader = own Reader {
+                            id = id
+                            inbox = inbox
+                            control = control
+                            pending = pending
+                        }
                         Value = .Err(.Transport)
                     }
                 }
@@ -252,23 +285,202 @@ task Read($reader own Reader) ReadOutcome {
                     length = length
                 }))
                 ReadOutcome {
-                    Reader = own Reader { id = id inbox = inbox control = control }
+                    Reader = own Reader {
+                        id = id
+                        inbox = inbox
+                        control = control
+                        pending = pending
+                    }
                     Value = .Ok(value)
                 }
             }
             Fin: ReadOutcome {
-                Reader = own Reader { id = id inbox = inbox control = control }
+                Reader = own Reader {
+                    id = id
+                    inbox = inbox
+                    control = control
+                    pending = pending
+                }
                 Value = .Err(.Closed)
             }
             Reset: ReadOutcome {
-                Reader = own Reader { id = id inbox = inbox control = control }
+                Reader = own Reader {
+                    id = id
+                    inbox = inbox
+                    control = control
+                    pending = pending
+                }
                 Value = .Err(.Reset)
             }
         }
         Err(error): ReadOutcome {
-            Reader = own Reader { id = id inbox = inbox control = control }
+            Reader = own Reader {
+                id = id
+                inbox = inbox
+                control = control
+                pending = pending
+            }
             Value = .Err(channelError(error))
         }
+    }
+}
+
+task ReadExact($reader own Reader, length u64) ReadOutcome {
+    const Reader { id inbox control pending } = reader
+    const opened = bytes.NewBuilder(length) else error {
+        discard error
+        return ReadOutcome {
+            Reader = own Reader {
+                id = id
+                inbox = inbox
+                control = control
+                pending = pending
+            }
+            Value = .Err(.Transport)
+        }
+    }
+    var builder = opened
+    var buffered = pending
+    var written u64 = 0
+    while written < length {
+        const available = buffered.Len() else error {
+            discard error
+            return ReadOutcome {
+                Reader = own Reader {
+                    id = id
+                    inbox = inbox
+                    control = control
+                    pending = buffered
+                }
+                Value = .Err(.Transport)
+            }
+        }
+        if available == 0 {
+            const received = inbox.receive()
+            const next = match received {
+                Ok(event): match event {
+                    Data(value): value
+                    Fin: {
+                        return ReadOutcome {
+                            Reader = own Reader {
+                                id = id
+                                inbox = inbox
+                                control = control
+                                pending = buffered
+                            }
+                            Value = .Err(.Closed)
+                        }
+                    }
+                    Reset: {
+                        return ReadOutcome {
+                            Reader = own Reader {
+                                id = id
+                                inbox = inbox
+                                control = control
+                                pending = buffered
+                            }
+                            Value = .Err(.Reset)
+                        }
+                    }
+                }
+                Err(error): {
+                    return ReadOutcome {
+                        Reader = own Reader {
+                            id = id
+                            inbox = inbox
+                            control = control
+                            pending = buffered
+                        }
+                        Value = .Err(channelError(error))
+                    }
+                }
+            }
+            buffered = next
+        }
+        const bufferedLength = buffered.Len() else error {
+            discard error
+            return ReadOutcome {
+                Reader = own Reader {
+                    id = id
+                    inbox = inbox
+                    control = control
+                    pending = buffered
+                }
+                Value = .Err(.Transport)
+            }
+        }
+        var taken = length - written
+        if taken > bufferedLength { taken = bufferedLength }
+        const part = buffered.Slice(0, taken) else error {
+            discard error
+            return ReadOutcome {
+                Reader = own Reader {
+                    id = id
+                    inbox = inbox
+                    control = control
+                    pending = buffered
+                }
+                Value = .Err(.Transport)
+            }
+        }
+        builder.Write(part) else error {
+            discard error
+            return ReadOutcome {
+                Reader = own Reader {
+                    id = id
+                    inbox = inbox
+                    control = control
+                    pending = buffered
+                }
+                Value = .Err(.Transport)
+            }
+        }
+        discard control.send(.Consumed(value = consumedRequest {
+            id = id
+            length = taken
+        }))
+        written += taken
+        if taken == bufferedLength {
+            buffered = bytes.FromText("")
+        } else {
+            const remainder = buffered.Slice(
+                taken,
+                bufferedLength
+            ) else error {
+                discard error
+                return ReadOutcome {
+                    Reader = own Reader {
+                        id = id
+                        inbox = inbox
+                        control = control
+                        pending = buffered
+                    }
+                    Value = .Err(.Transport)
+                }
+            }
+            buffered = remainder
+        }
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return ReadOutcome {
+            Reader = own Reader {
+                id = id
+                inbox = inbox
+                control = control
+                pending = buffered
+            }
+            Value = .Err(.Transport)
+        }
+    }
+    ReadOutcome {
+        Reader = own Reader {
+            id = id
+            inbox = inbox
+            control = control
+            pending = buffered
+        }
+        Value = .Ok(result)
     }
 }
 
@@ -986,6 +1198,7 @@ fn createStream(
                 id = id
                 inbox = receiver
                 control = control.clone()
+                pending = bytes.FromText("")
             }
             Writer = own Writer { id = id control = control }
         }

@@ -139,6 +139,35 @@ test "yamux multiplexes streams over pinned TLS" {
     expect(firstValue == "first stream")
     expect(secondValue == "second stream")
 
+    const exactWriting = spawn WriteAll(
+        $firstWriter,
+        $bytes.FromText("headerbody")
+    )
+    const headerReading = spawn ReadExact($firstReader, 6)
+    const exactWrite = $exactWriting.wait()
+    const headerRead = $headerReading.wait()
+    const WriteOutcome {
+        Writer as exactWriter
+        Value as exactWriteValue
+    } = exactWrite
+    const ReadOutcome {
+        Reader as headerReader
+        Value as headerValue
+    } = headerRead
+    expectWrite($exactWriteValue)
+    const headerBytes = headerValue else error { panic(muxFailure(error)) }
+    const headerText = headerBytes.Text() else { fail("header text failed") }
+    expect(headerText == "header")
+    const bodyReading = spawn ReadExact($headerReader, 4)
+    const bodyRead = $bodyReading.wait()
+    const ReadOutcome {
+        Reader as exactReader
+        Value as bodyValue
+    } = bodyRead
+    const bodyBytes = bodyValue else error { panic(muxFailure(error)) }
+    const bodyText = bodyBytes.Text() else { fail("body text failed") }
+    expect(bodyText == "body")
+
     const payload = largePayload()
     const flowing = spawn WriteAll($secondWriter, $payload)
     var flowReader = secondReader
@@ -162,7 +191,7 @@ test "yamux multiplexes streams over pinned TLS" {
     expectWrite($flowValue)
     expect(received == 262145)
 
-    const closingFirst = spawn CloseWriter($firstWriter)
+    const closingFirst = spawn CloseWriter($exactWriter)
     const closingSecond = spawn CloseWriter($flowWriter)
     const firstClosed = $closingFirst.wait()
     const secondClosed = $closingSecond.wait()
@@ -170,7 +199,7 @@ test "yamux multiplexes streams over pinned TLS" {
     expectWrite($secondClosed)
     discard firstClientReader
     discard secondClientReader
-    discard firstReader
+    discard exactReader
     discard flowReader
     discard firstServerWriter
     discard secondServerWriter
@@ -226,6 +255,7 @@ fn muxFailure(error Error) String {
         RemoteGoAway: "mux: remote go away"
         Reset: "mux: reset"
         Closed: "mux: closed"
+        Protocol: "mux: protocol"
         Transport: "mux: transport"
     }
 }

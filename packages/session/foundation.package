@@ -1,0 +1,13 @@
+format foundation.package/v1
+name remolo.session
+version 1.0.0
+language 1
+fcs standard
+source src
+test_source tests
+dependency remolo.crypto 1.0.0 path ../crypto
+dependency remolo.identity 1.0.0 path ../identity
+dependency remolo.mux 1.0.0 path ../mux
+dependency remolo.protocol 1.0.0 path ../protocol
+dependency remolo.token 1.0.0 path ../token
+dependency remolo.transport 1.0.0 path ../transport

@@ -5,5 +5,5 @@ language 1
 fcs standard
 source src
 test_source tests
+dependency remolo.protocol 1.0.0 path ../protocol
 dependency remolo.transport 1.0.0 path ../transport
-
