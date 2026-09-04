@@ -1,0 +1,165 @@
+package remolo.identity
+
+import std.bytes
+import std.text
+
+fn GenerateAuthNonce() Result<own bytes.Bytes, IdentityError> {
+    const result = bytes.Random(32) else error {
+        discard error
+        return .Err(.EntropyUnavailable)
+    }
+    .Ok(result)
+}
+
+fn HostSignature(
+    host Identity,
+    clientRawPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes
+) Result<own bytes.Bytes, IdentityError> {
+    validateTranscriptInputs(
+        host.RawPublicKey,
+        clientRawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    const message = transcript(
+        "remolo-clientkey-host-v1",
+        host.RawPublicKey,
+        clientRawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    host.Sign(message)
+}
+
+fn ClientSignature(
+    client Identity,
+    hostPublicKeyPEM bytes.Bytes,
+    hostRawPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes,
+    hostSignature bytes.Bytes
+) Result<own bytes.Bytes, IdentityError> {
+    validateTranscriptInputs(
+        hostRawPublicKey,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    const hostMessage = transcript(
+        "remolo-clientkey-host-v1",
+        hostRawPublicKey,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    Verify(hostPublicKeyPEM, hostMessage, hostSignature) else error {
+        return .Err(error)
+    }
+    const clientMessage = transcript(
+        "remolo-clientkey-client-v1",
+        hostRawPublicKey,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    client.Sign(clientMessage)
+}
+
+fn VerifyClientSignature(
+    clientPublicKeyPEM bytes.Bytes,
+    hostRawPublicKey bytes.Bytes,
+    clientRawPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes,
+    clientSignature bytes.Bytes
+) Result<void, IdentityError> {
+    validateTranscriptInputs(
+        hostRawPublicKey,
+        clientRawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    const message = transcript(
+        "remolo-clientkey-client-v1",
+        hostRawPublicKey,
+        clientRawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    Verify(clientPublicKeyPEM, message, clientSignature)
+}
+
+fn transcript(
+    label String,
+    hostRawPublicKey bytes.Bytes,
+    clientRawPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes
+) Result<own bytes.Bytes, IdentityError> {
+    const opened = bytes.NewBuilder(text.ByteLen(label) + 128) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var builder = opened
+    write(&builder, bytes.FromText(label)) else error { return .Err(error) }
+    write(&builder, hostRawPublicKey) else error { return .Err(error) }
+    write(&builder, clientRawPublicKey) else error { return .Err(error) }
+    write(&builder, clientNonce) else error { return .Err(error) }
+    write(&builder, hostNonce) else error { return .Err(error) }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn validateTranscriptInputs(
+    hostRawPublicKey bytes.Bytes,
+    clientRawPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes
+) Result<void, IdentityError> {
+    validateLength(hostRawPublicKey, 32) else error { return .Err(error) }
+    validateLength(clientRawPublicKey, 32) else error { return .Err(error) }
+    validateLength(clientNonce, 32) else error { return .Err(error) }
+    validateLength(hostNonce, 32)
+}
+
+fn validateLength(
+    value bytes.Bytes,
+    expected u64
+) Result<void, IdentityError> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if length != expected return .Err(.InvalidKey)
+    .Ok
+}
+
+fn write(
+    &builder bytes.Builder,
+    value bytes.Bytes
+) Result<void, IdentityError> {
+    builder.Write(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
