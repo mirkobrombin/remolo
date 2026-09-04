@@ -1,0 +1,277 @@
+package remolo.dirsync
+
+struct blockCandidate {
+    signature BlockSignature
+    next Option<own blockCandidate>
+}
+
+struct weakNode {
+    zero Option<own weakNode>
+    one Option<own weakNode>
+    candidates Option<own blockCandidate>
+}
+
+struct weakIndex {
+    root own weakNode
+
+    fn Insert(&self, signature BlockSignature) void {
+        const current = replace self.root with newWeakNode()
+        self.root = insertWeakNode($current, signature.Weak, 0, signature)
+    }
+
+    fn Find(
+        &self,
+        weak u64,
+        strongHigh u64,
+        strongLow u64
+    ) Option<u64> {
+        const current = replace self.root with newWeakNode()
+        const outcome = findWeakNode(
+            $current,
+            weak,
+            strongHigh,
+            strongLow,
+            0
+        )
+        const weakFindOutcome { Node Index } = outcome
+        self.root = Node
+        Index
+    }
+
+    fn Has(&self, weak u64) bool {
+        const current = replace self.root with newWeakNode()
+        const outcome = hasWeakNode($current, weak, 0)
+        const weakHasOutcome { Node Found } = outcome
+        self.root = Node
+        Found
+    }
+}
+
+struct weakFindOutcome {
+    Node own weakNode
+    Index Option<u64>
+}
+
+struct candidateFindOutcome {
+    Candidates Option<own blockCandidate>
+    Index Option<u64>
+}
+
+struct weakHasOutcome {
+    Node own weakNode
+    Found bool
+}
+
+fn newWeakIndex() own weakIndex {
+    own weakIndex { root = newWeakNode() }
+}
+
+fn newWeakNode() own weakNode {
+    own weakNode { zero = .None one = .None candidates = .None }
+}
+
+fn insertWeakNode(
+    $node own weakNode,
+    weak u64,
+    bit u64,
+    signature BlockSignature
+) own weakNode {
+    var current = node
+    if bit == 32 {
+        const previous = replace current.candidates with .None
+        current.candidates = .Some(own blockCandidate {
+            signature = signature
+            next = previous
+        })
+        return current
+    }
+    if ((weak >> (31 - bit)) & 1) == 0 {
+        const child = weakNodeValue(replace current.zero with .None)
+        current.zero = .Some(insertWeakNode($child, weak, bit + 1, signature))
+    } else {
+        const child = weakNodeValue(replace current.one with .None)
+        current.one = .Some(insertWeakNode($child, weak, bit + 1, signature))
+    }
+    current
+}
+
+fn findWeakNode(
+    $node own weakNode,
+    weak u64,
+    strongHigh u64,
+    strongLow u64,
+    bit u64
+) weakFindOutcome {
+    var current = node
+    if bit == 32 {
+        const outcome = findCandidate(
+            replace current.candidates with .None,
+            strongHigh,
+            strongLow
+        )
+        const candidateFindOutcome { Candidates Index } = outcome
+        current.candidates = Candidates
+        return weakFindOutcome { Node = current Index = Index }
+    }
+    if ((weak >> (31 - bit)) & 1) == 0 {
+        const selected = replace current.zero with .None
+        match selected {
+            None: {
+                return weakFindOutcome { Node = current Index = .None }
+            }
+            Some(child): {
+                const outcome = findWeakNode(
+                    $child,
+                    weak,
+                    strongHigh,
+                    strongLow,
+                    bit + 1
+                )
+                const weakFindOutcome { Node Index } = outcome
+                current.zero = .Some(Node)
+                return weakFindOutcome { Node = current Index = Index }
+            }
+        }
+    }
+    const selected = replace current.one with .None
+    match selected {
+        None: weakFindOutcome { Node = current Index = .None }
+        Some(child): {
+            const outcome = findWeakNode(
+                $child,
+                weak,
+                strongHigh,
+                strongLow,
+                bit + 1
+            )
+            const weakFindOutcome { Node Index } = outcome
+            current.one = .Some(Node)
+            weakFindOutcome { Node = current Index = Index }
+        }
+    }
+}
+
+fn hasWeakNode(
+    $node own weakNode,
+    weak u64,
+    bit u64
+) weakHasOutcome {
+    var current = node
+    if bit == 32 {
+        const selected = replace current.candidates with .None
+        match selected {
+            None: {
+                return weakHasOutcome { Node = current Found = false }
+            }
+            Some(candidate): {
+                current.candidates = .Some(candidate)
+                return weakHasOutcome { Node = current Found = true }
+            }
+        }
+    }
+    if ((weak >> (31 - bit)) & 1) == 0 {
+        const selected = replace current.zero with .None
+        match selected {
+            None: {
+                return weakHasOutcome { Node = current Found = false }
+            }
+            Some(child): {
+                const outcome = hasWeakNode($child, weak, bit + 1)
+                const weakHasOutcome { Node Found } = outcome
+                current.zero = .Some(Node)
+                return weakHasOutcome {
+                    Node = current
+                    Found = Found
+                }
+            }
+        }
+    }
+    const selected = replace current.one with .None
+    match selected {
+        None: {
+            weakHasOutcome { Node = current Found = false }
+        }
+        Some(child): {
+            const outcome = hasWeakNode($child, weak, bit + 1)
+            const weakHasOutcome { Node Found } = outcome
+            current.one = .Some(Node)
+            weakHasOutcome { Node = current Found = Found }
+        }
+    }
+}
+
+fn findCandidate(
+    $source Option<own blockCandidate>,
+    strongHigh u64,
+    strongLow u64
+) candidateFindOutcome {
+    var pending = source
+    var reversed Option<own blockCandidate> = .None
+    var found Option<u64> = .None
+    var running = true
+    while running {
+        const selected = replace pending with .None
+        match selected {
+            None: { running = false }
+            Some(node): {
+                const blockCandidate { signature next } = node
+                if optionU64Empty(found) &&
+                    signature.StrongHigh == strongHigh &&
+                    signature.StrongLow == strongLow {
+                    found = .Some(signature.Index)
+                }
+                const previous = replace reversed with .None
+                reversed = .Some(own blockCandidate {
+                    signature = signature
+                    next = previous
+                })
+                pending = next
+            }
+        }
+    }
+    candidateFindOutcome {
+        Candidates = reverseCandidates($reversed)
+        Index = found
+    }
+}
+
+fn reverseCandidates(
+    $source Option<own blockCandidate>
+) Option<own blockCandidate> {
+    var pending = source
+    var result Option<own blockCandidate> = .None
+    var running = true
+    while running {
+        const selected = replace pending with .None
+        match selected {
+            None: { running = false }
+            Some(node): {
+                const blockCandidate { signature next } = node
+                const previous = replace result with .None
+                result = .Some(own blockCandidate {
+                    signature = signature
+                    next = previous
+                })
+                pending = next
+            }
+        }
+    }
+    result
+}
+
+fn weakNodeValue($value Option<own weakNode>) own weakNode {
+    match value {
+        None: newWeakNode()
+        Some(node): node
+    }
+}
+
+fn optionU64Empty(value Option<u64>) bool {
+    match value {
+        None: true
+        Some(found): {
+            discard found
+            false
+        }
+    }
+}

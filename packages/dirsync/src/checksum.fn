@@ -1,0 +1,101 @@
+package remolo.dirsync
+
+import std.bytes
+
+struct rollingState {
+    A u64
+    B u64
+    Ready bool
+}
+
+struct strongParts {
+    High u64
+    Low u64
+}
+
+fn weakSum(value bytes.Bytes) Result<u64, Error> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.InvalidSignature)
+    }
+    const roll = initialRoll(value, 0, length) else error {
+        return .Err(error)
+    }
+    .Ok((roll.B << 16) | roll.A)
+}
+
+fn initialRoll(
+    value bytes.Bytes,
+    start u64,
+    end u64
+) Result<rollingState, Error> {
+    var a u64 = 0
+    var b u64 = 0
+    var offset = start
+    while offset < end {
+        const byte = value.At(offset) else error {
+            discard error
+            return .Err(.InvalidDelta)
+        }
+        a = (a + byte) % 65521
+        b = (b + a) % 65521
+        offset += 1
+    }
+    .Ok(rollingState { A = a B = b Ready = true })
+}
+
+fn advanceRoll(
+    value rollingState,
+    outgoing u64,
+    incoming u64,
+    blockSize u64
+) rollingState {
+    var a = (value.A + 65521 - (outgoing % 65521)) % 65521
+    a = (a + incoming) % 65521
+    const removed = ((blockSize % 65521) * (outgoing % 65521)) % 65521
+    var b = (value.B + 65521 - removed) % 65521
+    b = (b + a) % 65521
+    rollingState { A = a B = b Ready = true }
+}
+
+fn strongRange(
+    value bytes.Bytes,
+    start u64,
+    end u64
+) Result<strongParts, Error> {
+    const block = value.Slice(start, end) else error {
+        discard error
+        return .Err(.InvalidDelta)
+    }
+    const result = strongHash(block) else error {
+        discard block
+        return .Err(error)
+    }
+    discard block
+    .Ok(result)
+}
+
+fn strongHash(value bytes.Bytes) Result<strongParts, Error> {
+    var hasher = bytes.NewSha256()
+    hasher.WriteBytes(value) else error {
+        discard error
+        discard hasher
+        return .Err(.InvalidSignature)
+    }
+    const digest = hasher.Finish() else error {
+        discard error
+        discard hasher
+        return .Err(.InvalidSignature)
+    }
+    discard hasher
+    var high u64 = 0
+    var low u64 = 0
+    var offset u64 = 0
+    while offset < 8 {
+        high = (high << 8) | byteValue(digest, offset)
+        low = (low << 8) | byteValue(digest, offset + 8)
+        offset += 1
+    }
+    discard digest
+    .Ok(strongParts { High = high Low = low })
+}

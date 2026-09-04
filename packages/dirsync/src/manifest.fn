@@ -1,0 +1,228 @@
+package remolo.dirsync
+
+import std.bytes
+import std.fs
+import std.text
+
+fn BuildManifest(
+    root String,
+    &excludes Excluder,
+    hashFiles bool
+) Result<own Manifest, Error> {
+    const openedTree = fs.OpenTree(root, 1000000, 32768) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    var tree = openedTree
+    var manifest = newManifest()
+    var running = true
+    while running {
+        const selected = tree.Next() else error {
+            discard error
+            discard tree
+            discard manifest
+            return .Err(.Filesystem)
+        }
+        match selected {
+            None: { running = false }
+            Some(entry): {
+                addTreeEntry(
+                    &manifest,
+                    tree,
+                    &excludes,
+                    $entry,
+                    hashFiles
+                ) else error {
+                    discard tree
+                    discard manifest
+                    return .Err(error)
+                }
+            }
+        }
+    }
+    discard tree.Close()
+    discard tree
+    manifest.sort()
+    .Ok(manifest)
+}
+
+fn addTreeEntry(
+    &manifest Manifest,
+    tree fs.TreeReader,
+    &excludes Excluder,
+    $entry fs.TreeEntry,
+    hashFiles bool
+) Result<void, Error> {
+    const fs.TreeEntry {
+        Path
+        Kind
+        Executable
+        Size
+        Permissions
+        Modified
+    } = entry
+    discard Executable
+    if excludes.Match(Path, treeDirectory(Kind)) return .Ok
+    match Kind {
+        File: addFileEntry(
+            &manifest,
+            tree,
+            $Path,
+            Size,
+            Permissions,
+            Modified,
+            hashFiles
+        )
+        Directory: {
+            manifest.add($Entry {
+                Path = Path
+                Kind = .Directory
+                Size = 0
+                Modified = Modified
+                Permissions = Permissions
+                SHA256 = ""
+                Target = ""
+                DirectoryLink = false
+            })
+            .Ok
+        }
+        SymbolicLink: addSymbolicLinkEntry(
+            &manifest,
+            tree,
+            $Path,
+            Permissions,
+            Modified
+        )
+        Other: {
+            discard Path
+            .Ok
+        }
+    }
+}
+
+fn addFileEntry(
+    &manifest Manifest,
+    tree fs.TreeReader,
+    $path String,
+    size u64,
+    permissions u32,
+    modified u64,
+    hashFiles bool
+) Result<void, Error> {
+    var digest = ""
+    if hashFiles {
+        const content = tree.ReadFile(path, size) else error {
+            discard error
+            return .Err(.Filesystem)
+        }
+        const computed = sha256Hex(content) else error {
+            discard content
+            return .Err(error)
+        }
+        digest = computed
+        discard content
+    }
+    manifest.add($Entry {
+        Path = path
+        Kind = .File
+        Size = size
+        Modified = modified
+        Permissions = permissions
+        SHA256 = digest
+        Target = ""
+        DirectoryLink = false
+    })
+    .Ok
+}
+
+fn addSymbolicLinkEntry(
+    &manifest Manifest,
+    tree fs.TreeReader,
+    $path String,
+    permissions u32,
+    modified u64
+) Result<void, Error> {
+    const link = tree.ReadSymbolicLink(path, 65536) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    const fs.SymbolicLinkInfo { Target Directory } = link
+    manifest.add($Entry {
+        Path = path
+        Kind = .SymbolicLink
+        Size = 0
+        Modified = modified
+        Permissions = permissions
+        SHA256 = ""
+        Target = Target
+        DirectoryLink = Directory
+    })
+    .Ok
+}
+
+fn sha256Hex(value bytes.Bytes) Result<String, Error> {
+    var hasher = bytes.NewSha256()
+    hasher.WriteBytes(value) else error {
+        discard error
+        discard hasher
+        return .Err(.Encoding)
+    }
+    const digest = hasher.Finish() else error {
+        discard error
+        discard hasher
+        return .Err(.Encoding)
+    }
+    discard hasher
+    const result = bytesHex(digest) else error {
+        discard digest
+        return .Err(error)
+    }
+    discard digest
+    .Ok(result)
+}
+
+fn bytesHex(value bytes.Bytes) Result<String, Error> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    var builder = text.NewBuilder()
+    var offset u64 = 0
+    while offset < length {
+        const byte = value.At(offset) else error {
+            discard error
+            discard builder
+            return .Err(.Encoding)
+        }
+        const high = builder.WriteCodePoint(hexCodePoint(byte >> 4)) else error {
+            discard error
+            discard builder
+            return .Err(.Encoding)
+        }
+        discard high
+        const low = builder.WriteCodePoint(hexCodePoint(byte & 15)) else error {
+            discard error
+            discard builder
+            return .Err(.Encoding)
+        }
+        discard low
+        offset += 1
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok(result)
+}
+
+fn hexCodePoint(value u64) u64 {
+    if value < 10 return 48 + value
+    87 + value
+}
+
+fn treeDirectory(value fs.TreeKind) bool {
+    match value {
+        Directory: true
+        _: false
+    }
+}

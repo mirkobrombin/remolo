@@ -1,0 +1,195 @@
+package remolo.dirsync
+
+import std.bytes
+import std.fs
+
+test "exclude patterns match paths and basenames" {
+    const patterns = ["*.tmp", "node_modules", "build/out"]
+    var excludes = NewExcluder(patterns)
+    expect(excludes.Match("cache.tmp", false))
+    expect(excludes.Match("src/cache.tmp", false))
+    expect(excludes.Match("web/node_modules", true))
+    expect(excludes.Match("build/out/generated.fn", false))
+    expect(!excludes.Match("src/main.fn", false))
+}
+
+test "manifest encoding accepts the Go wire shape" {
+    const encoded = bytes.FromText(
+        "{\"link\":{\"kind\":2,\"mtime\":7,\"mode\":511," +
+        "\"target\":\"target\"},\"src\":{\"kind\":1,\"mode\":493}," +
+        "\"src/main.fn\":{\"kind\":0,\"size\":4,\"mtime\":9," +
+        "\"mode\":420,\"sha256\":" +
+        "\"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589\"}}"
+    )
+    const decodedManifest = DecodeManifest(encoded) else error {
+        panic(syncFailure(error))
+    }
+    var manifest = decodedManifest
+    expect(manifest.Len() == 3)
+    const file = requiredEntryResult(manifest.Find("src/main.fn"))
+    expect(isFile(file.Kind))
+    expect(file.Size == 4)
+    expect(file.Permissions == 420)
+    expect(file.Modified == 9)
+    const result = EncodeManifest($manifest) else error {
+        panic(syncFailure(error))
+    }
+    expect(result.Manifest.Len() == 3)
+    const roundTrip = DecodeManifest(result.Data) else error {
+        panic(syncFailure(error))
+    }
+    expect(roundTrip.Len() == 3)
+}
+
+test "manifest walks regular files and directories" {
+    const directory = fs.CreateTempDirectory(".", "remolo-sync-") else {
+        fail("temporary directory creation failed")
+    }
+    const openedRoot = fs.OpenRoot(directory) else {
+        fail("root opening failed")
+    }
+    var root = openedRoot
+    root.CreateDirectory("nested") else {
+        fail("directory creation failed")
+    }
+    const content = bytes.FromText("Foundation")
+    root.WriteFile("nested/file.txt", content, 416) else {
+        fail("file creation failed")
+    }
+    discard root.Close()
+    var excludes = NewExcluder(["*.skip"])
+    const builtManifest = BuildManifest(directory, &excludes, true) else error {
+        panic(syncFailure(error))
+    }
+    var manifest = builtManifest
+    expect(manifest.Len() == 2)
+    const file = requiredEntryResult(manifest.Find("nested/file.txt"))
+    expect(file.Size == 10)
+    expect(file.SHA256 ==
+        "df42a4d5d3537666f9ed0012c3a44999878842f8d92f2ac056e6df0ca4ac44d1")
+    const cleanup = fs.Canonicalize(directory) else {
+        fail("temporary directory resolution failed")
+    }
+    fs.RemoveTree(cleanup, 16, 4) else {
+        fail("temporary directory cleanup failed")
+    }
+}
+
+test "signature encoding matches Go blocks" {
+    const signature = BuildSignature(bytes.FromText("abcdefgh"), 4) else error {
+        panic(syncFailure(error))
+    }
+    expect(signature.Len() == 2)
+    const encoded = EncodeSignature($signature) else error {
+        panic(syncFailure(error))
+    }
+    const textValue = encoded.Data.Text() else {
+        fail("signature text failed")
+    }
+    expect(textValue ==
+        "{\"blocks\":[{\"i\":0,\"s\":[136,212,38,111,212,230,51,141," +
+        "19,184,69,252,242,137,87,157],\"w\":64225674},{\"i\":1," +
+        "\"s\":[229,224,136,160,182,97,99,160,162,106,94,5,61,42,68,150]," +
+        "\"w\":66847130}],\"bs\":4}"
+    )
+    const decoded = DecodeSignature(encoded.Data) else error {
+        panic(syncFailure(error))
+    }
+    expect(decoded.Len() == 2)
+}
+
+test "delta copies matching blocks and emits inserted bytes" {
+    const base = bytes.FromText("abcdefgh")
+    const signature = BuildSignature(base, 4) else error {
+        panic(syncFailure(error))
+    }
+    const source = bytes.FromText("abcdWXYZefgh")
+    const delta = WriteDelta(source, $signature) else error {
+        panic(syncFailure(error))
+    }
+    expect(delta.LiteralBytes == 4)
+    const expected [20]u64 = [
+        2, 0, 0, 0, 0, 1, 0, 0, 0, 4,
+        87, 88, 89, 90, 2, 0, 0, 0, 1, 3
+    ]
+    expectBytes(delta.Data, expected)
+    const rebuilt = ApplyDelta(base, delta.Data, 12, 4) else error {
+        panic(syncFailure(error))
+    }
+    const rebuiltText = rebuilt.Text() else {
+        fail("rebuilt text failed")
+    }
+    expect(rebuiltText == "abcdWXYZefgh")
+}
+
+test "delta rejects missing end and invalid copy" {
+    const base = bytes.FromText("abcd")
+    match ApplyDelta(base, bytes.FromText(""), 0, 4) {
+        Ok(value): {
+            discard value
+            fail("empty delta was accepted")
+        }
+        Err(error): expectInvalidDelta(error)
+    }
+    const invalidBytes [6]u64 = [2, 0, 0, 0, 4, 3]
+    const invalid = bytesFrom(invalidBytes)
+    match ApplyDelta(base, invalid, 4, 4) {
+        Ok(value): {
+            discard value
+            fail("invalid copy was accepted")
+        }
+        Err(error): expectInvalidDelta(error)
+    }
+}
+
+fn bytesFrom(values [u64]) own bytes.Bytes {
+    const openedBuilder = bytes.NewBuilder(1024) else {
+        fail("byte builder failed")
+    }
+    var builder = openedBuilder
+    for value in values {
+        builder.WriteByte(value) else {
+            fail("byte write failed")
+        }
+    }
+    const result = builder.Finish() else {
+        fail("byte finish failed")
+    }
+    result
+}
+
+fn expectBytes(actual bytes.Bytes, expected [u64]) void {
+    const length = actual.Len() else { fail("byte length failed") }
+    var offset u64 = 0
+    for value in expected {
+        const found = actual.At(offset) else { fail("byte read failed") }
+        expect(found == value)
+        offset += 1
+    }
+    expect(length == offset)
+}
+
+fn requiredEntryResult($value Option<Entry>) Entry {
+    match value {
+        None: panic("manifest entry missing")
+        Some(entry): entry
+    }
+}
+
+fn expectInvalidDelta(value Error) void {
+    match value {
+        InvalidDelta: {}
+        _: fail("wrong delta error")
+    }
+}
+
+fn syncFailure(value Error) String {
+    match value {
+        Filesystem: "dirsync: filesystem"
+        Encoding: "dirsync: encoding"
+        InvalidManifest: "dirsync: invalid manifest"
+        InvalidSignature: "dirsync: invalid signature"
+        InvalidDelta: "dirsync: invalid delta"
+        TooLarge: "dirsync: too large"
+    }
+}
