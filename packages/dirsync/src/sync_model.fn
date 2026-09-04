@@ -1,0 +1,68 @@
+package remolo.dirsync
+
+import std.text
+
+struct Options {
+    Delete bool
+    DryRun bool
+    Excludes own Excluder
+}
+
+struct Stats {
+    FilesConsidered u64
+    FilesTransferred u64
+    BytesTransferred u64
+}
+
+struct syncMessage {
+    Type String
+    Direction String
+    Root String
+    Delete bool
+    DryRun bool
+    Path String
+    HasBase bool
+    Size u64
+    Permissions u32
+    Modified u64
+    Stats Stats
+    HasStats bool
+    RemoteError String
+}
+
+fn NewOptions(excludes [String]) own Options {
+    own Options {
+        Delete = false
+        DryRun = false
+        Excludes = NewExcluder(excludes)
+    }
+}
+
+fn addTransferBytes(current u64, amount u64) Result<u64, Error> {
+    if amount > 18446744073709551615 - current {
+        return .Err(.TooLarge)
+    }
+    .Ok(current + amount)
+}
+
+fn newSyncMessage(messageType String) syncMessage {
+    syncMessage {
+        Type = text.Copy(messageType)
+        Direction = ""
+        Root = ""
+        Delete = false
+        DryRun = false
+        Path = ""
+        HasBase = false
+        Size = 0
+        Permissions = 0
+        Modified = 0
+        Stats = Stats {
+            FilesConsidered = 0
+            FilesTransferred = 0
+            BytesTransferred = 0
+        }
+        HasStats = false
+        RemoteError = ""
+    }
+}

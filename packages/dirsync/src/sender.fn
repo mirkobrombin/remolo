@@ -1,0 +1,223 @@
+package remolo.dirsync
+
+import remolo.mux
+import std.fs
+import std.text
+
+task runSender(
+    $initialReader own mux.Reader,
+    $initialWriter own mux.Writer,
+    $directory String,
+    $options own Options
+) Result<Stats, Error> {
+    const Options { Delete DryRun Excludes } = options
+    discard Delete
+    discard DryRun
+    var excludes = Excludes
+    const built = BuildManifest(directory, &excludes, true) else error {
+        discard initialReader
+        discard initialWriter
+        return .Err(error)
+    }
+    var manifest = built
+    const filesConsidered = manifest.CountFiles()
+    const encoded = EncodeManifest($manifest) else error {
+        discard initialReader
+        discard initialWriter
+        return .Err(error)
+    }
+    const ManifestEncoding { Manifest Data } = encoded
+    manifest = Manifest
+    const announcing = spawn writeSyncMessage(
+        $initialWriter,
+        $newSyncMessage("manifest")
+    )
+    const announced = $announcing.wait()
+    const manifestWriter = announced else error {
+        discard initialReader
+        discard Data
+        return .Err(error)
+    }
+    const streaming = spawn writeSyncStream($manifestWriter, $Data)
+    const streamed = $streaming.wait()
+    const streamedWriter = streamed else error {
+        discard initialReader
+        return .Err(error)
+    }
+    var writer = streamedWriter
+    var reader = initialReader
+    const openedTree = fs.OpenTree(directory, 1000000, 32768) else error {
+        discard error
+        discard reader
+        discard writer
+        return .Err(.Filesystem)
+    }
+    var tree = openedTree
+    var stats = Stats {
+        FilesConsidered = nonNegativeCount(filesConsidered)
+        FilesTransferred = 0
+        BytesTransferred = 0
+    }
+    var complete = false
+    while !complete {
+        const reading = spawn readSyncMessage($reader)
+        const read = $reading.wait()
+        const messageReadOutcome { Reader Value } = read
+        reader = Reader
+        const message = Value else error {
+            return .Err(error)
+        }
+        if message.Type == "need" {
+            const response = spawn answerNeed(
+                $reader,
+                $writer,
+                $tree,
+                $manifest,
+                $message
+            )
+            const answered = $response.wait()
+            const success = answered else error { return .Err(error) }
+            const needSuccess {
+                Reader as restoredReader
+                Writer as restoredWriter
+                Tree as restoredTree
+                Manifest as restoredManifest
+                LiteralBytes
+            } = success
+            reader = restoredReader
+            writer = restoredWriter
+            tree = restoredTree
+            manifest = restoredManifest
+            stats.FilesTransferred += 1
+            const totalBytes = addTransferBytes(
+                stats.BytesTransferred,
+                LiteralBytes
+            ) else error {
+                return .Err(error)
+            }
+            stats.BytesTransferred = totalBytes
+            continue
+        }
+        if message.Type == "done" {
+            const finalReading = spawn readSyncMessage($reader)
+            const finalRead = $finalReading.wait()
+            const messageReadOutcome {
+                Reader as finalReader
+                Value as finalValue
+            } = finalRead
+            reader = finalReader
+            const final = finalValue else error { return .Err(error) }
+            if final.Type == "error" return .Err(.Remote)
+            if final.Type != "complete" return .Err(.Protocol)
+            if final.HasStats {
+                stats = final.Stats
+            }
+            complete = true
+            continue
+        }
+        if message.Type == "error" return .Err(.Remote)
+        return .Err(.Protocol)
+    }
+    discard tree.Close()
+    discard tree
+    discard reader
+    const closing = spawn mux.CloseWriter($writer)
+    const closed = $closing.wait()
+    closed else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    .Ok(stats)
+}
+
+struct needSuccess {
+    Reader own mux.Reader
+    Writer own mux.Writer
+    Tree own fs.TreeReader
+    Manifest own Manifest
+    LiteralBytes u64
+}
+
+task answerNeed(
+    $initialReader own mux.Reader,
+    $initialWriter own mux.Writer,
+    $initialTree own fs.TreeReader,
+    $initialManifest own Manifest,
+    $message syncMessage
+) Result<needSuccess, Error> {
+    var reader = initialReader
+    var writer = initialWriter
+    var tree = initialTree
+    var manifest = initialManifest
+    if !validRelativePath(message.Path) {
+        return .Err(.Protocol)
+    }
+    const selected = manifest.Find(message.Path)
+    const entry = match selected {
+        None: { return .Err(.Protocol) }
+        Some(found): found
+    }
+    if !isFile(entry.Kind) {
+        return .Err(.Protocol)
+    }
+    var signature = newSignature(BlockSize())
+    if message.HasBase {
+        const reading = spawn readSyncStream($reader, signatureLimit(entry.Size))
+        const outcome = $reading.wait()
+        const streamReadOutcome { Reader Value } = outcome
+        reader = Reader
+        const encoded = Value else error {
+            return .Err(error)
+        }
+        const decoded = DecodeSignature(encoded) else error {
+            return .Err(error)
+        }
+        const empty = replace signature with decoded
+        discard empty
+    }
+    const source = tree.ReadFile(message.Path, entry.Size) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    const delta = WriteDelta(source, $signature) else error {
+        discard source
+        return .Err(error)
+    }
+    discard source
+    const Delta { Data LiteralBytes } = delta
+    var response = newSyncMessage("delta")
+    response.Path = text.Copy(message.Path)
+    response.Size = entry.Size
+    response.Permissions = entry.Permissions
+    response.Modified = entry.Modified
+    const announcing = spawn writeSyncMessage($writer, $response)
+    const announced = $announcing.wait()
+    const deltaWriter = announced else error {
+        discard Data
+        return .Err(error)
+    }
+    const streaming = spawn writeSyncStream($deltaWriter, $Data)
+    const streamed = $streaming.wait()
+    const finalWriter = streamed else error {
+        return .Err(error)
+    }
+    .Ok(needSuccess {
+        Reader = reader
+        Writer = finalWriter
+        Tree = tree
+        Manifest = manifest
+        LiteralBytes = LiteralBytes
+    })
+}
+
+fn signatureLimit(fileSize u64) u64 {
+    (fileSize / BlockSize() + 2) * 96 + 128
+}
+
+fn nonNegativeCount(value i32) u64 {
+    const result = u64.From(value) else error {
+        discard error
+        panic("dirsync count invariant failed")
+    }
+    result
+}

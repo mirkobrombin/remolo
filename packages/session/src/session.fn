@@ -18,6 +18,7 @@ enum Error {
     Authentication
     Execution
     FileTransfer
+    DirectorySync
     Storage
 }
 

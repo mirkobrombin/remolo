@@ -1,5 +1,6 @@
 package remolo.session
 
+import remolo.dirsync
 import remolo.protocol
 import std.bytes
 import std.collections
@@ -275,9 +276,427 @@ fn transferPayload() String {
     result
 }
 
+test "directory sync pushes rolling deltas and pulls trees" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const local = temporaryDirectory("remolo-sync-local-")
+    const remote = temporaryDirectory("remolo-sync-remote-")
+    const pulled = temporaryDirectory("remolo-sync-pulled-")
+    const changed = verifyInitialDirectorySync(client, peer, local, remote)
+    verifyDirectorySyncPolicies(client, peer, local, remote, changed)
+    verifyDirectoryPull(client, peer, remote, pulled, changed)
+    verifyDirectorySyncExcludes(client, peer, local, remote)
+    expectDirectoryPushRejected(client, peer, local, remote, "rejected", false)
+    expectDirectoryPushRejected(client, peer, local, remote, "../escape", true)
+
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    fs.RemoveTree(local, 16, 4) else { fail("local cleanup failed") }
+    fs.RemoveTree(remote, 32, 6) else { fail("remote cleanup failed") }
+    fs.RemoveTree(pulled, 16, 4) else { fail("pull cleanup failed") }
+}
+
+fn verifyInitialDirectorySync(
+    client Client,
+    peer Peer,
+    local String,
+    remote String
+) String {
+    fs.CreateDirectory(local + "/nested") else {
+        fail("source directory creation failed")
+    }
+    const payload = syncPayload()
+    fs.WriteTextAtomic(local + "/nested/data.bin", payload, 131072) else {
+        fail("source file write failed")
+    }
+    const script = "#!/bin/sh\necho remolo\n"
+    const scriptPath = local + "/run.sh"
+    fs.WriteTextAtomic(scriptPath, script, 128) else {
+        fail("source script write failed")
+    }
+    const executable = makeExecutable(scriptPath)
+    const linked = createSyncLink(local)
+    const first = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(first.FilesTransferred == 2)
+    expect(first.BytesTransferred == text.ByteLen(payload) + text.ByteLen(script))
+    if executable {
+        const copiedExecutable = fs.IsExecutable(remote + "/tree/run.sh") else {
+            fail("destination executable check failed")
+        }
+        expect(copiedExecutable)
+    }
+    if linked {
+        expectSyncedLink(remote + "/tree")
+    }
+    const left = text.Slice(payload, 0, 32768) else {
+        fail("payload prefix failed")
+    }
+    const right = text.Slice(payload, 32769, text.ByteLen(payload)) else {
+        fail("payload suffix failed")
+    }
+    const changed = left + "X" + right
+    fs.WriteTextAtomic(local + "/nested/data.bin", changed, 131072) else {
+        fail("changed source write failed")
+    }
+    const second = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(second.FilesTransferred == 1)
+    expect(second.BytesTransferred < text.ByteLen(changed) / 2)
+    const noOp = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(noOp.FilesTransferred == 0)
+    expect(noOp.BytesTransferred == 0)
+    changed
+}
+
+fn verifyDirectorySyncPolicies(
+    client Client,
+    peer Peer,
+    local String,
+    remote String,
+    changed String
+) void {
+    fs.WriteTextAtomic(remote + "/tree/extra.txt", "remove", 64) else {
+        fail("extra file write failed")
+    }
+    discard pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(pathExists(remote + "/tree/extra.txt"))
+    discard pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(true)
+    )
+    expect(!pathExists(remote + "/tree/extra.txt"))
+    const dry = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "preview",
+        $dryRunOptions()
+    )
+    expect(dry.FilesTransferred == 2)
+    expect(dry.BytesTransferred ==
+        text.ByteLen(changed) + text.ByteLen("#!/bin/sh\necho remolo\n"))
+    expect(!pathExists(remote + "/preview"))
+    fs.RemoveFile(remote + "/tree/nested/data.bin") else {
+        fail("conflicting file removal failed")
+    }
+    fs.CreateDirectory(remote + "/tree/nested/data.bin") else {
+        fail("conflicting directory creation failed")
+    }
+    fs.WriteTextAtomic(
+        remote + "/tree/nested/data.bin/child",
+        "conflict",
+        64
+    ) else {
+        fail("conflicting child write failed")
+    }
+    const replaced = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(replaced.FilesTransferred == 1)
+    const kind = fs.Kind(remote + "/tree/nested/data.bin") else {
+        fail("replacement kind check failed")
+    }
+    expect(filesystemFileKind(kind))
+}
+
+fn verifyDirectoryPull(
+    client Client,
+    peer Peer,
+    remote String,
+    pulled String,
+    changed String
+) void {
+    const stats = pullDirectory(client, peer, remote, "tree", pulled)
+    expect(stats.FilesTransferred == 2)
+    const resultBytes = fs.ReadBytesSync(
+        pulled + "/nested/data.bin",
+        131072
+    ) else {
+        fail("pulled file read failed")
+    }
+    const result = resultBytes.Text() else { fail("pulled text failed") }
+    expect(result == changed)
+}
+
+fn verifyDirectorySyncExcludes(
+    client Client,
+    peer Peer,
+    local String,
+    remote String
+) void {
+    fs.WriteTextAtomic(local + "/ignored.tmp", "ignored", 64) else {
+        fail("excluded file write failed")
+    }
+    fs.CreateDirectory(local + "/node_modules/module") else {
+        fail("excluded directory creation failed")
+    }
+    fs.WriteTextAtomic(
+        local + "/node_modules/module/index.js",
+        "ignored",
+        64
+    ) else {
+        fail("excluded nested file write failed")
+    }
+    const stats = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "filtered",
+        $excludeOptions()
+    )
+    expect(stats.FilesTransferred == 2)
+    expect(pathExists(remote + "/filtered/nested/data.bin"))
+    expect(!pathExists(remote + "/filtered/ignored.tmp"))
+    expect(!pathExists(remote + "/filtered/node_modules"))
+}
+
+fn pushDirectory(
+    client Client,
+    peer Peer,
+    local String,
+    remote String,
+    target String,
+    $options own dirsync.Options
+) dirsync.Stats {
+    const serving = spawn ServeDirectory(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const pushing = spawn PushDirectory(
+        $client.Handle(),
+        $text.Copy(local),
+        $text.Copy(target),
+        $options
+    )
+    const stats = $pushing.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    stats
+}
+
+fn pullDirectory(
+    client Client,
+    peer Peer,
+    remote String,
+    source String,
+    local String
+) dirsync.Stats {
+    const serving = spawn ServeDirectory(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const pulling = spawn PullDirectory(
+        $client.Handle(),
+        $text.Copy(source),
+        $text.Copy(local),
+        $syncOptions(false)
+    )
+    const stats = $pulling.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    stats
+}
+
+fn expectDirectoryPushRejected(
+    client Client,
+    peer Peer,
+    local String,
+    remote String,
+    target String,
+    allowWrite bool
+) void {
+    const serving = spawn ServeDirectory(
+        $peer.Handle(),
+        $text.Copy(remote),
+        allowWrite
+    )
+    const pushing = spawn PushDirectory(
+        $client.Handle(),
+        $text.Copy(local),
+        $text.Copy(target),
+        $syncOptions(false)
+    )
+    match $pushing.wait() {
+        Ok(stats): {
+            discard stats
+            fail("rejected directory sync was accepted")
+        }
+        Err(error): expect(directorySyncFailure(error))
+    }
+    match $serving.wait() {
+        Ok: fail("rejected directory sync reported success")
+        Err(error): expect(directorySyncFailure(error))
+    }
+}
+
+fn pathExists(path String) bool {
+    const exists = fs.Exists(path) else {
+        fail("path check failed")
+    }
+    exists
+}
+
+fn makeExecutable(path String) bool {
+    match fs.SetExecutable(path, true) {
+        Ok: true
+        Err(error): {
+            discard error
+            false
+        }
+    }
+}
+
+fn createSyncLink(directory String) bool {
+    const opened = fs.OpenRoot(directory) else {
+        fail("source root opening failed")
+    }
+    var root = opened
+    var linked = true
+    match root.CreateSymbolicLink("current", "nested/data.bin", false) {
+        Ok: {}
+        Err(error): {
+            discard error
+            linked = false
+        }
+    }
+    discard root.Close()
+    discard root
+    linked
+}
+
+fn expectSyncedLink(directory String) void {
+    const opened = fs.OpenTree(directory, 16, 32768) else {
+        fail("destination tree opening failed")
+    }
+    var tree = opened
+    const link = tree.ReadSymbolicLink("current", 1024) else {
+        fail("destination link reading failed")
+    }
+    expect(link.Target == "nested/data.bin")
+    expect(!link.Directory)
+    discard tree.Close()
+    discard tree
+}
+
+fn temporaryDirectory(prefix String) String {
+    const created = fs.CreateTempDirectory(".", prefix) else {
+        fail("temporary directory creation failed")
+    }
+    const directory = fs.Canonicalize(created) else {
+        fail("temporary directory resolution failed")
+    }
+    directory
+}
+
+fn syncPayload() String {
+    var builder = text.NewBuilder()
+    var blocks u64 = 0
+    while blocks < 2048 {
+        const written = builder.Write("0123456789abcdef0123456789abcdef") else {
+            fail("sync payload builder failed")
+        }
+        discard written
+        blocks += 1
+    }
+    const result = builder.Finish() else { fail("sync payload finish failed") }
+    result
+}
+
+fn syncOptions(delete bool) own dirsync.Options {
+    const noExcludes [0]String = []
+    var options = dirsync.NewOptions(noExcludes)
+    options.Delete = delete
+    options
+}
+
+fn dryRunOptions() own dirsync.Options {
+    const noExcludes [0]String = []
+    var options = dirsync.NewOptions(noExcludes)
+    options.DryRun = true
+    options
+}
+
+fn excludeOptions() own dirsync.Options {
+    const excludes [2]String = ["*.tmp", "node_modules"]
+    dirsync.NewOptions(excludes)
+}
+
 fn fileTransferFailure(error Error) bool {
     match error {
         FileTransfer: true
+        _: false
+    }
+}
+
+fn directorySyncFailure(error Error) bool {
+    match error {
+        DirectorySync: true
+        _: false
+    }
+}
+
+fn filesystemFileKind(kind fs.EntryKind) bool {
+    match kind {
+        File: true
         _: false
     }
 }
@@ -299,6 +718,7 @@ fn sessionFailure(error Error) String {
         Authentication: "session: authentication"
         Execution: "session: execution"
         FileTransfer: "session: file transfer"
+        DirectorySync: "session: directory sync"
         Storage: "session: storage"
     }
 }

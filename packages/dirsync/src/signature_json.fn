@@ -72,7 +72,7 @@ fn DecodeSignature(source bytes.Bytes) Result<own Signature, Error> {
         }
         None: { return .Err(.InvalidSignature) }
     }
-    if object.Len() != 0 || blocks.Len() > 1000000 {
+    if blocks.Len() > 1000000 {
         return .Err(.InvalidSignature)
     }
     var signature = newSignature(blockSize)
@@ -132,7 +132,7 @@ fn decodeBlock($value json.Value) Result<BlockSignature, Error> {
         }
         None: { return .Err(.InvalidSignature) }
     }
-    if object.Len() != 0 || strong.Len() != 16 {
+    if strong.Len() != 16 {
         return .Err(.InvalidSignature)
     }
     var high u64 = 0

@@ -1,3 +1,11 @@
 format foundation.lock/v1
 root remolo.dirsync 1.0.0
 target linux
+package remolo.mux 1.0.0 sha256:d9a134f30a4fcc87dde6aa61b3bb209446c995cfaccafd3d86f2ebf609f62ac1 path ../mux
+package remolo.protocol 1.0.0 sha256:74407c717e7e42480eaa46fa54f81ddeae0690473e744ef2998d5d424284e405 path ../protocol
+package remolo.transport 1.0.0 sha256:843cea853fca50bc664725dc1940e8935c8d73e8e24de6a286c402adcd963124 path ../transport
+edge remolo.dirsync remolo.mux
+edge remolo.dirsync remolo.protocol
+edge remolo.mux remolo.protocol
+edge remolo.mux remolo.transport
+edge remolo.transport remolo.protocol

@@ -11,6 +11,7 @@ fn BuildSignature(
     blockSize u64
 ) Result<own Signature, Error> {
     const size = normalizedBlockSize(blockSize)
+    if size > maxBlockData() return .Err(.InvalidSignature)
     const length = source.Len() else error {
         discard error
         return .Err(.InvalidSignature)
@@ -58,6 +59,7 @@ fn WriteDelta(
 ) Result<Delta, Error> {
     var signature = value
     const blockSize = normalizedBlockSize(signature.BlockSize)
+    if blockSize > maxBlockData() return .Err(.InvalidSignature)
     var index = newWeakIndex()
     while signature.Len() > 0 {
         index.Insert(requiredBlock(signature.Take()))
@@ -166,12 +168,15 @@ fn WriteDelta(
     .Ok(Delta { Data = data LiteralBytes = literalBytes })
 }
 
+// fcs:ignore FCS6001 Delta validation keeps opcode state and output bounds in one flow.
 fn ApplyDelta(
     base bytes.Bytes,
     delta bytes.Bytes,
     expectedSize u64,
     blockSize u64
 ) Result<own bytes.Bytes, Error> {
+    const size = normalizedBlockSize(blockSize)
+    if size > maxBlockData() return .Err(.InvalidDelta)
     const openedBuilder = bytes.NewBuilder(expectedSize) else error {
         discard error
         return .Err(.TooLarge)
@@ -187,7 +192,6 @@ fn ApplyDelta(
         discard builder
         return .Err(.InvalidDelta)
     }
-    const size = normalizedBlockSize(blockSize)
     var offset u64 = 0
     var outputLength u64 = 0
     var complete = false

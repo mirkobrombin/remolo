@@ -1,0 +1,213 @@
+package remolo.dirsync
+
+import std.collections
+import std.fs
+import std.text
+
+struct fileBase {
+    Available bool
+    Size u64
+}
+
+fn prepareDirectory(
+    &root fs.RootWriter,
+    &local Manifest,
+    $existing Option<Entry>,
+    path String,
+    dryRun bool
+) Result<void, Error> {
+    const conflict = match existing {
+        None: false
+        Some(entry): !isDirectory(entry.Kind)
+    }
+    if dryRun return .Ok
+    if conflict {
+        removeLocalSubtree(&root, &local, path) else error {
+            return .Err(error)
+        }
+    }
+    root.CreateDirectory(path) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    .Ok
+}
+
+fn prepareSymbolicLink(
+    &root fs.RootWriter,
+    &local Manifest,
+    $existing Option<Entry>,
+    source Entry,
+    dryRun bool
+) Result<void, Error> {
+    const same = match existing {
+        None: false
+        Some(entry): {
+            isSymbolicLink(entry.Kind) && entry.Target == source.Target &&
+                entry.DirectoryLink == source.DirectoryLink
+        }
+    }
+    if same || dryRun return .Ok
+    removeLocalSubtree(&root, &local, source.Path) else error {
+        return .Err(error)
+    }
+    root.CreateSymbolicLink(
+        source.Path,
+        source.Target,
+        source.DirectoryLink
+    ) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    .Ok
+}
+
+fn prepareFileBase(
+    &root fs.RootWriter,
+    &local Manifest,
+    $existing Option<Entry>,
+    path String
+) Result<fileBase, Error> {
+    match existing {
+        None: .Ok(fileBase { Available = false Size = 0 })
+        Some(entry): {
+            if isFile(entry.Kind) {
+                return .Ok(fileBase {
+                    Available = true
+                    Size = entry.Size
+                })
+            }
+            removeLocalSubtree(&root, &local, path) else error {
+                return .Err(error)
+            }
+            .Ok(fileBase { Available = false Size = 0 })
+        }
+    }
+}
+
+fn removeExtras(
+    &root fs.RootWriter,
+    &local Manifest,
+    &sender Manifest
+) Result<void, Error> {
+    var pending = replace local.entries with collections.NewList<Entry>()
+    var reversed = collections.NewList<Entry>()
+    while !pending.IsEmpty() {
+        reversed.PushFront($requiredEntry(pending.PopFront()))
+    }
+    discard pending
+    var kept = collections.NewList<Entry>()
+    var count i32 = 0
+    while !reversed.IsEmpty() {
+        const entry = requiredEntry(reversed.PopFront())
+        const selected = sender.Find(entry.Path)
+        if optionEntryEmpty(selected) {
+            removeRootEntry(&root, entry) else error {
+                discard kept
+                return .Err(error)
+            }
+        } else {
+            kept.PushFront($entry)
+            count += 1
+        }
+    }
+    discard reversed
+    local.entries = kept
+    local.length = count
+    .Ok
+}
+
+fn removeLocalSubtree(
+    &root fs.RootWriter,
+    &local Manifest,
+    path String
+) Result<void, Error> {
+    var pending = replace local.entries with collections.NewList<Entry>()
+    var reversed = collections.NewList<Entry>()
+    while !pending.IsEmpty() {
+        reversed.PushFront($requiredEntry(pending.PopFront()))
+    }
+    discard pending
+    var kept = collections.NewList<Entry>()
+    var count i32 = 0
+    while !reversed.IsEmpty() {
+        const entry = requiredEntry(reversed.PopFront())
+        if pathInside(entry.Path, path) {
+            removeRootEntry(&root, entry) else error {
+                discard kept
+                return .Err(error)
+            }
+        } else {
+            kept.PushFront($entry)
+            count += 1
+        }
+    }
+    discard reversed
+    local.entries = kept
+    local.length = count
+    .Ok
+}
+
+fn applyDirectoryMetadata(
+    &root fs.RootWriter,
+    &manifest Manifest
+) Result<void, Error> {
+    var pending = replace manifest.entries with collections.NewList<Entry>()
+    var reversed = collections.NewList<Entry>()
+    while !pending.IsEmpty() {
+        reversed.PushFront($requiredEntry(pending.PopFront()))
+    }
+    discard pending
+    var restored = collections.NewList<Entry>()
+    while !reversed.IsEmpty() {
+        const entry = requiredEntry(reversed.PopFront())
+        if isDirectory(entry.Kind) {
+            root.SetPermissions(entry.Path, entry.Permissions) else error {
+                discard error
+                discard restored
+                return .Err(.Filesystem)
+            }
+            root.SetModified(entry.Path, entry.Modified) else error {
+                discard error
+                discard restored
+                return .Err(.Filesystem)
+            }
+        }
+        restored.PushFront($entry)
+    }
+    discard reversed
+    manifest.entries = restored
+    .Ok
+}
+
+fn removeRootEntry(
+    &root fs.RootWriter,
+    entry Entry
+) Result<void, Error> {
+    if isDirectory(entry.Kind) {
+        root.RemoveEmptyDirectory(entry.Path) else error {
+            discard error
+            return .Err(.Filesystem)
+        }
+        return .Ok
+    }
+    root.RemoveFile(entry.Path) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    .Ok
+}
+
+fn pathInside(value String, parent String) bool {
+    value == parent || text.StartsWith(value, parent + "/")
+}
+
+fn optionEntryEmpty(value Option<Entry>) bool {
+    match value {
+        None: true
+        Some(entry): {
+            discard entry
+            false
+        }
+    }
+}

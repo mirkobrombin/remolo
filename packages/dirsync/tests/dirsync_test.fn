@@ -3,12 +3,70 @@ package remolo.dirsync
 import std.bytes
 import std.fs
 
+@target(linux)
+fn createTestSymbolicLink(&root fs.RootWriter) bool {
+    root.CreateSymbolicLink("current", "nested/file.txt", false) else {
+        return false
+    }
+    true
+}
+
+@target(linux)
+fn createTestDirectoryLink(
+    &root fs.RootWriter,
+    target String
+) bool {
+    root.CreateSymbolicLink("escape", target, true) else {
+        return false
+    }
+    true
+}
+
+@target(macos)
+fn createTestDirectoryLink(
+    &root fs.RootWriter,
+    target String
+) bool {
+    root.CreateSymbolicLink("escape", target, true) else {
+        return false
+    }
+    true
+}
+
+@target(windows)
+fn createTestDirectoryLink(
+    &root fs.RootWriter,
+    target String
+) bool {
+    root.CreateSymbolicLink("escape", target, true) else {
+        return false
+    }
+    true
+}
+
+@target(macos)
+fn createTestSymbolicLink(&root fs.RootWriter) bool {
+    root.CreateSymbolicLink("current", "nested/file.txt", false) else {
+        return false
+    }
+    true
+}
+
+@target(windows)
+fn createTestSymbolicLink(&root fs.RootWriter) bool {
+    root.CreateSymbolicLink("current", "nested/file.txt", false) else {
+        return false
+    }
+    true
+}
+
 test "exclude patterns match paths and basenames" {
     const patterns = ["*.tmp", "node_modules", "build/out"]
     var excludes = NewExcluder(patterns)
     expect(excludes.Match("cache.tmp", false))
     expect(excludes.Match("src/cache.tmp", false))
     expect(excludes.Match("web/node_modules", true))
+    expect(excludes.Match("web/node_modules/module/index.js", false))
     expect(excludes.Match("build/out/generated.fn", false))
     expect(!excludes.Match("src/main.fn", false))
 }
@@ -56,17 +114,28 @@ test "manifest walks regular files and directories" {
     root.WriteFile("nested/file.txt", content, 416) else {
         fail("file creation failed")
     }
+    const linked = createTestSymbolicLink(&root)
     discard root.Close()
     var excludes = NewExcluder(["*.skip"])
     const builtManifest = BuildManifest(directory, &excludes, true) else error {
         panic(syncFailure(error))
     }
     var manifest = builtManifest
-    expect(manifest.Len() == 2)
+    var expectedEntries i32 = 2
+    if linked {
+        expectedEntries += 1
+    }
+    expect(manifest.Len() == expectedEntries)
     const file = requiredEntryResult(manifest.Find("nested/file.txt"))
     expect(file.Size == 10)
     expect(file.SHA256 ==
         "df42a4d5d3537666f9ed0012c3a44999878842f8d92f2ac056e6df0ca4ac44d1")
+    if linked {
+        const link = requiredEntryResult(manifest.Find("current"))
+        expect(isSymbolicLink(link.Kind))
+        expect(link.Target == "nested/file.txt")
+        expect(!link.DirectoryLink)
+    }
     const cleanup = fs.Canonicalize(directory) else {
         fail("temporary directory resolution failed")
     }
@@ -142,6 +211,69 @@ test "delta rejects missing end and invalid copy" {
     }
 }
 
+test "signature rejects an oversized block" {
+    match BuildSignature(bytes.FromText("data"), 67108865) {
+        Ok(signature): {
+            discard signature
+            fail("oversized signature block was accepted")
+        }
+        Err(error): expectInvalidSignature(error)
+    }
+}
+
+test "transfer statistics reject overflow" {
+    match addTransferBytes(18446744073709551615, 1) {
+        Ok(value): {
+            discard value
+            fail("transfer byte overflow was accepted")
+        }
+        Err(error): match error {
+            TooLarge: {}
+            _: fail("wrong transfer overflow error")
+        }
+    }
+}
+
+test "dry-run root resolution rejects a linked parent" {
+    const rootCreated = fs.CreateTempDirectory(".", "remolo-root-") else {
+        fail("root temporary directory creation failed")
+    }
+    const rootDirectory = fs.Canonicalize(rootCreated) else {
+        fail("root temporary directory resolution failed")
+    }
+    const outsideCreated = fs.CreateTempDirectory(".", "remolo-outside-") else {
+        fail("outside temporary directory creation failed")
+    }
+    const outsideDirectory = fs.Canonicalize(outsideCreated) else {
+        fail("outside temporary directory resolution failed")
+    }
+    fs.CreateDirectory(outsideDirectory + "/tree") else {
+        fail("outside tree creation failed")
+    }
+    const opened = fs.OpenRoot(rootDirectory) else {
+        fail("root opening failed")
+    }
+    var root = opened
+    const linked = createTestDirectoryLink(&root, outsideDirectory)
+    discard root.Close()
+    discard root
+    if linked {
+        match syncPushDirectory(rootDirectory, "escape/tree", true) {
+            Ok(path): {
+                discard path
+                fail("linked parent escaped the sync root")
+            }
+            Err(error): { discard error }
+        }
+    }
+    fs.RemoveTree(rootDirectory, 16, 4) else {
+        fail("root temporary directory cleanup failed")
+    }
+    fs.RemoveTree(outsideDirectory, 16, 4) else {
+        fail("outside temporary directory cleanup failed")
+    }
+}
+
 fn bytesFrom(values [u64]) own bytes.Bytes {
     const openedBuilder = bytes.NewBuilder(1024) else {
         fail("byte builder failed")
@@ -183,6 +315,13 @@ fn expectInvalidDelta(value Error) void {
     }
 }
 
+fn expectInvalidSignature(value Error) void {
+    match value {
+        InvalidSignature: {}
+        _: fail("wrong signature error")
+    }
+}
+
 fn syncFailure(value Error) String {
     match value {
         Filesystem: "dirsync: filesystem"
@@ -191,5 +330,8 @@ fn syncFailure(value Error) String {
         InvalidSignature: "dirsync: invalid signature"
         InvalidDelta: "dirsync: invalid delta"
         TooLarge: "dirsync: too large"
+        Protocol: "dirsync: protocol"
+        ReadOnly: "dirsync: read only"
+        Remote: "dirsync: remote"
     }
 }

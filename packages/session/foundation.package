@@ -6,6 +6,7 @@ fcs standard
 source src
 test_source tests
 dependency remolo.crypto 1.0.0 path ../crypto
+dependency remolo.dirsync 1.0.0 path ../dirsync
 dependency remolo.filetransfer 1.0.0 path ../filetransfer
 dependency remolo.identity 1.0.0 path ../identity
 dependency remolo.mux 1.0.0 path ../mux

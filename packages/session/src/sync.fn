@@ -1,0 +1,115 @@
+package remolo.session
+
+import remolo.dirsync
+import remolo.mux
+import remolo.protocol
+
+task PushDirectory(
+    $handle mux.Handle,
+    $localDirectory String,
+    $remoteDirectory String,
+    $options own dirsync.Options
+) Result<dirsync.Stats, Error> {
+    const opening = spawn mux.OpenChannel(
+        $handle,
+        $protocol.NewOpen(.Sync)
+    )
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        discard localDirectory
+        discard remoteDirectory
+        discard options
+        return .Err(.Multiplex)
+    }
+    const syncing = spawn dirsync.Push(
+        $stream,
+        $localDirectory,
+        $remoteDirectory,
+        $options
+    )
+    const result = $syncing.wait()
+    match result {
+        Ok(stats): .Ok(stats)
+        Err(error): {
+            discard error
+            .Err(.DirectorySync)
+        }
+    }
+}
+
+task PullDirectory(
+    $handle mux.Handle,
+    $remoteDirectory String,
+    $localDirectory String,
+    $options own dirsync.Options
+) Result<dirsync.Stats, Error> {
+    const opening = spawn mux.OpenChannel(
+        $handle,
+        $protocol.NewOpen(.Sync)
+    )
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        discard remoteDirectory
+        discard localDirectory
+        discard options
+        return .Err(.Multiplex)
+    }
+    const syncing = spawn dirsync.Pull(
+        $stream,
+        $remoteDirectory,
+        $localDirectory,
+        $options
+    )
+    const result = $syncing.wait()
+    match result {
+        Ok(stats): .Ok(stats)
+        Err(error): {
+            discard error
+            .Err(.DirectorySync)
+        }
+    }
+}
+
+task ServeDirectory(
+    $handle mux.Handle,
+    $rootPath String,
+    allowWrite bool
+) Result<void, Error> {
+    const accepting = spawn mux.AcceptChannel($handle)
+    const accepted = $accepting.wait()
+    const channel = accepted else error {
+        discard error
+        discard rootPath
+        return .Err(.Multiplex)
+    }
+    const mux.AcceptedChannel { Open Stream } = channel
+    if !syncKind(Open.Kind) {
+        discard Open
+        discard Stream
+        discard rootPath
+        return .Err(.Protocol)
+    }
+    discard Open
+    const serving = spawn dirsync.ServeWithPolicy(
+        $Stream,
+        $rootPath,
+        allowWrite
+    )
+    const result = $serving.wait()
+    match result {
+        Ok: .Ok
+        Err(error): {
+            discard error
+            .Err(.DirectorySync)
+        }
+    }
+}
+
+fn syncKind(value protocol.Kind) bool {
+    match value {
+        Sync: true
+        _: false
+    }
+}

@@ -1,0 +1,176 @@
+package remolo.dirsync
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+
+struct messageReadOutcome {
+    Reader own mux.Reader
+    Value Result<syncMessage, Error>
+}
+
+struct streamReadOutcome {
+    Reader own mux.Reader
+    Value Result<own bytes.Bytes, Error>
+}
+
+task writeSyncMessage(
+    $writer own mux.Writer,
+    $message syncMessage
+) Result<own mux.Writer, Error> {
+    const encoded = encodeSyncMessage(message) else error {
+        discard writer
+        return .Err(error)
+    }
+    const sending = spawn writeSyncFrame($writer, .JSON, $encoded)
+    const result = $sending.wait()
+    result
+}
+
+task readSyncMessage($reader own mux.Reader) messageReadOutcome {
+    const reading = spawn mux.ReadFrame($reader)
+    const outcome = $reading.wait()
+    const mux.FrameReadOutcome { Reader Value } = outcome
+    const frame = Value else error {
+        discard error
+        return messageReadOutcome { Reader = Reader Value = .Err(.Protocol) }
+    }
+    const protocol.Frame { Type Payload } = frame
+    if !syncJSON(Type) {
+        discard Payload
+        return messageReadOutcome { Reader = Reader Value = .Err(.Protocol) }
+    }
+    const decoded = decodeSyncMessage(Payload) else error {
+        return messageReadOutcome { Reader = Reader Value = .Err(error) }
+    }
+    messageReadOutcome { Reader = Reader Value = .Ok(decoded) }
+}
+
+task writeSyncStream(
+    $initialWriter own mux.Writer,
+    $data own bytes.Bytes
+) Result<own mux.Writer, Error> {
+    var writer = initialWriter
+    const length = data.Len() else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    var offset u64 = 0
+    while offset < length {
+        var end = offset + streamChunkSize()
+        if end > length {
+            end = length
+        }
+        const chunk = data.Slice(offset, end) else error {
+            discard error
+            return .Err(.Protocol)
+        }
+        const sending = spawn writeSyncFrame($writer, .Data, $chunk)
+        const sent = $sending.wait()
+        const next = sent else error {
+            discard data
+            return .Err(error)
+        }
+        writer = next
+        offset = end
+    }
+    discard data
+    const ending = spawn writeSyncFrame(
+        $writer,
+        .EOF,
+        $bytes.FromText("")
+    )
+    const completed = $ending.wait()
+    completed
+}
+
+task readSyncStream(
+    $initialReader own mux.Reader,
+    limit u64
+) streamReadOutcome {
+    var reader = initialReader
+    const opened = bytes.NewBuilder(limit) else error {
+        discard error
+        return streamReadOutcome { Reader = reader Value = .Err(.TooLarge) }
+    }
+    var builder = opened
+    var complete = false
+    while !complete {
+        const reading = spawn mux.ReadFrame($reader)
+        const outcome = $reading.wait()
+        const mux.FrameReadOutcome { Reader as restored Value } = outcome
+        reader = restored
+        const frame = Value else error {
+            discard error
+            return streamReadOutcome { Reader = reader Value = .Err(.Protocol) }
+        }
+        const protocol.Frame { Type Payload } = frame
+        if syncData(Type) {
+            builder.Write(Payload) else error {
+                discard error
+                discard Payload
+                return streamReadOutcome { Reader = reader Value = .Err(.TooLarge) }
+            }
+            discard Payload
+        } else {
+            if syncEOF(Type) {
+                discard Payload
+                complete = true
+            } else {
+                discard Payload
+                return streamReadOutcome {
+                    Reader = reader
+                    Value = .Err(.Protocol)
+                }
+            }
+        }
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return streamReadOutcome { Reader = reader Value = .Err(.Protocol) }
+    }
+    streamReadOutcome { Reader = reader Value = .Ok(result) }
+}
+
+task writeSyncFrame(
+    $writer own mux.Writer,
+    frameType protocol.FrameType,
+    $payload own bytes.Bytes
+) Result<own mux.Writer, Error> {
+    const sending = spawn mux.WriteFrame($writer, frameType, $payload)
+    const outcome = $sending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Ok(Writer)
+        Err(error): {
+            discard error
+            discard Writer
+            .Err(.Protocol)
+        }
+    }
+}
+
+fn streamChunkSize() u64 {
+    1024 * 1024
+}
+
+fn syncJSON(value protocol.FrameType) bool {
+    match value {
+        JSON: true
+        _: false
+    }
+}
+
+fn syncData(value protocol.FrameType) bool {
+    match value {
+        Data: true
+        _: false
+    }
+}
+
+fn syncEOF(value protocol.FrameType) bool {
+    match value {
+        EOF: true
+        _: false
+    }
+}

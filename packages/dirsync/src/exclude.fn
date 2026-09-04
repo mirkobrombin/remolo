@@ -42,10 +42,28 @@ fn NewExcluder(patterns [String]) own Excluder {
 fn matchesPattern(pattern String, path String, directory bool) bool {
     discard directory
     if globMatch(pattern, path) return true
-    if !text.Contains(pattern, "/") && globMatch(pattern, baseName(path)) {
+    if !text.Contains(pattern, "/") && componentMatches(pattern, path) {
         return true
     }
     text.StartsWith(path, pattern + "/")
+}
+
+fn componentMatches(pattern String, path String) bool {
+    const length = text.ByteLen(path)
+    var start u64 = 0
+    var end u64 = 0
+    while end <= length {
+        if end == length || byteAt(path, end) == 47 {
+            const component = text.Slice(path, start, end) else error {
+                discard error
+                panic("dirsync component boundary invariant failed")
+            }
+            if globMatch(pattern, component) return true
+            start = end + 1
+        }
+        end += 1
+    }
+    false
 }
 
 fn globMatch(pattern String, value String) bool {
@@ -102,21 +120,6 @@ fn cleanPattern(value String) String {
         panic("dirsync pattern boundary invariant failed")
     }
     cleaned
-}
-
-fn baseName(value String) String {
-    var offset = text.ByteLen(value)
-    while offset > 0 {
-        if byteAt(value, offset - 1) == 47 {
-            const result = text.Slice(value, offset, text.ByteLen(value)) else error {
-                discard error
-                panic("dirsync path boundary invariant failed")
-            }
-            return result
-        }
-        offset -= 1
-    }
-    text.Copy(value)
 }
 
 fn requiredPattern($value Option<String>) String {

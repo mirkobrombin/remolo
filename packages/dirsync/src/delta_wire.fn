@@ -107,3 +107,42 @@ fn maxBlockData() u64 {
 fn deltaLimit(sourceLength u64) u64 {
     sourceLength + ((sourceLength / maxBlockData()) + 2) * 5 + 1
 }
+
+fn deltaLiteralBytes(value bytes.Bytes) Result<u64, Error> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.InvalidDelta)
+    }
+    var offset u64 = 0
+    var literal u64 = 0
+    while offset < length {
+        const op = byteValue(value, offset)
+        offset += 1
+        if op == 3 {
+            if offset != length return .Err(.InvalidDelta)
+            return .Ok(literal)
+        }
+        if op == 1 {
+            const size = readU32(value, offset) else error {
+                return .Err(error)
+            }
+            offset += 4
+            if size > maxBlockData() || offset + size > length {
+                return .Err(.InvalidDelta)
+            }
+            literal += size
+            offset += size
+            continue
+        }
+        if op == 2 {
+            const block = readU32(value, offset) else error {
+                return .Err(error)
+            }
+            discard block
+            offset += 4
+            continue
+        }
+        return .Err(.InvalidDelta)
+    }
+    .Err(.InvalidDelta)
+}

@@ -156,8 +156,10 @@ fn decodeEntry(path String, $value json.Value) Result<Entry, Error> {
     const directoryLink = takeOptionalBool(&object, "directory") else {
         return .Err(.InvalidManifest)
     }
-    if object.Len() != 0 return .Err(.InvalidManifest)
     if isFile(kind) && !text.IsEmpty(digest) && text.ByteLen(digest) != 64 {
+        return .Err(.InvalidManifest)
+    }
+    if isFile(kind) && size > 9223372036854775807 {
         return .Err(.InvalidManifest)
     }
     if !isFile(kind) && size != 0 return .Err(.InvalidManifest)
