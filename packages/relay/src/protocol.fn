@@ -1,0 +1,82 @@
+package remolo.relay
+
+import std.net
+import std.text
+
+struct greetingCursor {
+    value String
+    offset u64
+    length u64
+}
+
+fn clientGreeting(sessionID String) String {
+    "REMOLO-RELAY client " + sessionID + "\n"
+}
+
+fn hostGreeting(sessionID String) String {
+    "REMOLO-RELAY host " + sessionID + "\n"
+}
+
+fn greetingSession($value String) Result<String, Error> {
+    const length = text.ByteLen(value)
+    var cursor = greetingCursor {
+        value = value
+        offset = 0
+        length = length
+    }
+    const prefix = cursor.Next() else error { return .Err(error) }
+    const role = cursor.Next() else error { return .Err(error) }
+    const sessionID = cursor.Next() else error { return .Err(error) }
+    if prefix != "REMOLO-RELAY" || text.IsEmpty(role) || text.IsEmpty(sessionID) {
+        return .Err(.InvalidGreeting)
+    }
+    cursor.SkipWhitespace()
+    if cursor.offset != cursor.length return .Err(.InvalidGreeting)
+    .Ok(text.Copy(sessionID))
+}
+
+fn greetingWhitespace(value u64) bool {
+    value == 9 || value == 10 || value == 11 || value == 12 ||
+        value == 13 || value == 32
+}
+
+fn cursorByte(value String, offset u64) u64 {
+    const result = text.ByteAt(value, offset) else error {
+        discard error
+        panic("relay greeting boundary invariant failed")
+    }
+    result
+}
+
+methods greetingCursor {
+    fn SkipWhitespace(&self) void {
+        while self.offset < self.length &&
+            greetingWhitespace(cursorByte(self.value, self.offset)) {
+            self.offset += 1
+        }
+    }
+
+    fn Next(&self) Result<String, Error> {
+        self.SkipWhitespace()
+        const start = self.offset
+        while self.offset < self.length &&
+            !greetingWhitespace(cursorByte(self.value, self.offset)) {
+            self.offset += 1
+        }
+        if start == self.offset return .Err(.InvalidGreeting)
+        const field = text.Slice(self.value, start, self.offset) else error {
+            discard error
+            return .Err(.InvalidGreeting)
+        }
+        .Ok(field)
+    }
+}
+
+fn networkError(error net.Error) Error {
+    match error {
+        InvalidAddress: .InvalidAddress
+        Timeout: .Timeout
+        Closed: .Closed
+        _: .Io
+    }
+}

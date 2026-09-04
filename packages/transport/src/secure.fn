@@ -5,6 +5,7 @@ import foundation.tls
 import remolo.protocol
 import std.bytes
 import std.concurrent
+import std.net
 
 @concurrent.Transferable()
 struct SecureReader {
@@ -105,6 +106,53 @@ task DialSecure(
     const connected = $pending.wait()
     match connected {
         Ok(connection): openSecureStream($connection)
+        Err(error): .Err(secureError(error))
+    }
+}
+
+task SecureClientOver(
+    $connection own net.TcpConnection,
+    $hostRawPublicKey own bytes.Bytes
+) Result<SecureStream, Error> {
+    const source = concurrent.NewCancellationSource()
+    const cancellation = source.Token()
+    discard source
+    const pending = spawn tls.OpenSSLConnectOverPinned(
+        $connection,
+        $hostRawPublicKey,
+        $"remolo/1",
+        15000000000,
+        $cancellation
+    )
+    const connected = $pending.wait()
+    match connected {
+        Ok(secured): openSecureStream($secured)
+        Err(error): .Err(secureError(error))
+    }
+}
+
+task SecureServerOver(
+    $connection own net.TcpConnection,
+    $privateKeyPEM own bytes.Bytes
+) Result<SecureStream, Error> {
+    const certificate = auth.OpenSSLEd25519Certificate(privateKeyPEM) else error {
+        discard error
+        return .Err(.InvalidFrame)
+    }
+    const source = concurrent.NewCancellationSource()
+    const cancellation = source.Token()
+    discard source
+    const pending = spawn tls.OpenSSLAcceptOver(
+        $connection,
+        $certificate,
+        $privateKeyPEM,
+        $"remolo/1",
+        15000000000,
+        $cancellation
+    )
+    const accepted = $pending.wait()
+    match accepted {
+        Ok(secured): openSecureStream($secured)
         Err(error): .Err(secureError(error))
     }
 }

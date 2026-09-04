@@ -27,6 +27,8 @@ struct Host {
     listener own transport.SecureListener
     psk own bytes.Bytes
     publicKey own bytes.Bytes
+    privateKey own bytes.Bytes
+    sessionID own bytes.Bytes
     capabilities protocol.Capabilities
     expiry u64
 
@@ -122,12 +124,19 @@ fn ListenLocal(
         discard error
         return .Err(.Storage)
     }
+    const privateKey = generated.PrivateKeyPEM.Copy() else error {
+        discard error
+        discard hostKey
+        discard tokenKey
+        return .Err(.Storage)
+    }
     const listener = transport.ListenSecure(
         $"127.0.0.1",
         0,
         generated.PrivateKeyPEM
     ) else error {
         discard error
+        discard privateKey
         return .Err(.Transport)
     }
     const port = u16.From(listener.Port()) else error {
@@ -144,10 +153,26 @@ fn ListenLocal(
         ""
     ) else error {
         discard error
+        discard listener
+        discard hostKey
+        discard privateKey
         return .Err(.Storage)
     }
     const psk = credential.PSK.Copy() else error {
         discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard credential
+        return .Err(.Storage)
+    }
+    const sessionID = credential.SessionID.Copy() else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard psk
+        discard credential
         return .Err(.Storage)
     }
     .Ok(ListeningHost {
@@ -155,6 +180,8 @@ fn ListenLocal(
             listener = listener
             psk = psk
             publicKey = hostKey
+            privateKey = privateKey
+            sessionID = sessionID
             capabilities = capabilities
             expiry = expiry
         }
@@ -191,6 +218,12 @@ task Listen($options HostOptions) Result<ListeningHost, Error> {
         discard error
         return .Err(.Storage)
     }
+    const privateKey = generated.PrivateKeyPEM.Copy() else error {
+        discard error
+        discard hostKey
+        discard tokenKey
+        return .Err(.Storage)
+    }
     const listener = transport.ListenSecure(
         $BindAddress,
         Port,
@@ -199,6 +232,7 @@ task Listen($options HostOptions) Result<ListeningHost, Error> {
         discard error
         discard hostKey
         discard tokenKey
+        discard privateKey
         return .Err(.Transport)
     }
     discard generated
@@ -207,6 +241,7 @@ task Listen($options HostOptions) Result<ListeningHost, Error> {
         discard listener
         discard hostKey
         discard tokenKey
+        discard privateKey
         return .Err(.Transport)
     }
     const candidates [1]token.Candidate = [
@@ -221,12 +256,24 @@ task Listen($options HostOptions) Result<ListeningHost, Error> {
         discard error
         discard listener
         discard hostKey
+        discard privateKey
         return .Err(.Storage)
     }
     const psk = credential.PSK.Copy() else error {
         discard error
         discard listener
         discard hostKey
+        discard privateKey
+        discard credential
+        return .Err(.Storage)
+    }
+    const sessionID = credential.SessionID.Copy() else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard psk
+        discard credential
         return .Err(.Storage)
     }
     .Ok(ListeningHost {
@@ -234,6 +281,8 @@ task Listen($options HostOptions) Result<ListeningHost, Error> {
             listener = listener
             psk = psk
             publicKey = hostKey
+            privateKey = privateKey
+            sessionID = sessionID
             capabilities = Capabilities
             expiry = Expiry
         }
@@ -285,6 +334,20 @@ task Connect($credential own token.Token) Result<own Client, Error> {
         discard error
         return .Err(.Transport)
     }
+    const authenticating = spawn connectSecured(
+        $secured,
+        $PSK,
+        $HostPublicKey
+    )
+    const result = $authenticating.wait()
+    result
+}
+
+task connectSecured(
+    $secured transport.SecureStream,
+    $psk own bytes.Bytes,
+    $hostPublicKey own bytes.Bytes
+) Result<own Client, Error> {
     var session = mux.NewClient($secured)
     const handle = session.Handle()
     const opening = spawn mux.OpenChannel(
@@ -294,15 +357,15 @@ task Connect($credential own token.Token) Result<own Client, Error> {
     const streamResult = $opening.wait()
     const stream = streamResult else error {
         mux.Close($session)
-        discard HostPublicKey
-        discard PSK
+        discard hostPublicKey
+        discard psk
         discard error
         return .Err(.Multiplex)
     }
     const authenticating = spawn authenticateClient(
         $stream,
-        $PSK,
-        $HostPublicKey
+        $psk,
+        $hostPublicKey
     )
     const controlResult = $authenticating.wait()
     const control = controlResult else error {
@@ -330,6 +393,8 @@ task Accept($host own Host) HostAcceptOutcome {
         listener
         psk
         publicKey
+        privateKey
+        sessionID
         capabilities
         expiry
     } = host
@@ -340,6 +405,8 @@ task Accept($host own Host) HostAcceptOutcome {
         listener = Listener
         psk = psk
         publicKey = publicKey
+        privateKey = privateKey
+        sessionID = sessionID
         capabilities = capabilities
         expiry = expiry
     }

@@ -1,0 +1,97 @@
+package remolo.relay_server
+
+import std.net
+import std.text
+
+struct options {
+    address String
+    port u64
+    help bool
+}
+
+fn argument(args [String], index usize) String {
+    text.Copy(args[index])
+}
+
+fn normalizedEndpoint(value String) String {
+    if text.StartsWith(value, ":") return "0.0.0.0" + value
+    text.Copy(value)
+}
+
+fn applyAddress(&value options, source String) Result<void, String> {
+    const endpoint = net.ParseEndpoint(normalizedEndpoint(source)) else {
+        return .Err("--addr requires host:port")
+    }
+    const net.Endpoint { Host Port } = endpoint
+    value.address = Host
+    value.port = u64.From(Port)
+    .Ok
+}
+
+fn assignedAddress(source String) Option<String> {
+    if text.StartsWith(source, "-addr=") {
+        const value = text.Slice(source, 6, text.ByteLen(source)) else {
+            return .None
+        }
+        return .Some(value)
+    }
+    if text.StartsWith(source, "--addr=") {
+        const value = text.Slice(source, 7, text.ByteLen(source)) else {
+            return .None
+        }
+        return .Some(value)
+    }
+    .None
+}
+
+fn addressAfter(args [String], index usize) Result<String, String> {
+    if index + 1 < len(args) return .Ok(argument(args, index + 1))
+    .Err("--addr requires a value")
+}
+
+fn parseOption(
+    &value options,
+    args [String],
+    index usize
+) Result<usize, String> {
+    const name = argument(args, index)
+    if name == "--help" || name == "-h" {
+        value.help = true
+        return .Ok(index + 1)
+    }
+    match assignedAddress(name) {
+        Some(source): {
+            applyAddress(&value, source) else error { return .Err(error) }
+            return .Ok(index + 1)
+        }
+        None: {}
+    }
+    if name != "--addr" && name != "-addr" {
+        return .Err("unknown option: " + name)
+    }
+    const source = addressAfter(args, index) else error {
+        return .Err(error)
+    }
+    applyAddress(&value, source) else error { return .Err(error) }
+    .Ok(index + 2)
+}
+
+fn parseOptions(args [String]) Result<own options, String> {
+    var value = own options {
+        address = "0.0.0.0"
+        port = 8788
+        help = false
+    }
+    var index usize = 0
+    while index < len(args) {
+        const next = parseOption(&value, args, index) else error {
+            return .Err(error)
+        }
+        index = next
+    }
+    .Ok(value)
+}
+
+fn usage() String {
+    "usage: remolo-relay [-addr HOST:PORT]\n"
+}

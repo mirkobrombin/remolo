@@ -1,3 +1,4 @@
 format foundation.workspace/v1
 member remolo apps/remolo
 member remolo-rendezvous apps/remolo-rendezvous
+member remolo-relay apps/remolo-relay

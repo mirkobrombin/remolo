@@ -1,0 +1,8 @@
+format foundation.package/v1
+name remolo.relay
+version 1.0.0
+language 1
+fcs standard
+source src
+test_source tests
+

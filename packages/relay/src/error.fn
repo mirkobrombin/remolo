@@ -1,0 +1,10 @@
+package remolo.relay
+
+enum Error {
+    InvalidAddress
+    InvalidGreeting
+    Timeout
+    Closed
+    Io
+}
+

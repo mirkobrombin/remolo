@@ -1,0 +1,151 @@
+package remolo.relay
+
+import std.format
+import std.net
+import std.text
+import std.time
+
+test "relay pairs peers by session and copies opaque bytes" {
+    const server = NewServer($"127.0.0.1", 0) else error {
+        discard error
+        fail("relay listen failed")
+    }
+    const port = server.Port()
+    const openedControl = server.Control() else error {
+        discard error
+        fail("relay control failed")
+    }
+    var control = openedControl
+    const serving = spawn Serve($server)
+    const address = "127.0.0.1:" + format.U64(port)
+    const hostPending = spawn RegisterHost(text.Copy(address), "deadbeefcafe0001")
+    const clientPending = spawn DialClient($address, "deadbeefcafe0001")
+    const host = $hostPending.wait() else error {
+        discard error
+        fail("relay host registration failed")
+    }
+    const client = $clientPending.wait() else error {
+        discard error
+        fail("relay client registration failed")
+    }
+    const hostStream = host.SplitControlled() else error {
+        discard error
+        fail("host split failed")
+    }
+    const clientStream = client.SplitControlled() else error {
+        discard error
+        fail("client split failed")
+    }
+    const net.ControlledStream {
+        Reader as hostReader
+        Writer as hostWriter
+        Controller as hostController
+    } = hostStream
+    const net.ControlledStream {
+        Reader as clientReader
+        Writer as clientWriter
+        Controller as clientController
+    } = clientStream
+    const writing = spawn net.WriteAll($clientWriter, $"opaque relay payload")
+    const written = $writing.wait()
+    const net.WriteOutcome { Writer as restoredClientWriter Value } = written
+    Value else error {
+        discard error
+        fail("relay write failed")
+    }
+    const deadline = net.DeadlineAfter(time.Seconds(2)) else error {
+        discard error
+        fail("deadline failed")
+    }
+    const reading = spawn net.ReadExactUntil($hostReader, 20, deadline)
+    const read = $reading.wait()
+    const net.ReadOutcome { Reader as restoredHostReader Value as body } = read
+    const value = body else error {
+        discard error
+        fail("relay read failed")
+    }
+    expect(value == "opaque relay payload")
+    discard restoredHostReader
+    discard hostWriter
+    discard hostController
+    discard clientReader
+    discard restoredClientWriter
+    discard clientController
+    discard control.Close()
+    const served = $serving.wait()
+    served else error {
+        discard error
+        fail("relay server shutdown failed")
+    }
+    pass()
+}
+
+test "relay does not pair different sessions" {
+    const server = NewServer($"127.0.0.1", 0) else error {
+        discard error
+        fail("relay listen failed")
+    }
+    const port = server.Port()
+    const openedControl = server.Control() else error {
+        discard error
+        fail("relay control failed")
+    }
+    var control = openedControl
+    const serving = spawn Serve($server)
+    const address = "127.0.0.1:" + format.U64(port)
+    const hostPending = spawn RegisterHost(text.Copy(address), "aaaa")
+    const clientPending = spawn DialClient($address, "bbbb")
+    const host = $hostPending.wait() else error {
+        discard error
+        fail("relay host registration failed")
+    }
+    const client = $clientPending.wait() else error {
+        discard error
+        fail("relay client registration failed")
+    }
+    const hostStream = host.Split() else error {
+        discard error
+        fail("host split failed")
+    }
+    const clientStream = client.Split() else error {
+        discard error
+        fail("client split failed")
+    }
+    const net.StreamPair { Reader as hostReader Writer as hostWriter } = hostStream
+    const net.StreamPair { Reader as clientReader Writer as clientWriter } = clientStream
+    const writing = spawn net.WriteAll($clientWriter, $"ping")
+    const written = $writing.wait()
+    const net.WriteOutcome { Writer as restoredClientWriter Value } = written
+    Value else error {
+        discard error
+        fail("relay write failed")
+    }
+    const deadline = net.DeadlineAfter(time.Milliseconds(100)) else error {
+        discard error
+        fail("deadline failed")
+    }
+    const reading = spawn net.ReadExactUntil($hostReader, 4, deadline)
+    const read = $reading.wait()
+    const net.ReadOutcome { Reader as restoredHostReader Value as body } = read
+    match body {
+        Ok(value): {
+            discard value
+            fail("different relay sessions were paired")
+        }
+        Err(error): match error {
+            Timeout: {}
+            _: { fail("unmatched relay read did not time out") }
+        }
+    }
+    discard restoredHostReader
+    discard hostWriter
+    discard clientReader
+    discard restoredClientWriter
+    discard control.Close()
+    const served = $serving.wait()
+    served else error {
+        discard error
+        fail("relay server shutdown failed")
+    }
+    pass()
+}

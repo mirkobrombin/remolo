@@ -2,9 +2,11 @@ package remolo.session
 
 import remolo.dirsync
 import remolo.protocol
+import remolo.relay
 import remolo.tunnel
 import std.bytes
 import std.collections
+import std.format
 import std.fs
 import std.net
 import std.text
@@ -103,6 +105,69 @@ test "client and host authenticate over pinned multiplexed TLS" {
     CloseClient($client)
     ClosePeer($peer)
     expect(host.Close())
+}
+
+test "client and host execute through an opaque relay" {
+    const relayServer = relay.NewServer($"127.0.0.1", 0) else error {
+        discard error
+        fail("relay listen failed")
+    }
+    const openedControl = relayServer.Control() else error {
+        discard error
+        fail("relay control failed")
+    }
+    var relayControl = openedControl
+    const relayPort = relayServer.Port()
+    const relayServing = spawn relay.Serve($relayServer)
+    const relayAddress = "127.0.0.1:" + format.U64(relayPort)
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn AcceptRelay($host, text.Copy(relayAddress))
+    const connecting = spawn ConnectRelay($Token, $relayAddress)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("relay client connection failed")
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error {
+        discard error
+        fail("relay host connection failed")
+    }
+    expect(bytes.ConstantTimeEqual(client.sessionKey, peer.sessionKey))
+    const serving = spawn ServeExec($peer.Handle())
+    const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const executed = $executing.wait() else error {
+        discard error
+        fail("relay execution failed")
+    }
+    const served = $serving.wait()
+    served else error {
+        discard error
+        fail("relay execution service failed")
+    }
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("relay stdout text failed") }
+    const stderr = Stderr.Text() else { fail("relay stderr text failed") }
+    expect(Exit.Code == 7)
+    expect(stdout == "foundation-exec\n")
+    expect(stderr == "foundation-stderr\n")
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    discard host
+    discard relayControl.Close()
+    const relayServed = $relayServing.wait()
+    relayServed else error {
+        discard error
+        fail("relay shutdown failed")
+    }
 }
 
 fn execDescriptor() protocol.Open {

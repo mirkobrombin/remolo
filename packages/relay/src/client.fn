@@ -1,0 +1,56 @@
+package remolo.relay
+
+import std.net
+import std.time
+
+task DialClient(
+    $address String,
+    $sessionID String
+) Result<own net.TcpConnection, Error> {
+    const greeting = clientGreeting(sessionID)
+    const pending = spawn connectWithGreeting($address, $greeting)
+    const result = $pending.wait()
+    result
+}
+
+task RegisterHost(
+    $address String,
+    $sessionID String
+) Result<own net.TcpConnection, Error> {
+    const greeting = hostGreeting(sessionID)
+    const pending = spawn connectWithGreeting($address, $greeting)
+    const result = $pending.wait()
+    result
+}
+
+task connectWithGreeting(
+    $address String,
+    $greeting String
+) Result<own net.TcpConnection, Error> {
+    const endpoint = net.ParseEndpoint(address) else error {
+        discard error
+        return .Err(.InvalidAddress)
+    }
+    const deadline = net.DeadlineAfter(time.Seconds(30)) else error {
+        discard error
+        return .Err(.Timeout)
+    }
+    const net.Endpoint { Host Port } = endpoint
+    const connecting = spawn net.ConnectUntil($Host, u64.From(Port), deadline)
+    const connection = $connecting.wait()
+    const connected = connection else error {
+        return .Err(networkError(error))
+    }
+    const writing = spawn net.WriteConnectionAllUntil(
+        $connected,
+        $greeting,
+        deadline
+    )
+    const written = $writing.wait()
+    const net.ConnectionWriteOutcome { Connection Value } = written
+    Value else error {
+        discard Connection
+        return .Err(networkError(error))
+    }
+    .Ok(Connection)
+}
