@@ -1,0 +1,143 @@
+package remolo.session
+
+import remolo.crypto
+import remolo.mux
+import remolo.transport
+import std.bytes
+
+task acceptPeer(
+    $secured transport.SecureStream,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    $encodedCaps own bytes.Bytes
+) Result<own Peer, Error> {
+    var session = mux.NewServer($secured)
+    const handle = session.Handle()
+    const accepting = spawn mux.AcceptChannel($handle.Clone())
+    const acceptedResult = $accepting.wait()
+    const accepted = acceptedResult else error {
+        mux.Close($session)
+        discard error
+        return .Err(.Multiplex)
+    }
+    if !controlKind(accepted.Open.Kind) {
+        discard accepted
+        mux.Close($session)
+        return .Err(.Protocol)
+    }
+    const mux.AcceptedChannel { Open Stream } = accepted
+    discard Open
+    const authenticating = spawn authenticateHost(
+        $Stream,
+        $psk,
+        $publicKey,
+        $encodedCaps
+    )
+    const controlResult = $authenticating.wait()
+    const control = controlResult else error {
+        mux.Close($session)
+        return .Err(error)
+    }
+    const hostControl { reader writer key } = control
+    .Ok(own Peer {
+        session = session
+        handle = handle
+        controlReader = reader
+        controlWriter = writer
+        sessionKey = key
+    })
+}
+
+task authenticateHost(
+    $stream mux.Stream,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    $encodedCaps own bytes.Bytes
+) Result<hostControl, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const modePending = spawn readRaw($Reader, 1)
+    const modeResult = $modePending.wait()
+    const modeRead = modeResult else error {
+        discard Writer
+        return .Err(error)
+    }
+    const rawRead { reader as modeReader value as modeValue } = modeRead
+    var reader = modeReader
+    const mode = modeValue.At(0) else error {
+        discard error
+        discard reader
+        discard Writer
+        return .Err(.Protocol)
+    }
+    if mode != 80 {
+        discard reader
+        discard Writer
+        return .Err(.Authentication)
+    }
+    const noncePending = spawn readRaw($reader, 32)
+    const nonceResult = $noncePending.wait()
+    const nonceRead = nonceResult else error {
+        discard Writer
+        return .Err(error)
+    }
+    const rawRead { reader as nonceReader value as clientNonce } = nonceRead
+    reader = nonceReader
+    const hostNonce = crypto.GenerateNonce() else error {
+        discard reader
+        discard Writer
+        return .Err(handshakeError(error))
+    }
+    const response = crypto.HostResponse(
+        psk,
+        publicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        discard reader
+        discard Writer
+        return .Err(handshakeError(error))
+    }
+    const responsePending = spawn writeRaw($Writer, $response)
+    const startedWriterResult = $responsePending.wait()
+    const startedWriter = startedWriterResult else error {
+        discard reader
+        return .Err(error)
+    }
+    var writer = startedWriter
+    const proofPending = spawn readRaw($reader, 32)
+    const proofResult = $proofPending.wait()
+    const proofRead = proofResult else error {
+        discard writer
+        return .Err(error)
+    }
+    const rawRead { reader as proofReader value as proofValue } = proofRead
+    reader = proofReader
+    const sessionKey = crypto.FinishHost(
+        psk,
+        publicKey,
+        clientNonce,
+        hostNonce,
+        proofValue
+    ) else error {
+        discard reader
+        discard writer
+        return .Err(handshakeError(error))
+    }
+    const capsPending = spawn mux.WriteFrame($writer, .JSON, $encodedCaps)
+    const capsOutcome = $capsPending.wait()
+    const mux.WriteOutcome { Writer as restored Value } = capsOutcome
+    match Value {
+        Ok: .Ok(hostControl {
+            reader = reader
+            writer = restored
+            key = sessionKey
+        })
+        Err(error): {
+            discard reader
+            discard restored
+            discard sessionKey
+            .Err(muxError(error))
+        }
+    }
+}

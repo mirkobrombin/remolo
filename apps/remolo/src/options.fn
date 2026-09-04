@@ -1,5 +1,6 @@
 package remolo.cli
 
+import remolo.session
 import std.env
 import std.net
 import std.parse
@@ -13,6 +14,10 @@ struct hostOptions {
     identityPath String
     fileRoot String
     rendezvous String
+    includeLoopback bool
+    mdns bool
+    stun String
+    relay String
     readOnly bool
     once bool
 }
@@ -26,6 +31,8 @@ struct syncOptions {
 enum hostSwitch {
     ReadOnly
     Once
+    Loopback
+    MDNS
 }
 
 enum hostValue {
@@ -35,6 +42,8 @@ enum hostValue {
     Identity
     FileRoot
     Rendezvous
+    STUN
+    Relay
 }
 
 fn argument(args [String], index usize) String {
@@ -53,6 +62,8 @@ fn optionValue(
 fn hostSwitchFor(name String) Option<hostSwitch> {
     if name == "--read-only" || name == "--ro" return .Some(.ReadOnly)
     if name == "--once" return .Some(.Once)
+    if name == "--loopback" return .Some(.Loopback)
+    if name == "--mdns" return .Some(.MDNS)
     .None
 }
 
@@ -63,6 +74,8 @@ fn hostValueFor(name String) Option<hostValue> {
     if name == "--identity" return .Some(.Identity)
     if name == "--file-root" return .Some(.FileRoot)
     if name == "--rendezvous" return .Some(.Rendezvous)
+    if name == "--stun" return .Some(.STUN)
+    if name == "--relay" return .Some(.Relay)
     .None
 }
 
@@ -70,6 +83,8 @@ fn applyHostSwitch(&options hostOptions, value hostSwitch) void {
     match value {
         ReadOnly: { options.readOnly = true }
         Once: { options.once = true }
+        Loopback: { options.includeLoopback = true }
+        MDNS: { options.mdns = true }
     }
 }
 
@@ -95,6 +110,14 @@ fn applyHostValue(
         }
         Rendezvous: {
             options.rendezvous = text.Copy(value)
+            .Ok
+        }
+        STUN: {
+            options.stun = text.Copy(value)
+            .Ok
+        }
+        Relay: {
+            options.relay = text.Copy(value)
             .Ok
         }
     }
@@ -163,15 +186,64 @@ fn defaultFileRoot() String {
 fn defaultHostOptions() own hostOptions {
     own hostOptions {
         bindAddress = "0.0.0.0"
-        advertiseAddress = "127.0.0.1"
+        advertiseAddress = ""
         port = 0
         ttl = 86400
         identityPath = ""
         fileRoot = defaultFileRoot()
         rendezvous = ""
+        includeLoopback = false
+        mdns = false
+        stun = ""
+        relay = ""
         readOnly = false
         once = false
     }
+}
+
+struct connectOptions {
+    connection own session.ConnectOptions
+    commandStart usize
+}
+
+fn parseConnectOptions(
+    args [String]
+) Result<own connectOptions, failure> {
+    var connection = session.DefaultConnectOptions()
+    var index usize = 2
+    var commandStart = len(args)
+    var parsing = true
+    while index < len(args) && parsing {
+        const name = argument(args, index)
+        if name == "--" {
+            commandStart = index + 1
+            parsing = false
+            continue
+        }
+        if name == "--mdns" {
+            connection.LocalDiscovery = true
+            index += 1
+            continue
+        }
+        if name == "--rendezvous" || name == "--relay" {
+            const value = optionValue(args, index, name) else error {
+                return .Err(error)
+            }
+            if name == "--rendezvous" {
+                connection.Rendezvous = value
+            } else {
+                connection.Relay = value
+            }
+            index += 2
+            continue
+        }
+        commandStart = index
+        parsing = false
+    }
+    .Ok(own connectOptions {
+        connection = connection
+        commandStart = commandStart
+    })
 }
 
 fn parseHostOptions(args [String]) Result<own hostOptions, failure> {

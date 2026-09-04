@@ -1,0 +1,88 @@
+package remolo.holepunch
+
+import std.bytes
+
+fn writeU16OrPanic(&builder bytes.Builder, value u64) void {
+    writeU16(&builder, value) else { panic("response encoding failed") }
+}
+
+fn writeU32OrPanic(&builder bytes.Builder, value u64) void {
+    writeU32(&builder, value) else { panic("response encoding failed") }
+}
+
+fn writeByteOrPanic(&builder bytes.Builder, value u64) void {
+    builder.WriteByte(value) else { panic("response encoding failed") }
+}
+
+fn writeBytesOrPanic(&builder bytes.Builder, value bytes.Bytes) void {
+    builder.Write(value) else { panic("response encoding failed") }
+}
+
+fn finishOrPanic(&builder bytes.Builder) own bytes.Bytes {
+    const result = builder.Finish() else { panic("response encoding failed") }
+    result
+}
+
+fn transaction() own bytes.Bytes {
+    const opened = bytes.NewBuilder(12) else {
+        panic("transaction builder failed")
+    }
+    var builder = opened
+    var value u64 = 0
+    while value < 12 {
+        builder.WriteByte(value) else {
+            panic("transaction byte failed")
+        }
+        value += 1
+    }
+    finishOrPanic(&builder)
+}
+
+fn bindingResponse(transaction bytes.Bytes) own bytes.Bytes {
+    const opened = bytes.NewBuilder(32) else {
+        panic("response builder failed")
+    }
+    var builder = opened
+    writeU16OrPanic(&builder, 257)
+    writeU16OrPanic(&builder, 12)
+    writeU32OrPanic(&builder, 554869826)
+    writeBytesOrPanic(&builder, transaction)
+    writeU16OrPanic(&builder, 32)
+    writeU16OrPanic(&builder, 8)
+    writeByteOrPanic(&builder, 0)
+    writeByteOrPanic(&builder, 1)
+    writeU16OrPanic(&builder, 57954)
+    writeByteOrPanic(&builder, 203 ^ 33)
+    writeByteOrPanic(&builder, 0 ^ 18)
+    writeByteOrPanic(&builder, 113 ^ 164)
+    writeByteOrPanic(&builder, 9 ^ 66)
+    finishOrPanic(&builder)
+}
+
+test "STUN binding response exposes the XOR mapped address" {
+    const id = transaction()
+    const packet = bindingResponse(id)
+    const address = response(packet, id) else error {
+        discard error
+        fail("binding response parsing failed")
+    }
+    expect(address == "203.0.113.9")
+}
+
+test "STUN binding response rejects another transaction" {
+    const id = transaction()
+    const packet = bindingResponse(id)
+    const other = bytes.Random(12) else {
+        fail("transaction entropy failed")
+    }
+    match response(packet, other) {
+        Ok(address): {
+            discard address
+            fail("response accepted another transaction")
+        }
+        Err(error): match error {
+            InvalidResponse: {}
+            _: fail("wrong transaction mismatch error")
+        }
+    }
+}

@@ -3,6 +3,7 @@ package remolo.session
 import remolo.dirsync
 import remolo.protocol
 import remolo.relay
+import remolo.token
 import remolo.tunnel
 import std.bytes
 import std.collections
@@ -37,6 +38,10 @@ test "host listener uses configured identity and advertised endpoint" {
         Capabilities = testCapabilities()
         Expiry = expiry
         Rendezvous = ""
+        IncludeLoopback = true
+        MDNS = false
+        STUN = ""
+        Relay = ""
     })
     const listening = $pending.wait() else error {
         panic(sessionFailure(error))
@@ -107,6 +112,37 @@ test "client and host authenticate over pinned multiplexed TLS" {
     expect(host.Close())
 }
 
+test "client advances to the next direct candidate" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    var credential = Token
+    credential.Candidates.PushFront(token.Candidate {
+        IP = "127.0.0.1"
+        Port = 1
+    })
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($credential)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("candidate fallback failed")
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error {
+        discard error
+        fail("candidate fallback authentication failed")
+    }
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+}
+
 test "client and host execute through an opaque relay" {
     const relayServer = relay.NewServer($"127.0.0.1", 0) else error {
         discard error
@@ -162,6 +198,82 @@ test "client and host execute through an opaque relay" {
     ClosePeer($peer)
     expect(host.Close())
     discard host
+    discard relayControl.Close()
+    const relayServed = $relayServing.wait()
+    relayServed else error {
+        discard error
+        fail("relay shutdown failed")
+    }
+}
+
+test "connect falls back to the configured relay" {
+    const relayServer = relay.NewServer($"127.0.0.1", 0) else error {
+        discard error
+        fail("relay listen failed")
+    }
+    const openedControl = relayServer.Control() else error {
+        discard error
+        fail("relay control failed")
+    }
+    var relayControl = openedControl
+    const relayAddress = "127.0.0.1:" + format.U64(relayServer.Port())
+    const relayServing = spawn relay.Serve($relayServer)
+    const listening = spawn Listen($HostOptions {
+        BindAddress = "127.0.0.1"
+        AdvertiseAddress = "127.0.0.1"
+        Port = 0
+        IdentityPath = ""
+        Capabilities = testCapabilities()
+        Expiry = time.Now().Unix() + 3600
+        Rendezvous = ""
+        IncludeLoopback = true
+        MDNS = false
+        STUN = ""
+        Relay = text.Copy(relayAddress)
+    })
+    const listeningResult = $listening.wait()
+    const opened = listeningResult else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = opened
+    var host = Host
+    var credential = Token
+    const Relay = host.TakeRelay()
+    var relayHost = match Relay {
+        None: panic("relay host missing")
+        Some(value): value
+    }
+    while !credential.Candidates.IsEmpty() {
+        discard credential.Candidates.PopFront()
+    }
+    credential.Candidates.PushFront(token.Candidate {
+        IP = "127.0.0.1"
+        Port = 1
+    })
+    const accepting = spawn AcceptRelayHost($relayHost)
+    const connectionOptions = own ConnectOptions {
+        Rendezvous = ""
+        Relay = relayAddress
+        LocalDiscovery = false
+    }
+    const connecting = spawn ConnectWith($credential, $connectionOptions)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("relay fallback connection failed")
+    }
+    const accepted = $accepting.wait()
+    const RelayHostAcceptOutcome { Host as restored Value } = accepted
+    relayHost = restored
+    const peer = Value else error {
+        discard error
+        fail("relay fallback authentication failed")
+    }
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    discard host
+    discard relayHost
     discard relayControl.Close()
     const relayServed = $relayServing.wait()
     relayServed else error {

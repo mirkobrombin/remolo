@@ -1,6 +1,7 @@
 package remolo.token
 
 import std.bytes
+import std.collections
 
 fn sequence(start u64, count u64, descending bool) own bytes.Bytes {
     const opened = bytes.NewBuilder(count) else {
@@ -146,4 +147,23 @@ test "tokens expose expiration against wall time" {
         fail("expired token construction failed")
     }
     expect(value.Expired())
+}
+
+test "tokens take dynamically discovered candidates" {
+    var candidates = collections.NewList<Candidate>()
+    candidates.PushFront(Candidate { IP = "203.0.113.9" Port = 41000 })
+    candidates.PushFront(Candidate { IP = "10.0.0.8" Port = 41000 })
+    const value = NewFromCandidates(
+        $sequence(0, 32, false),
+        $candidates,
+        1767225600,
+        "rendezvous.example:443"
+    ) else error {
+        discard error
+        fail("dynamic token construction failed")
+    }
+    var token = value
+    expect(token.Candidates.Len() == 2)
+    expect(candidateValue(token.Candidates.PopFront()).Addr() == "10.0.0.8:41000")
+    expect(candidateValue(token.Candidates.PopFront()).Addr() == "203.0.113.9:41000")
 }

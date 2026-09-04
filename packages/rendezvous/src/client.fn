@@ -69,6 +69,37 @@ fn Register(
     .Err(.Transport)
 }
 
+// Publishes a dynamically assembled candidate list for one session.
+fn RegisterCandidates(
+    baseURL String,
+    sessionID String,
+    $candidates own collections.List<token.Candidate>
+) Result<void, Error> {
+    const url = endpoint(baseURL, "/register") else error {
+        return .Err(error)
+    }
+    const body = encodeRegistrationCandidates(
+        sessionID,
+        $candidates
+    ) else error {
+        return .Err(error)
+    }
+    const created = httpx.NewRequest($"POST", $url, $body) else {
+        return .Err(.InvalidRequest)
+    }
+    var request = created
+    request.Timeout = time.Seconds(10)
+    request.SetHeader("Content-Type", "application/json") else {
+        return .Err(.InvalidRequest)
+    }
+    const response = execute($request) else error { return .Err(error) }
+    const httpx.Response { Status Headers Body } = response
+    discard Headers
+    discard Body
+    if Status == 200 || Status == 204 return .Ok
+    .Err(.Transport)
+}
+
 // Loads the candidates published for a session.
 fn Lookup(
     baseURL String,

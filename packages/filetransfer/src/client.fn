@@ -1,7 +1,6 @@
 package remolo.filetransfer
 
 import remolo.mux
-import remolo.protocol
 import std.bytes
 import std.fs
 import std.text

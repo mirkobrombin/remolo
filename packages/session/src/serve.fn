@@ -72,6 +72,36 @@ task ServeHost(
     .Ok
 }
 
+task ServeRelayHost(
+    $host own RelayHost,
+    $rootPath String,
+    allowWrite bool
+) Result<void, Error> {
+    var active = host
+    while true {
+        const accepting = spawn AcceptRelayHost($active)
+        const accepted = $accepting.wait()
+        const RelayHostAcceptOutcome { Host Value } = accepted
+        active = Host
+        const peer = Value else error {
+            discard active
+            discard rootPath
+            return .Err(error)
+        }
+        const serving = spawn ServePeer(
+            $peer,
+            $text.Copy(rootPath),
+            allowWrite
+        )
+        const result = $serving.wait()
+        match result {
+            Ok: {}
+            Err(error): { discard error }
+        }
+    }
+    .Ok
+}
+
 task runPeer(
     $peer own Peer,
     $rootPath String,

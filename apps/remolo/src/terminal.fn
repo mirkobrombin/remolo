@@ -15,7 +15,11 @@ struct terminalForwardOutcome {
 
 fn runShell(args [String]) Result<i32, failure> {
     if len(args) < 2 return .Err(invalid("shell requires a token"))
-    const client = connectToken(args[1]) else error { return .Err(error) }
+    const parsed = parseConnectOptions(args) else error { return .Err(error) }
+    const connectOptions { connection commandStart } = parsed
+    const client = connectTokenWith(args[1], $connection) else error {
+        return .Err(error)
+    }
     const openedTerminal = terminal.Open() else error {
         discard error
         session.CloseClient($client)
@@ -26,7 +30,7 @@ fn runShell(args [String]) Result<i32, failure> {
         Reader as localReader
         Controller as localController
     } = openedTerminal
-    const descriptor = shellDescriptor(args, Size)
+    const descriptor = shellDescriptor(args, commandStart, Size)
     const opening = spawn session.OpenPTY(client.Handle(), $descriptor)
     const opened = $opening.wait() else error {
         discard localReader
@@ -208,12 +212,19 @@ task forwardTerminalOutput(
     .Ok(0)
 }
 
-fn shellDescriptor(args [String], size terminal.Size) protocol.Open {
+fn shellDescriptor(
+    args [String],
+    commandStart usize,
+    size terminal.Size
+) protocol.Open {
     var descriptor = protocol.NewOpen(.PTY)
     descriptor.Cols = size.Columns
     descriptor.Rows = size.Rows
     descriptor.Term = terminalName()
-    const empty = replace descriptor.Command with commandArguments(args, 2)
+    const empty = replace descriptor.Command with commandArguments(
+        args,
+        commandStart
+    )
     discard empty
     descriptor
 }

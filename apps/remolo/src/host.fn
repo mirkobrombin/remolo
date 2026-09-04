@@ -56,6 +56,10 @@ fn runHost(args [String]) Result<i32, failure> {
         identityPath
         fileRoot
         rendezvous
+        includeLoopback
+        mdns
+        stun
+        relay
         readOnly
         once
     } = options
@@ -63,7 +67,11 @@ fn runHost(args [String]) Result<i32, failure> {
     if ttl > 18446744073709551615 - now {
         return .Err(invalid("--ttl exceeds the timestamp range"))
     }
-    const displayedAddress = text.Copy(advertiseAddress)
+    const displayedAddress = if text.IsEmpty(advertiseAddress) {
+        "local interfaces"
+    } else {
+        text.Copy(advertiseAddress)
+    }
     const listening = spawn session.Listen($session.HostOptions {
         BindAddress = bindAddress
         AdvertiseAddress = advertiseAddress
@@ -72,6 +80,10 @@ fn runHost(args [String]) Result<i32, failure> {
         Capabilities = hostCapabilities()
         Expiry = now + ttl
         Rendezvous = rendezvous
+        IncludeLoopback = includeLoopback
+        MDNS = mdns
+        STUN = stun
+        Relay = relay
     })
     const opened = $listening.wait()
     const active = opened else error {
@@ -80,20 +92,31 @@ fn runHost(args [String]) Result<i32, failure> {
     }
     const session.ListeningHost { Host Token } = active
     var host = Host
+    const Relay = host.TakeRelay()
+    const relayServing Option<Task<Result<void, session.Error>>> = match Relay {
+        None: .None
+        Some(relayHost): .Some(spawn session.ServeRelayHost(
+                $relayHost,
+                $text.Copy(fileRoot),
+                !readOnly
+            ))
+    }
     const port = host.Port()
     const encoded = token.Encode($Token) else error {
         discard error
         discard host
+        discard relayServing
         return .Err(failed("could not encode the session token"))
     }
     writeStdoutText(
         "remolo host active, listening on TCP port " +
         format.U64(port) + "\n\nSession token:\n   " + encoded +
         "\n\nAdvertised endpoint: " +
-        displayedAddress + ":" + format.U64(port) +
+        displayedAddress + " on port " + format.U64(port) +
         "\nAuthorized use only.\nWaiting for connections...\n"
     ) else error {
         discard host
+        discard relayServing
         return .Err(error)
     }
     const serving = spawn session.ServeHost(
@@ -103,6 +126,7 @@ fn runHost(args [String]) Result<i32, failure> {
         once
     )
     const result = $serving.wait()
+    discard relayServing
     result else error {
         discard error
         return .Err(failed("host stopped after a session error"))

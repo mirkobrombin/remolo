@@ -8,6 +8,71 @@ import std.bytes
 import std.text
 import std.time
 
+struct RelayHost {
+    address String
+    psk own bytes.Bytes
+    publicKey own bytes.Bytes
+    privateKey own bytes.Bytes
+    sessionID own bytes.Bytes
+    capabilities protocol.Capabilities
+    expiry u64
+}
+
+struct RelayHostAcceptOutcome {
+    Host own RelayHost
+    Value Result<own Peer, Error>
+}
+
+fn relayHostFor(
+    $address String,
+    psk bytes.Bytes,
+    publicKey bytes.Bytes,
+    privateKey bytes.Bytes,
+    sessionID bytes.Bytes,
+    capabilities protocol.Capabilities,
+    expiry u64
+) Result<Option<own RelayHost>, Error> {
+    if text.IsEmpty(address) {
+        discard address
+        return .Ok(.None)
+    }
+    const relayPSK = psk.Copy() else error {
+        discard error
+        discard address
+        return .Err(.Storage)
+    }
+    const relayPublicKey = publicKey.Copy() else error {
+        discard error
+        discard address
+        discard relayPSK
+        return .Err(.Storage)
+    }
+    const relayPrivateKey = privateKey.Copy() else error {
+        discard error
+        discard address
+        discard relayPSK
+        discard relayPublicKey
+        return .Err(.Storage)
+    }
+    const relaySessionID = sessionID.Copy() else error {
+        discard error
+        discard address
+        discard relayPSK
+        discard relayPublicKey
+        discard relayPrivateKey
+        return .Err(.Storage)
+    }
+    .Ok(.Some(own RelayHost {
+        address = address
+        psk = relayPSK
+        publicKey = relayPublicKey
+        privateKey = relayPrivateKey
+        sessionID = relaySessionID
+        capabilities = protocol.CopyCapabilities(capabilities)
+        expiry = expiry
+    }))
+}
+
 task ConnectRelay(
     $credential own token.Token,
     $relayAddress String
@@ -26,18 +91,29 @@ task ConnectRelay(
     discard Candidates
     discard Expiry
     discard Rendezvous
-    const session = bytesHex(SessionID) else error {
+    const connecting = spawn connectRelayParts(
+        $relayAddress,
+        $HostPublicKey,
+        $PSK,
+        $SessionID
+    )
+    const result = $connecting.wait()
+    result
+}
+
+task connectRelayParts(
+    $relayAddress String,
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes,
+    $sessionID own bytes.Bytes
+) Result<own Client, Error> {
+    const session = bytesHex(sessionID) else error {
         discard error
-        discard HostPublicKey
-        discard PSK
         discard relayAddress
         return .Err(.Storage)
     }
-    discard SessionID
-    const transportKey = HostPublicKey.Copy() else error {
+    const transportKey = hostPublicKey.Copy() else error {
         discard error
-        discard HostPublicKey
-        discard PSK
         discard relayAddress
         discard session
         return .Err(.Storage)
@@ -46,8 +122,6 @@ task ConnectRelay(
     const connection = $dialing.wait()
     const connected = connection else error {
         discard error
-        discard HostPublicKey
-        discard PSK
         discard transportKey
         return .Err(.Transport)
     }
@@ -58,14 +132,23 @@ task ConnectRelay(
     const securedResult = $securing.wait()
     const secured = securedResult else error {
         discard error
-        discard HostPublicKey
-        discard PSK
         return .Err(.Transport)
+    }
+    const authPSK = psk.Copy() else error {
+        discard error
+        discard secured
+        return .Err(.Storage)
+    }
+    const authKey = hostPublicKey.Copy() else error {
+        discard error
+        discard authPSK
+        discard secured
+        return .Err(.Storage)
     }
     const authenticating = spawn connectSecured(
         $secured,
-        $PSK,
-        $HostPublicKey
+        $authPSK,
+        $authKey
     )
     const result = $authenticating.wait()
     result
@@ -171,6 +254,104 @@ task AcceptRelay(
     )
     const peer = $authenticating.wait()
     HostAcceptOutcome { Host = restored Value = peer }
+}
+
+task AcceptRelayHost(
+    $host own RelayHost
+) RelayHostAcceptOutcome {
+    var restored = host
+    if time.Now().Unix() > restored.expiry {
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Expired)
+        }
+    }
+    const privateKey = restored.privateKey.Copy() else error {
+        discard error
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const psk = restored.psk.Copy() else error {
+        discard error
+        discard privateKey
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const publicKey = restored.publicKey.Copy() else error {
+        discard error
+        discard privateKey
+        discard psk
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const encodedCaps = protocol.EncodeCapabilities(
+        restored.capabilities
+    ) else error {
+        discard error
+        discard privateKey
+        discard psk
+        discard publicKey
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Protocol)
+        }
+    }
+    const session = bytesHex(restored.sessionID) else error {
+        discard error
+        discard privateKey
+        discard psk
+        discard publicKey
+        discard encodedCaps
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const registering = spawn relay.RegisterHost(
+        $text.Copy(restored.address),
+        $session
+    )
+    const registered = $registering.wait()
+    const connected = registered else error {
+        discard error
+        discard privateKey
+        discard psk
+        discard publicKey
+        discard encodedCaps
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Transport)
+        }
+    }
+    const securing = spawn transport.SecureServerOver(
+        $connected,
+        $privateKey
+    )
+    const securedResult = $securing.wait()
+    const secured = securedResult else error {
+        discard error
+        discard psk
+        discard publicKey
+        discard encodedCaps
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Transport)
+        }
+    }
+    const authenticating = spawn acceptPeer(
+        $secured,
+        $psk,
+        $publicKey,
+        $encodedCaps
+    )
+    const peer = $authenticating.wait()
+    RelayHostAcceptOutcome { Host = restored Value = peer }
 }
 
 fn bytesHex(value bytes.Bytes) Result<String, Error> {

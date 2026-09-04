@@ -12,9 +12,12 @@ enum cliCommand {
 
 fn usage() String {
     "usage:\n" +
-        "  remolo host [--bind HOST:PORT] [--advertise IP] [--ttl SECONDS] " +
-        "[--identity PATH] [--file-root PATH] [--ro] [--once]\n" +
-        "  remolo connect TOKEN [COMMAND [ARG...]]\n" +
+        "  remolo host [--bind HOST:PORT] [--advertise IP] [--loopback] " +
+        "[--mdns] [--stun HOST:PORT] [--ttl SECONDS] [--identity PATH] " +
+        "[--file-root PATH] " +
+        "[--rendezvous URL] [--relay HOST:PORT] [--ro] [--once]\n" +
+        "  remolo connect TOKEN [--mdns] [--rendezvous URL] " +
+        "[--relay HOST:PORT] [-- COMMAND [ARG...]]\n" +
         "  remolo exec TOKEN COMMAND [ARG...]\n" +
         "  remolo put TOKEN LOCAL REMOTE\n" +
         "  remolo get TOKEN REMOTE LOCAL\n" +

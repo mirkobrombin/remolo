@@ -1,0 +1,195 @@
+package remolo.holepunch
+
+import std.bytes
+import std.format
+import std.net
+import std.text
+import std.time
+
+enum Error {
+    InvalidServer
+    Network
+    InvalidResponse
+    NoAddress
+}
+
+fn writeU16(&builder bytes.Builder, value u64) Result<void, Error> {
+    builder.WriteByte((value >> 8) & 255) else { return .Err(.InvalidResponse) }
+    builder.WriteByte(value & 255) else { return .Err(.InvalidResponse) }
+    .Ok
+}
+
+fn writeU32(&builder bytes.Builder, value u64) Result<void, Error> {
+    builder.WriteByte((value >> 24) & 255) else { return .Err(.InvalidResponse) }
+    builder.WriteByte((value >> 16) & 255) else { return .Err(.InvalidResponse) }
+    builder.WriteByte((value >> 8) & 255) else { return .Err(.InvalidResponse) }
+    builder.WriteByte(value & 255) else { return .Err(.InvalidResponse) }
+    .Ok
+}
+
+fn request(transaction bytes.Bytes) Result<own bytes.Bytes, Error> {
+    const opened = bytes.NewBuilder(20) else { return .Err(.InvalidResponse) }
+    var builder = opened
+    writeU16(&builder, 1) else error { return .Err(error) }
+    writeU16(&builder, 0) else error { return .Err(error) }
+    writeU32(&builder, 554869826) else error { return .Err(error) }
+    builder.Write(transaction) else { return .Err(.InvalidResponse) }
+    const result = builder.Finish() else { return .Err(.InvalidResponse) }
+    .Ok(result)
+}
+
+fn readU16(value bytes.Bytes, offset u64) Result<u64, Error> {
+    const first = value.At(offset) else { return .Err(.InvalidResponse) }
+    const second = value.At(offset + 1) else { return .Err(.InvalidResponse) }
+    .Ok((first << 8) | second)
+}
+
+fn readU32(value bytes.Bytes, offset u64) Result<u64, Error> {
+    const first = value.At(offset) else { return .Err(.InvalidResponse) }
+    const second = value.At(offset + 1) else { return .Err(.InvalidResponse) }
+    const third = value.At(offset + 2) else { return .Err(.InvalidResponse) }
+    const fourth = value.At(offset + 3) else { return .Err(.InvalidResponse) }
+    .Ok((first << 24) | (second << 16) | (third << 8) | fourth)
+}
+
+fn transactionMatches(value bytes.Bytes, transaction bytes.Bytes) bool {
+    var offset u64 = 0
+    while offset < 12 {
+        const actual = value.At(offset + 8) else { return false }
+        const expected = transaction.At(offset) else { return false }
+        if actual != expected return false
+        offset += 1
+    }
+    true
+}
+
+fn mappedIPv4(
+    value bytes.Bytes,
+    offset u64,
+    xor bool
+) Result<String, Error> {
+    const family = value.At(offset + 1) else { return .Err(.InvalidResponse) }
+    if family != 1 return .Err(.NoAddress)
+    const firstByte = value.At(offset + 4) else { return .Err(.InvalidResponse) }
+    const secondByte = value.At(offset + 5) else { return .Err(.InvalidResponse) }
+    const thirdByte = value.At(offset + 6) else { return .Err(.InvalidResponse) }
+    const fourthByte = value.At(offset + 7) else { return .Err(.InvalidResponse) }
+    var first = firstByte
+    var second = secondByte
+    var third = thirdByte
+    var fourth = fourthByte
+    if xor {
+        first = first ^ 33
+        second = second ^ 18
+        third = third ^ 164
+        fourth = fourth ^ 66
+    }
+    .Ok(format.U64(first) + "." + format.U64(second) + "." +
+        format.U64(third) + "." + format.U64(fourth))
+}
+
+fn response(
+    value bytes.Bytes,
+    transaction bytes.Bytes
+) Result<String, Error> {
+    const length = value.Len() else { return .Err(.InvalidResponse) }
+    if length < 20 return .Err(.InvalidResponse)
+    const kind = readU16(value, 0) else error { return .Err(error) }
+    const bodyLength = readU16(value, 2) else error { return .Err(error) }
+    const magic = readU32(value, 4) else error { return .Err(error) }
+    if kind != 257 || magic != 554869826 || bodyLength > length - 20 ||
+        !transactionMatches(value, transaction) {
+        return .Err(.InvalidResponse)
+    }
+    const headerSize u64 = 20
+    var offset = headerSize
+    const end = headerSize + bodyLength
+    var mapped = ""
+    while offset < end {
+        if end - offset < 4 return .Err(.InvalidResponse)
+        const kind = readU16(value, offset) else error {
+            return .Err(error)
+        }
+        const attributeLength = readU16(value, offset + 2) else error {
+            return .Err(error)
+        }
+        offset += 4
+        if attributeLength > end - offset return .Err(.InvalidResponse)
+        if kind == 32 && attributeLength >= 8 {
+            return mappedIPv4(value, offset, true)
+        }
+        if kind == 1 && attributeLength >= 8 {
+            const found = mappedIPv4(value, offset, false)
+            match found {
+                Ok(address): {
+                    discard mapped
+                    mapped = address
+                }
+                Err(error): { discard error }
+            }
+        }
+        offset += attributeLength
+        const remainder = offset % 4
+        if remainder != 0 {
+            offset += 4 - remainder
+        }
+    }
+    if !text.IsEmpty(mapped) return .Ok(mapped)
+    .Err(.NoAddress)
+}
+
+// Discovers the public IPv4 address observed by one STUN server.
+task Discover($server String) Result<String, Error> {
+    const endpoint = net.ParseEndpoint(server) else {
+        return .Err(.InvalidServer)
+    }
+    const net.Endpoint { Host Port } = endpoint
+    const transaction = bytes.Random(12) else { return .Err(.Network) }
+    const wireTransaction = transaction.Copy() else {
+        return .Err(.Network)
+    }
+    const message = request(wireTransaction) else error {
+        return .Err(error)
+    }
+    const opened = net.OpenDatagram($"0.0.0.0", 0, false) else {
+        return .Err(.Network)
+    }
+    var socket = opened
+    const sending = spawn net.SendDatagram(
+        $socket,
+        $Host,
+        u64.From(Port),
+        $message
+    )
+    const sent = $sending.wait()
+    const net.DatagramSendOutcome {
+        Socket as returnedAfterSend
+        Value as sendResult
+    } = sent
+    socket = returnedAfterSend
+    sendResult else {
+        discard transaction
+        discard socket
+        return .Err(.Network)
+    }
+    const deadline = net.DeadlineAfter(time.Seconds(4)) else {
+        discard transaction
+        discard socket
+        return .Err(.Network)
+    }
+    const receiving = spawn net.ReceiveDatagramUntil($socket, 1500, deadline)
+    const received = $receiving.wait()
+    const net.DatagramReceiveOutcome {
+        Socket as returnedAfterReceive
+        Value as receiveResult
+    } = received
+    discard returnedAfterReceive
+    const datagram = receiveResult else {
+        discard transaction
+        return .Err(.Network)
+    }
+    const result = response(datagram.Data, transaction)
+    discard datagram
+    discard transaction
+    result
+}

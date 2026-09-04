@@ -228,3 +228,21 @@ fn encodeRegistration(
     }
     .Ok(encoded)
 }
+
+fn encodeRegistrationCandidates(
+    sessionID String,
+    $candidates own collections.List<token.Candidate>
+) Result<String, Error> {
+    const response = encodeCandidates($candidates) else error {
+        return .Err(error)
+    }
+    const parsed = parseObject(response) else error { return .Err(error) }
+    var object = parsed
+    setField(&object, "session_id", .Text(text.Copy(sessionID))) else error {
+        return .Err(error)
+    }
+    const encoded = json.Stringify(.Object(object)) else {
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}

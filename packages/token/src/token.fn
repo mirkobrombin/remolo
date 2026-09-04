@@ -86,6 +86,31 @@ fn New(
     )
 }
 
+// Creates a token by taking a dynamically assembled candidate list.
+fn NewFromCandidates(
+    $hostPublicKey own bytes.Bytes,
+    $candidates own collections.List<Candidate>,
+    expiry u64,
+    rendezvous String
+) Result<own Token, TokenError> {
+    const psk = bytes.Random(32) else error {
+        discard error
+        return .Err(.EntropyUnavailable)
+    }
+    const sessionID = bytes.Random(16) else error {
+        discard error
+        return .Err(.EntropyUnavailable)
+    }
+    newWithCandidateSecrets(
+        $hostPublicKey,
+        $psk,
+        $candidates,
+        $sessionID,
+        expiry,
+        rendezvous
+    )
+}
+
 fn NewWithSecrets(
     $hostPublicKey own bytes.Bytes,
     $psk own bytes.Bytes,
@@ -107,6 +132,58 @@ fn NewWithSecrets(
         return .Err(error)
     }
     const candidateSet { values count } = copied
+    newToken(
+        $hostPublicKey,
+        $psk,
+        $values,
+        count,
+        $sessionID,
+        expiry,
+        rendezvous
+    )
+}
+
+fn newWithCandidateSecrets(
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes,
+    $candidates own collections.List<Candidate>,
+    $sessionID own bytes.Bytes,
+    expiry u64,
+    rendezvous String
+) Result<own Token, TokenError> {
+    validateLength(hostPublicKey, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(psk, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(sessionID, 16, .InvalidSession) else error {
+        return .Err(error)
+    }
+    const claimed = claimCandidates($candidates) else error {
+        return .Err(error)
+    }
+    const candidateSet { values count } = claimed
+    newToken(
+        $hostPublicKey,
+        $psk,
+        $values,
+        count,
+        $sessionID,
+        expiry,
+        rendezvous
+    )
+}
+
+fn newToken(
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes,
+    $candidates own collections.List<Candidate>,
+    count u64,
+    $sessionID own bytes.Bytes,
+    expiry u64,
+    rendezvous String
+) Result<own Token, TokenError> {
     if count == 0 && text.IsEmpty(rendezvous) {
         return .Err(.NoEndpoint)
     }
@@ -114,7 +191,7 @@ fn NewWithSecrets(
         Version = 1
         HostPublicKey = hostPublicKey
         PSK = psk
-        Candidates = values
+        Candidates = candidates
         SessionID = sessionID
         Expiry = expiry
         Rendezvous = text.Copy(rendezvous)
@@ -540,6 +617,27 @@ fn copyCandidates(values [Candidate]) Result<candidateSet, TokenError> {
         count += 1
     }
     .Ok(candidateSet { values = reverseCandidates($reversed) count = count })
+}
+
+fn claimCandidates(
+    $values own collections.List<Candidate>
+) Result<candidateSet, TokenError> {
+    var source = values
+    var reversed = collections.NewList<Candidate>()
+    var count u64 = 0
+    while !source.IsEmpty() {
+        const candidate = candidateValue(source.PopFront())
+        if candidate.Port == 0 || !validIP(candidate.IP) {
+            discard candidate
+            return .Err(.InvalidCandidate)
+        }
+        reversed.PushFront($candidate)
+        count += 1
+    }
+    .Ok(candidateSet {
+        values = reverseCandidates($reversed)
+        count = count
+    })
 }
 
 fn reverseCandidates(

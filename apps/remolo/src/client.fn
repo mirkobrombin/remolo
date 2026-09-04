@@ -23,6 +23,25 @@ fn connectToken(value String) Result<own session.Client, failure> {
     }
 }
 
+fn connectTokenWith(
+    value String,
+    $options own session.ConnectOptions
+) Result<own session.Client, failure> {
+    const credential = token.Decode(value) else error {
+        discard error
+        return .Err(invalid("invalid session token"))
+    }
+    const connecting = spawn session.ConnectWith($credential, $options)
+    const result = $connecting.wait()
+    match result {
+        Ok(client): .Ok(client)
+        Err(error): {
+            discard error
+            .Err(failed("could not connect to the host"))
+        }
+    }
+}
+
 fn commandArguments(args [String], start usize) own collections.List<String> {
     var result = collections.NewList<String>()
     var index = len(args)

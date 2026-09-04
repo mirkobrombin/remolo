@@ -1,0 +1,376 @@
+package remolo.session
+
+import remolo.discovery
+import remolo.holepunch
+import remolo.rendezvous
+import remolo.token
+import remolo.transport
+import std.bytes
+import std.collections
+import std.net
+import std.text
+import std.time
+
+fn DefaultConnectOptions() own ConnectOptions {
+    own ConnectOptions {
+        Rendezvous = ""
+        Relay = ""
+        LocalDiscovery = false
+    }
+}
+
+task Connect($credential own token.Token) Result<own Client, Error> {
+    const connecting = spawn ConnectWith(
+        $credential,
+        $DefaultConnectOptions()
+    )
+    const result = $connecting.wait()
+    result
+}
+
+task ConnectWith(
+    $credential own token.Token,
+    $options own ConnectOptions
+) Result<own Client, Error> {
+    if credential.Expired() return .Err(.Expired)
+    const token.Token {
+        Version
+        HostPublicKey
+        PSK
+        Candidates
+        SessionID
+        Expiry
+        Rendezvous
+    } = credential
+    const ConnectOptions {
+        Rendezvous as RendezvousOverride
+        Relay
+        LocalDiscovery
+    } = options
+    discard Version
+    discard Expiry
+    const directKeys = copyConnectionKeys(HostPublicKey, PSK) else error {
+        discard error
+        discard Candidates
+        discard HostPublicKey
+        discard PSK
+        discard SessionID
+        discard Rendezvous
+        discard RendezvousOverride
+        discard Relay
+        return .Err(.Storage)
+    }
+    const connectionKeys {
+        PublicKey as directPublicKey
+        PSK as directPSK
+    } = directKeys
+    const direct = spawn connectCandidates(
+        $Candidates,
+        $directPublicKey,
+        $directPSK
+    )
+    const directResult = $direct.wait()
+    var failure Error = .NoCandidate
+    match directResult {
+        Ok(client): {
+            discard HostPublicKey
+            discard PSK
+            discard SessionID
+            discard Rendezvous
+            discard RendezvousOverride
+            discard Relay
+            discard LocalDiscovery
+            return .Ok(client)
+        }
+        Err(error): { failure = error }
+    }
+
+    if LocalDiscovery {
+        const session = bytesHex(SessionID) else error {
+            discard error
+            discard HostPublicKey
+            discard PSK
+            discard SessionID
+            discard Rendezvous
+            discard RendezvousOverride
+            discard Relay
+            return .Err(.Storage)
+        }
+        const browsing = spawn discovery.Browse($session, time.Seconds(2))
+        const found = $browsing.wait()
+        const candidates = localCandidates($found)
+        const localKeys = copyConnectionKeys(
+            HostPublicKey,
+            PSK
+        ) else error {
+            discard error
+            discard candidates
+            discard HostPublicKey
+            discard PSK
+            discard SessionID
+            discard Rendezvous
+            discard RendezvousOverride
+            discard Relay
+            return .Err(.Storage)
+        }
+        const connectionKeys {
+            PublicKey as localPublicKey
+            PSK as localPSK
+        } = localKeys
+        const connecting = spawn connectCandidates(
+            $candidates,
+            $localPublicKey,
+            $localPSK
+        )
+        const result = $connecting.wait()
+        match result {
+            Ok(client): {
+                discard HostPublicKey
+                discard PSK
+                discard SessionID
+                discard Rendezvous
+                discard RendezvousOverride
+                discard Relay
+                return .Ok(client)
+            }
+            Err(error): { failure = error }
+        }
+    }
+
+    const broker = if text.IsEmpty(RendezvousOverride) {
+        Rendezvous
+    } else {
+        discard Rendezvous
+        RendezvousOverride
+    }
+    if !text.IsEmpty(broker) {
+        const session = bytesHex(SessionID) else error {
+            discard error
+            discard HostPublicKey
+            discard PSK
+            discard Relay
+            discard broker
+            return .Err(.Storage)
+        }
+        const found = rendezvous.Lookup(broker, session)
+        discard session
+        const candidates = remoteCandidates($found)
+        const rendezvousKeys = copyConnectionKeys(
+            HostPublicKey,
+            PSK
+        ) else error {
+            discard error
+            discard candidates
+            discard HostPublicKey
+            discard PSK
+            discard SessionID
+            discard Relay
+            discard broker
+            return .Err(.Storage)
+        }
+        const connectionKeys {
+            PublicKey as rendezvousPublicKey
+            PSK as rendezvousPSK
+        } = rendezvousKeys
+        const connecting = spawn connectCandidates(
+            $candidates,
+            $rendezvousPublicKey,
+            $rendezvousPSK
+        )
+        const result = $connecting.wait()
+        match result {
+            Ok(client): {
+                discard HostPublicKey
+                discard PSK
+                discard SessionID
+                discard Relay
+                discard LocalDiscovery
+                discard broker
+                return .Ok(client)
+            }
+            Err(error): { failure = error }
+        }
+    }
+    discard broker
+
+    if !text.IsEmpty(Relay) {
+        const relaying = spawn connectRelayParts(
+            $Relay,
+            $HostPublicKey,
+            $PSK,
+            $SessionID
+        )
+        const relayResult = $relaying.wait()
+        return relayResult
+    }
+    discard Relay
+    discard LocalDiscovery
+    discard HostPublicKey
+    discard PSK
+    discard SessionID
+    .Err(failure)
+}
+
+task connectCandidates(
+    $candidates own collections.List<token.Candidate>,
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes
+) Result<own Client, Error> {
+    var pending = candidates
+    var failure Error = .NoCandidate
+    while !pending.IsEmpty() {
+        const candidate = candidateValue(pending.PopFront())
+        const token.Candidate { IP Port } = candidate
+        const transportKey = hostPublicKey.Copy() else error {
+            discard error
+            discard IP
+            return .Err(.Storage)
+        }
+        const dialing = spawn transport.DialSecure(
+            $IP,
+            u64.From(Port),
+            $transportKey
+        )
+        const securedResult = $dialing.wait()
+        const secured = securedResult else error {
+            discard error
+            continue
+        }
+        const authPSK = psk.Copy() else error {
+            discard error
+            discard secured
+            return .Err(.Storage)
+        }
+        const authKey = hostPublicKey.Copy() else error {
+            discard error
+            discard authPSK
+            discard secured
+            return .Err(.Storage)
+        }
+        const authenticating = spawn connectSecured(
+            $secured,
+            $authPSK,
+            $authKey
+        )
+        const result = $authenticating.wait()
+        const client = result else error {
+            failure = error
+            continue
+        }
+        return .Ok(client)
+    }
+    .Err(failure)
+}
+
+fn candidateValue(
+    $value Option<token.Candidate>
+) token.Candidate {
+    match value {
+        None: panic("session candidate invariant failed")
+        Some(candidate): candidate
+    }
+}
+
+task hostCandidates(
+    $advertiseAddress String,
+    port u16,
+    includeLoopback bool,
+    $stunServer String
+) Result<candidateLists, Error> {
+    var tokenValues = collections.NewList<token.Candidate>()
+    var registryValues = collections.NewList<token.Candidate>()
+    const listing = spawn net.LocalAddresses(includeLoopback)
+    const listed = $listing.wait()
+    if !text.IsEmpty(advertiseAddress) {
+        discard listed
+        const registryAddress = text.Copy(advertiseAddress)
+        tokenValues.PushFront(token.Candidate {
+            IP = advertiseAddress
+            Port = port
+        })
+        registryValues.PushFront(token.Candidate {
+            IP = registryAddress
+            Port = port
+        })
+    } else {
+        discard advertiseAddress
+        const addresses = listed else error {
+            discard error
+            return .Err(.Transport)
+        }
+        var pending = addresses
+        while !pending.IsEmpty() {
+            const address = stringValue(pending.PopFront())
+            registryValues.PushFront(token.Candidate {
+                IP = text.Copy(address)
+                Port = port
+            })
+            tokenValues.PushFront(token.Candidate { IP = address Port = port })
+        }
+    }
+    if !text.IsEmpty(stunServer) {
+        const discovering = spawn holepunch.Discover($stunServer)
+        const discovered = $discovering.wait()
+        match discovered {
+            Ok(address): {
+                registryValues.PushFront(token.Candidate {
+                    IP = text.Copy(address)
+                    Port = port
+                })
+                tokenValues.PushFront(token.Candidate {
+                    IP = address
+                    Port = port
+                })
+            }
+            Err(error): { discard error }
+        }
+    } else {
+        discard stunServer
+    }
+    .Ok(candidateLists {
+        TokenValues = reverseCandidates($tokenValues)
+        RegistryValues = reverseCandidates($registryValues)
+    })
+}
+
+fn localCandidates(
+    $result Result<own collections.List<token.Candidate>, discovery.Error>
+) own collections.List<token.Candidate> {
+    match result {
+        Ok(candidates): candidates
+        Err(error): {
+            discard error
+            collections.NewList<token.Candidate>()
+        }
+    }
+}
+
+fn remoteCandidates(
+    $result Result<own collections.List<token.Candidate>, rendezvous.Error>
+) own collections.List<token.Candidate> {
+    match result {
+        Ok(candidates): candidates
+        Err(error): {
+            discard error
+            collections.NewList<token.Candidate>()
+        }
+    }
+}
+
+fn stringValue($value Option<String>) String {
+    match value {
+        None: panic("session address invariant failed")
+        Some(address): address
+    }
+}
+
+fn reverseCandidates(
+    $values own collections.List<token.Candidate>
+) own collections.List<token.Candidate> {
+    var pending = values
+    var result = collections.NewList<token.Candidate>()
+    while !pending.IsEmpty() {
+        result.PushFront($candidateValue(pending.PopFront()))
+    }
+    result
+}

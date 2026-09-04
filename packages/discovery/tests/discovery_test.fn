@@ -1,0 +1,50 @@
+package remolo.discovery
+
+test "DNS-SD query identifies the Remolo service" {
+    const query = Query() else error {
+        discard error
+        fail("query encoding failed")
+    }
+    expect(IsQuery(query))
+}
+
+test "DNS-SD response preserves the authenticated endpoint" {
+    const response = Response(
+        "00112233445566778899aabbccddeeff",
+        "10.20.30.40",
+        41000
+    ) else error {
+        discard error
+        fail("response encoding failed")
+    }
+    const candidate = Candidate(
+        response,
+        "00112233445566778899aabbccddeeff"
+    ) else error {
+        discard error
+        fail("response decoding failed")
+    }
+    expect(candidate.IP == "10.20.30.40")
+    expect(candidate.Port == 41000)
+}
+
+test "DNS-SD response rejects another session" {
+    const response = Response(
+        "00112233445566778899aabbccddeeff",
+        "10.20.30.40",
+        41000
+    ) else error {
+        discard error
+        fail("response encoding failed")
+    }
+    match Candidate(response, "ffeeddccbbaa99887766554433221100") {
+        Ok(candidate): {
+            discard candidate
+            fail("response accepted another session")
+        }
+        Err(error): match error {
+            NoAddress: {}
+            _: fail("wrong session mismatch error")
+        }
+    }
+}

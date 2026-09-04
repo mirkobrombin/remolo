@@ -1,0 +1,344 @@
+package remolo.session
+
+import remolo.discovery
+import remolo.identity
+import remolo.protocol
+import remolo.rendezvous
+import remolo.token
+import remolo.transport
+import std.text
+import std.time
+
+fn ListenLocal(
+    $capabilities protocol.Capabilities,
+    expiry u64
+) Result<ListeningHost, Error> {
+    const generated = identity.Generate() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const hostKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const tokenKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const privateKey = generated.PrivateKeyPEM.Copy() else error {
+        discard error
+        discard hostKey
+        discard tokenKey
+        return .Err(.Storage)
+    }
+    const listener = transport.ListenSecure(
+        $"127.0.0.1",
+        0,
+        generated.PrivateKeyPEM
+    ) else error {
+        discard error
+        discard privateKey
+        return .Err(.Transport)
+    }
+    const port = u16.From(listener.Port()) else error {
+        discard error
+        return .Err(.Transport)
+    }
+    const candidates [1]token.Candidate = [
+        token.Candidate { IP = "127.0.0.1" Port = port }
+    ]
+    const credential = token.New(
+        $tokenKey,
+        candidates,
+        expiry,
+        ""
+    ) else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        return .Err(.Storage)
+    }
+    const psk = credential.PSK.Copy() else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard credential
+        return .Err(.Storage)
+    }
+    const sessionID = credential.SessionID.Copy() else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard psk
+        discard credential
+        return .Err(.Storage)
+    }
+    .Ok(ListeningHost {
+        Host = own Host {
+            listener = listener
+            psk = psk
+            publicKey = hostKey
+            privateKey = privateKey
+            sessionID = sessionID
+            capabilities = capabilities
+            expiry = expiry
+            advertisement = .None
+            relay = .None
+        }
+        Token = credential
+    })
+}
+
+task Listen($options HostOptions) Result<ListeningHost, Error> {
+    const HostOptions {
+        BindAddress
+        AdvertiseAddress
+        Port
+        IdentityPath
+        Capabilities
+        Expiry
+        Rendezvous
+        IncludeLoopback
+        MDNS
+        STUN
+        Relay
+    } = options
+    const identityResult = if text.IsEmpty(IdentityPath) {
+        identity.Generate()
+    } else {
+        const loading = spawn identity.LoadOrCreate($IdentityPath)
+        const loaded = $loading.wait()
+        loaded
+    }
+    const generated = identityResult else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const hostKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const tokenKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const privateKey = generated.PrivateKeyPEM.Copy() else error {
+        discard error
+        discard hostKey
+        discard tokenKey
+        return .Err(.Storage)
+    }
+    const listener = transport.ListenSecure(
+        $BindAddress,
+        Port,
+        generated.PrivateKeyPEM
+    ) else error {
+        discard error
+        discard hostKey
+        discard tokenKey
+        discard privateKey
+        return .Err(.Transport)
+    }
+    discard generated
+    const port = u16.From(listener.Port()) else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard tokenKey
+        discard privateKey
+        return .Err(.Transport)
+    }
+    const assembling = spawn hostCandidates(
+        $AdvertiseAddress,
+        port,
+        IncludeLoopback,
+        $STUN
+    )
+    const assembledResult = $assembling.wait()
+    const assembled = assembledResult else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard tokenKey
+        discard privateKey
+        return .Err(.Transport)
+    }
+    const candidateLists { TokenValues RegistryValues } = assembled
+    const credential = token.NewFromCandidates(
+        $tokenKey,
+        $TokenValues,
+        Expiry,
+        Rendezvous
+    ) else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        return .Err(.Storage)
+    }
+    const psk = credential.PSK.Copy() else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard credential
+        return .Err(.Storage)
+    }
+    const sessionID = credential.SessionID.Copy() else error {
+        discard error
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard psk
+        discard credential
+        return .Err(.Storage)
+    }
+    var sessionText = ""
+    if MDNS || !text.IsEmpty(Rendezvous) {
+        const encodedSession = bytesHex(sessionID) else error {
+            discard error
+            discard RegistryValues
+            discard listener
+            discard hostKey
+            discard privateKey
+            discard psk
+            discard credential
+            return .Err(.Storage)
+        }
+        sessionText = encodedSession
+    }
+    if text.IsEmpty(Rendezvous) {
+        discard RegistryValues
+    } else {
+        const registered = rendezvous.RegisterCandidates(
+            Rendezvous,
+            sessionText,
+            $RegistryValues
+        )
+        match registered {
+            Ok: {}
+            Err(error): { discard error }
+        }
+    }
+    const advertisement Option<Task<Result<void, discovery.Error>>> = if MDNS {
+        .Some(spawn discovery.Advertise($sessionText, port))
+    } else {
+        discard sessionText
+        .None
+    }
+    const relayHost = relayHostFor(
+        $Relay,
+        psk,
+        hostKey,
+        privateKey,
+        sessionID,
+        Capabilities,
+        Expiry
+    ) else error {
+        discard error
+        discard advertisement
+        discard listener
+        discard hostKey
+        discard privateKey
+        discard psk
+        discard sessionID
+        discard credential
+        return .Err(.Storage)
+    }
+    .Ok(ListeningHost {
+        Host = own Host {
+            listener = listener
+            psk = psk
+            publicKey = hostKey
+            privateKey = privateKey
+            sessionID = sessionID
+            capabilities = Capabilities
+            expiry = Expiry
+            advertisement = advertisement
+            relay = relayHost
+        }
+        Token = credential
+    })
+}
+
+task Accept($host own Host) HostAcceptOutcome {
+    const Host {
+        listener
+        psk
+        publicKey
+        privateKey
+        sessionID
+        capabilities
+        expiry
+        advertisement
+        relay
+    } = host
+    const accepting = spawn transport.AcceptSecure($listener)
+    const accepted = $accepting.wait()
+    const transport.SecureAcceptOutcome { Listener Value } = accepted
+    const restored = own Host {
+        listener = Listener
+        psk = psk
+        publicKey = publicKey
+        privateKey = privateKey
+        sessionID = sessionID
+        capabilities = capabilities
+        expiry = expiry
+        advertisement = advertisement
+        relay = relay
+    }
+    const secured = Value else error {
+        discard error
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Transport)
+        }
+    }
+    if time.Now().Unix() > expiry {
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Expired)
+        }
+    }
+    const authPSK = restored.psk.Copy() else error {
+        discard error
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const authKey = restored.publicKey.Copy() else error {
+        discard error
+        discard authPSK
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const encodedCaps = protocol.EncodeCapabilities(
+        restored.capabilities
+    ) else error {
+        discard error
+        discard authPSK
+        discard authKey
+        discard secured
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Protocol)
+        }
+    }
+    const authenticating = spawn acceptPeer(
+        $secured,
+        $authPSK,
+        $authKey,
+        $encodedCaps
+    )
+    const peer = $authenticating.wait()
+    HostAcceptOutcome { Host = restored Value = peer }
+}

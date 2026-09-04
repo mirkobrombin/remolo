@@ -7,11 +7,14 @@ source src
 test_source tests
 dependency remolo.crypto 1.0.0 path ../crypto
 dependency remolo.dirsync 1.0.0 path ../dirsync
+dependency remolo.discovery 1.0.0 path ../discovery
 dependency remolo.filetransfer 1.0.0 path ../filetransfer
+dependency remolo.holepunch 1.0.0 path ../holepunch
 dependency remolo.identity 1.0.0 path ../identity
 dependency remolo.mux 1.0.0 path ../mux
 dependency remolo.protocol 1.0.0 path ../protocol
 dependency remolo.relay 1.0.0 path ../relay
+dependency remolo.rendezvous 1.0.0 path ../rendezvous
 dependency remolo.token 1.0.0 path ../token
 dependency remolo.transport 1.0.0 path ../transport
 dependency remolo.tunnel 1.0.0 path ../tunnel

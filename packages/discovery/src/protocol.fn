@@ -1,0 +1,441 @@
+package remolo.discovery
+
+import remolo.token
+import std.bytes
+import std.format
+import std.parse
+import std.text
+
+enum Error {
+    InvalidPacket
+    Network
+    NoAddress
+}
+
+fn writeU16(&builder bytes.Builder, value u64) Result<void, Error> {
+    builder.WriteByte((value >> 8) & 255) else { return .Err(.InvalidPacket) }
+    builder.WriteByte(value & 255) else { return .Err(.InvalidPacket) }
+    .Ok
+}
+
+fn writeU32(&builder bytes.Builder, value u64) Result<void, Error> {
+    builder.WriteByte((value >> 24) & 255) else { return .Err(.InvalidPacket) }
+    builder.WriteByte((value >> 16) & 255) else { return .Err(.InvalidPacket) }
+    builder.WriteByte((value >> 8) & 255) else { return .Err(.InvalidPacket) }
+    builder.WriteByte(value & 255) else { return .Err(.InvalidPacket) }
+    .Ok
+}
+
+fn writeLabel(
+    &builder bytes.Builder,
+    value String,
+    start u64,
+    end u64
+) Result<void, Error> {
+    const length = end - start
+    if length == 0 || length > 63 return .Err(.InvalidPacket)
+    builder.WriteByte(length) else { return .Err(.InvalidPacket) }
+    var offset = start
+    while offset < end {
+        const byte = text.ByteAt(value, offset) else {
+            return .Err(.InvalidPacket)
+        }
+        builder.WriteByte(byte) else { return .Err(.InvalidPacket) }
+        offset += 1
+    }
+    .Ok
+}
+
+fn writeName(&builder bytes.Builder, name String) Result<void, Error> {
+    const length = text.ByteLen(name)
+    var start u64 = 0
+    var offset u64 = 0
+    while offset <= length {
+        const end = offset == length
+        var separator = end
+        if !end {
+            const value = text.ByteAt(name, offset) else {
+                return .Err(.InvalidPacket)
+            }
+            separator = value == 46
+        }
+        if separator {
+            writeLabel(&builder, name, start, offset) else error {
+                return .Err(error)
+            }
+            start = offset + 1
+        }
+        offset += 1
+    }
+    builder.WriteByte(0) else { return .Err(.InvalidPacket) }
+    .Ok
+}
+
+fn writeHeader(
+    &builder bytes.Builder,
+    flags u64,
+    questions u64,
+    answers u64
+) Result<void, Error> {
+    writeU16(&builder, 0) else error { return .Err(error) }
+    writeU16(&builder, flags) else error { return .Err(error) }
+    writeU16(&builder, questions) else error { return .Err(error) }
+    writeU16(&builder, answers) else error { return .Err(error) }
+    writeU16(&builder, 0) else error { return .Err(error) }
+    writeU16(&builder, 0) else error { return .Err(error) }
+    .Ok
+}
+
+fn serviceName() String {
+    "_remolo._udp.local"
+}
+
+fn instanceName(session String) String {
+    session + "." + serviceName()
+}
+
+fn hostName(session String) String {
+    const limit u64 = 12
+    const end = if text.ByteLen(session) > limit {
+        limit
+    } else {
+        text.ByteLen(session)
+    }
+    const prefix = text.Slice(session, 0, end) else {
+        panic("discovery session boundary invariant failed")
+    }
+    "remolo-" + prefix + ".local"
+}
+
+fn Query() Result<own bytes.Bytes, Error> {
+    const opened = bytes.NewBuilder(512) else { return .Err(.InvalidPacket) }
+    var builder = opened
+    writeHeader(&builder, 0, 1, 0) else error { return .Err(error) }
+    writeName(&builder, serviceName()) else error { return .Err(error) }
+    writeU16(&builder, 12) else error { return .Err(error) }
+    writeU16(&builder, 1) else error { return .Err(error) }
+    const result = builder.Finish() else { return .Err(.InvalidPacket) }
+    .Ok(result)
+}
+
+fn writeRecordHeader(
+    &builder bytes.Builder,
+    name String,
+    kind u64,
+    length u64
+) Result<void, Error> {
+    writeName(&builder, name) else error { return .Err(error) }
+    writeU16(&builder, kind) else error { return .Err(error) }
+    writeU16(&builder, 1) else error { return .Err(error) }
+    writeU32(&builder, 120) else error { return .Err(error) }
+    writeU16(&builder, length) else error { return .Err(error) }
+    .Ok
+}
+
+fn nameWireLength(value String) u64 {
+    text.ByteLen(value) + 2
+}
+
+fn ipv4Parts(value String) Result< [4]u8, Error> {
+    var parts [4]u8 = [0, 0, 0, 0]
+    const length = text.ByteLen(value)
+    var start u64 = 0
+    var index usize = 0
+    var offset u64 = 0
+    while offset <= length {
+        var separator = offset == length
+        if !separator {
+            const current = text.ByteAt(value, offset) else {
+                return .Err(.NoAddress)
+            }
+            separator = current == 46
+        }
+        if separator {
+            if index >= 4 || start == offset return .Err(.NoAddress)
+            const segment = text.Slice(value, start, offset) else {
+                return .Err(.NoAddress)
+            }
+            const parsed = parse.U8(segment) else { return .Err(.NoAddress) }
+            parts[index] = parsed
+            index += 1
+            start = offset + 1
+        }
+        offset += 1
+    }
+    if index != 4 return .Err(.NoAddress)
+    .Ok(parts)
+}
+
+fn writePTRRecord(
+    &builder bytes.Builder,
+    instance String
+) Result<void, Error> {
+    writeRecordHeader(
+        &builder,
+        serviceName(),
+        12,
+        nameWireLength(instance)
+    ) else error { return .Err(error) }
+    writeName(&builder, instance) else error { return .Err(error) }
+    .Ok
+}
+
+fn writeSRVRecord(
+    &builder bytes.Builder,
+    instance String,
+    host String,
+    port u16
+) Result<void, Error> {
+    writeRecordHeader(
+        &builder,
+        instance,
+        33,
+        6 + nameWireLength(host)
+    ) else error { return .Err(error) }
+    writeU16(&builder, 0) else error { return .Err(error) }
+    writeU16(&builder, 0) else error { return .Err(error) }
+    writeU16(&builder, u64.From(port)) else error { return .Err(error) }
+    writeName(&builder, host) else error { return .Err(error) }
+    .Ok
+}
+
+fn writeTXTRecord(
+    &builder bytes.Builder,
+    instance String,
+    value String
+) Result<void, Error> {
+    writeRecordHeader(
+        &builder,
+        instance,
+        16,
+        text.ByteLen(value) + 1
+    ) else error { return .Err(error) }
+    builder.WriteByte(text.ByteLen(value)) else {
+        return .Err(.InvalidPacket)
+    }
+    var offset u64 = 0
+    while offset < text.ByteLen(value) {
+        const byte = text.ByteAt(value, offset) else {
+            return .Err(.InvalidPacket)
+        }
+        builder.WriteByte(byte) else { return .Err(.InvalidPacket) }
+        offset += 1
+    }
+    .Ok
+}
+
+fn writeARecord(
+    &builder bytes.Builder,
+    host String,
+    parts [4]u8
+) Result<void, Error> {
+    writeRecordHeader(&builder, host, 1, 4) else error {
+        return .Err(error)
+    }
+    for part in parts {
+        builder.WriteByte(u64.From(part)) else {
+            return .Err(.InvalidPacket)
+        }
+    }
+    .Ok
+}
+
+fn Response(
+    session String,
+    address String,
+    port u16
+) Result<own bytes.Bytes, Error> {
+    const parts = ipv4Parts(address) else error { return .Err(error) }
+    const instance = instanceName(session)
+    const host = hostName(session)
+    const txt = "session=" + session
+    const opened = bytes.NewBuilder(2048) else { return .Err(.InvalidPacket) }
+    var builder = opened
+    writeHeader(&builder, 33792, 0, 4) else error { return .Err(error) }
+    writePTRRecord(&builder, instance) else error { return .Err(error) }
+    writeSRVRecord(&builder, instance, host, port) else error {
+        return .Err(error)
+    }
+    writeTXTRecord(&builder, instance, txt) else error { return .Err(error) }
+    writeARecord(&builder, host, parts) else error { return .Err(error) }
+    const result = builder.Finish() else { return .Err(.InvalidPacket) }
+    .Ok(result)
+}
+
+struct reader {
+    offset u64
+
+    fn ReadU16(&self, value bytes.Bytes) Result<u64, Error> {
+        const first = value.At(self.offset) else { return .Err(.InvalidPacket) }
+        const second = value.At(self.offset + 1) else {
+            return .Err(.InvalidPacket)
+        }
+        self.offset += 2
+        .Ok((first << 8) | second)
+    }
+
+    fn Skip(&self, value bytes.Bytes, length u64) Result<void, Error> {
+        const total = value.Len() else { return .Err(.InvalidPacket) }
+        if self.offset > total || length > total - self.offset {
+            return .Err(.InvalidPacket)
+        }
+        self.offset += length
+        .Ok
+    }
+
+    fn SkipName(&self, value bytes.Bytes) Result<void, Error> {
+        var labels u64 = 0
+        while labels < 128 {
+            const length = value.At(self.offset) else {
+                return .Err(.InvalidPacket)
+            }
+            self.offset += 1
+            if length == 0 return .Ok
+            if (length & 192) == 192 {
+                self.Skip(value, 1) else error { return .Err(error) }
+                return .Ok
+            }
+            if length > 63 return .Err(.InvalidPacket)
+            self.Skip(value, length) else error { return .Err(error) }
+            labels += 1
+        }
+        .Err(.InvalidPacket)
+    }
+
+    fn SkipQuestion(&self, value bytes.Bytes) Result<void, Error> {
+        self.SkipName(value) else error { return .Err(error) }
+        self.Skip(value, 4) else error { return .Err(error) }
+        .Ok
+    }
+}
+
+fn ipv4Text(value bytes.Bytes, offset u64) Result<String, Error> {
+    const first = value.At(offset) else { return .Err(.InvalidPacket) }
+    const second = value.At(offset + 1) else { return .Err(.InvalidPacket) }
+    const third = value.At(offset + 2) else { return .Err(.InvalidPacket) }
+    const fourth = value.At(offset + 3) else { return .Err(.InvalidPacket) }
+    .Ok(format.U64(first) + "." + format.U64(second) + "." +
+        format.U64(third) + "." + format.U64(fourth))
+}
+
+fn txtMatches(
+    value bytes.Bytes,
+    offset u64,
+    length u64,
+    session String
+) bool {
+    const end = offset + length
+    const expected = "session=" + session
+    var current = offset
+    while current < end {
+        const itemLength = value.At(current) else { return false }
+        current += 1
+        if itemLength > end - current return false
+        if itemLength == text.ByteLen(expected) &&
+            textBytesMatch(value, current, expected) {
+            return true
+        }
+        current += itemLength
+    }
+    false
+}
+
+fn textBytesMatch(
+    value bytes.Bytes,
+    offset u64,
+    expected String
+) bool {
+    var index u64 = 0
+    while index < text.ByteLen(expected) {
+        const actual = value.At(offset + index) else { return false }
+        const wanted = text.ByteAt(expected, index) else { return false }
+        if actual != wanted return false
+        index += 1
+    }
+    true
+}
+
+fn Candidate(value bytes.Bytes, session String) Result<token.Candidate, Error> {
+    var input = reader { offset = 0 }
+    const identifier = input.ReadU16(value) else error { return .Err(error) }
+    const flags = input.ReadU16(value) else error { return .Err(error) }
+    discard identifier
+    discard flags
+    const questions = input.ReadU16(value) else error { return .Err(error) }
+    const answers = input.ReadU16(value) else error { return .Err(error) }
+    input.Skip(value, 4) else error { return .Err(error) }
+    var question u64 = 0
+    while question < questions {
+        input.SkipQuestion(value) else error { return .Err(error) }
+        question += 1
+    }
+    var port u64 = 0
+    var address = ""
+    var sessionMatches = false
+    var answer u64 = 0
+    while answer < answers {
+        input.SkipName(value) else error { return .Err(error) }
+        const kind = input.ReadU16(value) else error { return .Err(error) }
+        const class = input.ReadU16(value) else error { return .Err(error) }
+        discard class
+        input.Skip(value, 4) else error { return .Err(error) }
+        const length = input.ReadU16(value) else error { return .Err(error) }
+        if kind == 33 && length >= 6 {
+            var data = reader { offset = input.offset + 4 }
+            const foundPort = data.ReadU16(value) else error {
+                return .Err(error)
+            }
+            port = foundPort
+        }
+        if kind == 1 && length == 4 {
+            const found = ipv4Text(value, input.offset) else error {
+                return .Err(error)
+            }
+            discard address
+            address = found
+        }
+        if kind == 16 && txtMatches(value, input.offset, length, session) {
+            sessionMatches = true
+        }
+        input.Skip(value, length) else error { return .Err(error) }
+        answer += 1
+    }
+    if port == 0 || text.IsEmpty(address) || !sessionMatches {
+        return .Err(.NoAddress)
+    }
+    const converted = u16.From(port) else { return .Err(.InvalidPacket) }
+    .Ok(token.Candidate { IP = address Port = converted })
+}
+
+fn IsQuery(value bytes.Bytes) bool {
+    var input = reader { offset = 0 }
+    const identifier = input.ReadU16(value) else { return false }
+    discard identifier
+    const flags = input.ReadU16(value) else { return false }
+    if (flags & 32768) != 0 return false
+    const questions = input.ReadU16(value) else { return false }
+    const answers = input.ReadU16(value) else { return false }
+    discard answers
+    input.Skip(value, 4) else { return false }
+    if questions == 0 return false
+    const expected [3]String = ["_remolo", "_udp", "local"]
+    for label in expected {
+        const length = value.At(input.offset) else { return false }
+        input.offset += 1
+        if length != text.ByteLen(label) return false
+        var index u64 = 0
+        while index < length {
+            const actual = value.At(input.offset + index) else { return false }
+            const wanted = text.ByteAt(label, index) else { return false }
+            if actual != wanted return false
+            index += 1
+        }
+        input.offset += length
+    }
+    const end = value.At(input.offset) else { return false }
+    input.offset += 1
+    if end != 0 return false
+    const kind = input.ReadU16(value) else { return false }
+    const class = input.ReadU16(value) else { return false }
+    kind == 12 && (class & 32767) == 1
+}
