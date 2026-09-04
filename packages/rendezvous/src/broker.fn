@@ -1,0 +1,67 @@
+package remolo.rendezvous
+
+import std.safemap
+import std.text
+import std.time
+
+// Stores session candidates until their configured expiry.
+struct Broker {
+    entries own safemap.ShardedMap<String, String>
+
+    // Replaces the candidates registered for one session.
+    fn Register(self, body String) Result<void, Error> {
+        const decoded = decodeRegistration(body) else error {
+            return .Err(error)
+        }
+        const registration { sessionID response } = decoded
+        const storing = self.entries.Set($sessionID, $response)
+        const stored = $storing.wait()
+        match stored {
+            Ok: .Ok
+            Err(error): {
+                discard error
+                .Err(.Storage)
+            }
+        }
+    }
+
+    // Returns the encoded candidates registered for one session.
+    fn Lookup(self, sessionID String) Result<String, Error> {
+        if text.IsEmpty(sessionID) return .Err(.InvalidRequest)
+        const loading = self.entries.Get(text.Copy(sessionID))
+        const loaded = $loading.wait() else error {
+            discard error
+            return .Err(.Storage)
+        }
+        match loaded {
+            None: .Err(.NotFound)
+            Some(body): .Ok(body)
+        }
+    }
+}
+
+// Creates a broker whose registrations expire after ttl.
+fn New(ttl time.Duration) Result<own Broker, Error> {
+    var entries = safemap.NewSharded<String, String>(
+        $safemap.StringEqual,
+        $safemap.CloneString,
+        $safemap.CloneString,
+        $safemap.StringHasher,
+        16
+    )
+    const configuring = entries.WithExpiry(normalizedTTL(ttl))
+    const configured = $configuring.wait()
+    match configured {
+        Ok: .Ok(own Broker { entries = entries })
+        Err(error): {
+            discard error
+            discard entries
+            .Err(.Storage)
+        }
+    }
+}
+
+fn normalizedTTL(ttl time.Duration) time.Duration {
+    if ttl.Nanoseconds() <= 0 return time.Seconds(600)
+    ttl
+}

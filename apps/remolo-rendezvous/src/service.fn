@@ -1,0 +1,31 @@
+package remolo.rendezvous_server
+
+import foundation.di
+import remolo.rendezvous
+import std.time
+
+@di.Scope(.Singleton)
+// Owns the rendezvous broker shared by HTTP handlers.
+service RendezvousState {
+    broker own rendezvous.Broker
+
+    // Creates the shared broker with the configured registration lifetime.
+    ctor New(ttlNanoseconds u64) Result<rendezvous.Error> {
+        const broker = rendezvous.New(
+            time.Nanoseconds(ttlNanoseconds)
+        ) else error {
+            return .Err(error)
+        }
+        .Ok(RendezvousState { broker = broker })
+    }
+
+    // Publishes one encoded registration.
+    fn Register(self, body String) Result<void, rendezvous.Error> {
+        self.broker.Register(body)
+    }
+
+    // Returns one encoded registration.
+    fn Lookup(self, sessionID String) Result<String, rendezvous.Error> {
+        self.broker.Lookup(sessionID)
+    }
+}

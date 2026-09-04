@@ -1,0 +1,13 @@
+package remolo.rendezvous
+
+// Describes failures returned by rendezvous brokers and clients.
+enum Error {
+    // The request or response does not follow the rendezvous protocol.
+    InvalidRequest
+    // No live registration exists for the requested session.
+    NotFound
+    // The broker could not access its registration store.
+    Storage
+    // The remote rendezvous service could not complete the request.
+    Transport
+}

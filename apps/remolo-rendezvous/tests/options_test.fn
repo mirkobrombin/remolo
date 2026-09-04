@@ -1,0 +1,38 @@
+package remolo.rendezvous_server
+
+test "Go flag forms preserve address and ttl behavior" {
+    const parsed = parseOptions([
+            "-addr",
+            "127.0.0.1:9000",
+            "-ttl",
+            "45s"
+        ]) else error {
+        fail(error)
+    }
+    expect(parsed.address == "127.0.0.1")
+    expect(parsed.port == 9000)
+    expect(parsed.ttlNanoseconds == 45000000000)
+}
+
+test "Go assigned flag forms preserve address and ttl behavior" {
+    const parsed = parseOptions([
+            "-addr=127.0.0.1:9000",
+            "--ttl=45s"
+        ]) else error {
+        fail(error)
+    }
+    expect(parsed.address == "127.0.0.1")
+    expect(parsed.port == 9000)
+    expect(parsed.ttlNanoseconds == 45000000000)
+}
+
+test "nonpositive ttl restores the Go default" {
+    const zero = parseOptions(["-ttl", "0s"]) else error {
+        fail(error)
+    }
+    expect(zero.ttlNanoseconds == 600000000000)
+    const negative = parseOptions(["--ttl", "-1s"]) else error {
+        fail(error)
+    }
+    expect(negative.ttlNanoseconds == 600000000000)
+}

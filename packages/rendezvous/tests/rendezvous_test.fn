@@ -1,0 +1,142 @@
+package remolo.rendezvous
+
+import std.time
+
+fn broker(ttl time.Duration) own Broker {
+    const value = New(ttl) else error {
+        discard error
+        panic("could not create rendezvous broker")
+    }
+    value
+}
+
+fn registrationBody() String {
+    "{\"session_id\":\"deadbeefcafef00d\",\"candidates\":[" +
+        "{\"ip\":\"192.168.1.10\",\"port\":4242}," +
+        "{\"ip\":\"2001:db8::1\",\"port\":5353}]}"
+}
+
+fn expectNotFound(value Result<String, Error>) void {
+    match value {
+        Ok(body): {
+            discard body
+            fail("expected a missing rendezvous session")
+        }
+        Err(error): match error {
+            NotFound: {}
+            _: fail("expected a not found error")
+        }
+    }
+}
+
+test "registrations preserve candidate order and wire names" {
+    const value = broker(time.Seconds(60))
+    value.Register(registrationBody()) else error {
+        discard error
+        fail("could not register rendezvous candidates")
+    }
+    const response = value.Lookup("deadbeefcafef00d") else error {
+        discard error
+        fail("could not look up rendezvous candidates")
+    }
+    const candidates = decodeLookup(response) else error {
+        discard error
+        fail("could not decode rendezvous candidates")
+    }
+    var pending = candidates
+    expect(pending.Len() == 2)
+    const first = requiredValue(pending.PopFront())
+    const second = requiredValue(pending.PopFront())
+    expect(first.IP == "192.168.1.10")
+    expect(first.Port == 4242)
+    expect(second.IP == "2001:db8::1")
+    expect(second.Port == 5353)
+    discard value
+}
+
+test "lookup reports missing sessions" {
+    const value = broker(time.Seconds(60))
+    expectNotFound(value.Lookup("missing"))
+    discard value
+}
+
+test "registration rejects invalid json and empty sessions" {
+    const value = broker(time.Seconds(60))
+    match value.Register("not-json") {
+        Ok: fail("expected invalid JSON to fail")
+        Err(error): match error {
+            InvalidRequest: {}
+            _: fail("expected an invalid request error")
+        }
+    }
+    match value.Register("{\"session_id\":\"\",\"candidates\":[]}") {
+        Ok: fail("expected an empty session to fail")
+        Err(error): match error {
+            InvalidRequest: {}
+            _: fail("expected an invalid request error")
+        }
+    }
+    discard value
+}
+
+test "null candidates decode as an empty list" {
+    const value = broker(time.Seconds(60))
+    value.Register(
+        "{\"session_id\":\"empty\",\"candidates\":null}"
+    ) else error {
+        discard error
+        fail("could not register a null candidate list")
+    }
+    const response = value.Lookup("empty") else error {
+        discard error
+        fail("could not look up an empty candidate list")
+    }
+    const candidates = decodeLookup(response) else error {
+        discard error
+        fail("could not decode an empty candidate list")
+    }
+    expect(candidates.IsEmpty())
+    discard value
+}
+
+task waitForExpiry() void {
+    const Channel { sender receiver } = channel<void>(0)
+    var endpoint = receiver
+    const delay u64 = 2000000
+    select {
+        endpoint.receive(): {
+            discard sender
+            discard endpoint
+        }
+        timeout delay: {
+            discard sender
+            discard endpoint
+        }
+        else error: {
+            discard error
+            discard sender
+            discard endpoint
+        }
+    }
+}
+
+test "registrations expire after their ttl" {
+    const value = broker(time.Nanoseconds(1000000))
+    value.Register(registrationBody()) else error {
+        discard error
+        fail("could not register expiring rendezvous candidates")
+    }
+    const waiting = spawn waitForExpiry()
+    $waiting.wait()
+    expectNotFound(value.Lookup("deadbeefcafef00d"))
+    discard value
+}
+
+test "nonpositive ttl uses the ten minute default" {
+    expect(normalizedTTL(time.Nanoseconds(0)).Nanoseconds() == 600000000000)
+    const negative = time.Duration.Parse("-1ns") else error {
+        discard error
+        fail("negative duration did not parse")
+    }
+    expect(normalizedTTL(negative).Nanoseconds() == 600000000000)
+}

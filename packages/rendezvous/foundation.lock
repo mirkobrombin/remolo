@@ -1,0 +1,7 @@
+format foundation.lock/v1
+root remolo.rendezvous 1.0.0
+target linux
+package remolo.codec 1.0.0 sha256:0b669009e86d2d19ad75fb45e813fbc25b11c68889b94a2bc9e5a74dadda0f70 path ../codec
+package remolo.token 1.0.0 sha256:59a45efec141d890479a3fe1bb2c2a86fa7d300a9241c4242915a3162019bbb8 path ../token
+edge remolo.rendezvous remolo.token
+edge remolo.token remolo.codec

@@ -1,0 +1,79 @@
+package remolo.rendezvous_server
+
+import foundation.web
+import remolo.rendezvous
+import remolo.token
+import std.format
+
+fn serverResult($value Result<void, web.ServeError<FoundationWebError>>) void {
+    match value {
+        Ok: {}
+        Err(error): {
+            discard error
+            fail("rendezvous server rejected a request")
+        }
+    }
+}
+
+fn candidate($value Option<token.Candidate>) token.Candidate {
+    match value {
+        None: panic("rendezvous client result was incomplete")
+        Some(selected): selected
+    }
+}
+
+test "the Foundation client uses the rendezvous HTTP protocol" {
+    const application = BuildFoundationApplication(60000000000) else error {
+        discard error
+        fail("could not build the rendezvous application")
+    }
+    const opened = web.NewServer<FoundationWebError>(
+        $"127.0.0.1",
+        0,
+        $application
+    ) else error {
+        discard error
+        fail("could not open the rendezvous server")
+    }
+    var server = opened
+    const baseURL = "http://127.0.0.1:" + format.U64(server.Port())
+    const paddedURL = baseURL + "///"
+    const values [2]token.Candidate = [
+        token.Candidate { IP = "192.168.1.10" Port = 4242 },
+        token.Candidate { IP = "2001:db8::1" Port = 5353 }
+    ]
+
+    const registering = server.ServeOne()
+    rendezvous.Register(paddedURL, "deadbeefcafef00d", values) else error {
+        discard error
+        fail("rendezvous client registration failed")
+    }
+    const registered = $registering.wait()
+    const web.ServeOutcome { Server as afterRegister Value as registerValue } =
+        registered
+    serverResult($registerValue)
+    server = afterRegister
+
+    const lookingUp = server.ServeOne()
+    const found = rendezvous.Lookup(paddedURL, "deadbeefcafef00d") else error {
+        discard error
+        fail("rendezvous client lookup failed")
+    }
+    const lookedUp = $lookingUp.wait()
+    const web.ServeOutcome {
+        Server as afterLookup
+        Value as lookupValue
+    } = lookedUp
+    serverResult($lookupValue)
+    server = afterLookup
+
+    var candidates = found
+    expect(candidates.Len() == 2)
+    const first = candidate(candidates.PopFront())
+    const second = candidate(candidates.PopFront())
+    expect(first.IP == "192.168.1.10")
+    expect(first.Port == 4242)
+    expect(second.IP == "2001:db8::1")
+    expect(second.Port == 5353)
+    discard server
+}
