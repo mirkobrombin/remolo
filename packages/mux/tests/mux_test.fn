@@ -1,0 +1,231 @@
+package remolo.mux
+
+import foundation.auth
+import remolo.transport
+import std.bytes
+
+test "yamux wire matches version 0 frames" {
+    const encoded = encodePacket(
+        header {
+        frameType = .Data
+        flags = 5
+        streamID = 16909060
+        length = 3
+    },
+        bytes.FromText("abc")
+    ) else error { panic(muxFailure(error)) }
+    const encodedLength = encoded.Len() else { fail("length read failed") }
+    expect(encodedLength == 15)
+    expect(byteValue(encoded, 0) == 0)
+    expect(byteValue(encoded, 1) == 0)
+    expect(byteValue(encoded, 2) == 0)
+    expect(byteValue(encoded, 3) == 5)
+    expect(byteValue(encoded, 4) == 1)
+    expect(byteValue(encoded, 5) == 2)
+    expect(byteValue(encoded, 6) == 3)
+    expect(byteValue(encoded, 7) == 4)
+    expect(byteValue(encoded, 8) == 0)
+    expect(byteValue(encoded, 9) == 0)
+    expect(byteValue(encoded, 10) == 0)
+    expect(byteValue(encoded, 11) == 3)
+    expect(byteValue(encoded, 12) == 97)
+    expect(byteValue(encoded, 13) == 98)
+    expect(byteValue(encoded, 14) == 99)
+
+    const rawHeader = encoded.Slice(0, 12) else { fail("header slice failed") }
+    const decoded = decodeHeader(rawHeader) else error { panic(muxFailure(error)) }
+    expect(isData(decoded.frameType))
+    expect(decoded.flags == 5)
+    expect(decoded.streamID == 16909060)
+    expect(decoded.length == 3)
+}
+
+test "yamux multiplexes streams over pinned TLS" {
+    const host = auth.GenerateOpenSSLEd25519() else { fail("identity failed") }
+    const listener = transport.ListenSecure(
+        $"127.0.0.1",
+        0,
+        host.PrivateKeyPEM
+    ) else { fail("secure listen failed") }
+    const port = listener.Port()
+    const pin = host.RawPublicKey.Copy() else { fail("pin copy failed") }
+    const acceptingTransport = spawn transport.AcceptSecure($listener)
+    const dialing = spawn transport.DialSecure($"127.0.0.1", port, $pin)
+    const clientTransport = $dialing.wait() else { fail("secure dial failed") }
+    const acceptedTransport = $acceptingTransport.wait()
+    const transport.SecureAcceptOutcome {
+        Listener
+        Value as serverValue
+    } = acceptedTransport
+    const serverTransport = serverValue else { fail("secure accept failed") }
+    var client = NewClient($clientTransport)
+    var server = NewServer($serverTransport)
+    const clientHandle = client.Handle()
+    const serverHandle = server.Handle()
+
+    const openingFirst = clientHandle.Open()
+    const acceptingFirst = serverHandle.Accept()
+    const firstClient = $openingFirst.wait() else error { panic(muxFailure(error)) }
+    const firstServer = $acceptingFirst.wait() else error { panic(muxFailure(error)) }
+    expect(firstClient.ID == 1)
+    expect(firstServer.ID == 1)
+
+    const openingSecond = clientHandle.Open()
+    const acceptingSecond = serverHandle.Accept()
+    const secondClient = $openingSecond.wait() else error { panic(muxFailure(error)) }
+    const secondServer = $acceptingSecond.wait() else error { panic(muxFailure(error)) }
+    expect(secondClient.ID == 3)
+    expect(secondServer.ID == 3)
+
+    const Stream {
+        Reader as firstClientReader
+        Writer as firstClientWriter
+        ID as firstClientID
+    } = firstClient
+    const Stream {
+        Reader as firstServerReader
+        Writer as firstServerWriter
+        ID as firstServerID
+    } = firstServer
+    const Stream {
+        Reader as secondClientReader
+        Writer as secondClientWriter
+        ID as secondClientID
+    } = secondClient
+    const Stream {
+        Reader as secondServerReader
+        Writer as secondServerWriter
+        ID as secondServerID
+    } = secondServer
+    expect(firstClientID == firstServerID)
+    expect(secondClientID == secondServerID)
+
+    const writingFirst = spawn WriteAll(
+        $firstClientWriter,
+        $bytes.FromText("first stream")
+    )
+    const writingSecond = spawn WriteAll(
+        $secondClientWriter,
+        $bytes.FromText("second stream")
+    )
+    const readingFirst = spawn Read($firstServerReader)
+    const readingSecond = spawn Read($secondServerReader)
+    const firstWrite = $writingFirst.wait()
+    const secondWrite = $writingSecond.wait()
+    const firstRead = $readingFirst.wait()
+    const secondRead = $readingSecond.wait()
+    const WriteOutcome {
+        Writer as firstWriter
+        Value as firstWriteValue
+    } = firstWrite
+    const WriteOutcome {
+        Writer as secondWriter
+        Value as secondWriteValue
+    } = secondWrite
+    const ReadOutcome {
+        Reader as firstReader
+        Value as firstReadValue
+    } = firstRead
+    const ReadOutcome {
+        Reader as secondReader
+        Value as secondReadValue
+    } = secondRead
+    expectWrite($firstWriteValue)
+    expectWrite($secondWriteValue)
+    const firstText = firstReadValue else error { panic(muxFailure(error)) }
+    const secondText = secondReadValue else error { panic(muxFailure(error)) }
+    const firstValue = firstText.Text() else { fail("first text failed") }
+    const secondValue = secondText.Text() else { fail("second text failed") }
+    expect(firstValue == "first stream")
+    expect(secondValue == "second stream")
+
+    const payload = largePayload()
+    const flowing = spawn WriteAll($secondWriter, $payload)
+    var flowReader = secondReader
+    var received u64 = 0
+    var frames u64 = 0
+    while frames < 5 {
+        const pending = spawn Read($flowReader)
+        const outcome = $pending.wait()
+        const ReadOutcome { Reader Value } = outcome
+        flowReader = Reader
+        const chunk = Value else error { panic(muxFailure(error)) }
+        const length = chunk.Len() else { fail("flow chunk length failed") }
+        received += length
+        frames += 1
+    }
+    const flowWrite = $flowing.wait()
+    const WriteOutcome {
+        Writer as flowWriter
+        Value as flowValue
+    } = flowWrite
+    expectWrite($flowValue)
+    expect(received == 262145)
+
+    const closingFirst = spawn CloseWriter($firstWriter)
+    const closingSecond = spawn CloseWriter($flowWriter)
+    const firstClosed = $closingFirst.wait()
+    const secondClosed = $closingSecond.wait()
+    expectWrite($firstClosed)
+    expectWrite($secondClosed)
+    discard firstClientReader
+    discard secondClientReader
+    discard firstReader
+    discard flowReader
+    discard firstServerWriter
+    discard secondServerWriter
+    Close($client)
+    Close($server)
+    discard Listener
+}
+
+fn expectWrite($value Result<void, Error>) void {
+    match value {
+        Ok: {}
+        Err(error): panic(muxFailure(error))
+    }
+}
+
+fn byteValue(value bytes.Bytes, index u64) u64 {
+    const found = value.At(index) else { fail("byte read failed") }
+    found
+}
+
+fn largePayload() own bytes.Bytes {
+    const openedChunk = bytes.NewBuilder(65536) else { fail("chunk builder failed") }
+    var chunk = openedChunk
+    var index u64 = 0
+    while index < 65536 {
+        chunk.WriteByte(97) else { fail("chunk write failed") }
+        index += 1
+    }
+    const block = chunk.Finish() else { fail("chunk finish failed") }
+    const openedPayload = bytes.NewBuilder(262145) else {
+        fail("payload builder failed")
+    }
+    var payload = openedPayload
+    payload.Write(block) else { fail("payload write failed") }
+    payload.Write(block) else { fail("payload write failed") }
+    payload.Write(block) else { fail("payload write failed") }
+    payload.Write(block) else { fail("payload write failed") }
+    payload.WriteByte(98) else { fail("payload write failed") }
+    const result = payload.Finish() else { fail("payload finish failed") }
+    result
+}
+
+fn muxFailure(error Error) String {
+    match error {
+        InvalidVersion: "mux: invalid version"
+        InvalidType: "mux: invalid type"
+        InvalidFlags: "mux: invalid flags"
+        InvalidStream: "mux: invalid stream"
+        InvalidLength: "mux: invalid length"
+        DuplicateStream: "mux: duplicate stream"
+        StreamsExhausted: "mux: streams exhausted"
+        ReceiveWindowExceeded: "mux: receive window exceeded"
+        RemoteGoAway: "mux: remote go away"
+        Reset: "mux: reset"
+        Closed: "mux: closed"
+        Transport: "mux: transport"
+    }
+}

@@ -27,11 +27,13 @@ test "pinned TLS carries Remolo frames" {
     const SecureStream {
         Reader as clientReader
         Writer as clientWriter
+        Controller as clientController
         Peer as clientPeer
     } = client
     const SecureStream {
         Reader as serverReader
         Writer as serverWriter
+        Controller as serverController
         Peer as serverPeer
     } = server
     expect(clientPeer == "127.0.0.1")
@@ -57,9 +59,11 @@ test "pinned TLS carries Remolo frames" {
     const payload = frame.Payload.Text() else { fail("secure payload failed") }
     expect(payload == "hello over pinned TLS")
     discard clientReader
+    discard clientController
     discard Reader
     discard Writer
     discard serverWriter
+    discard serverController
     discard Listener
 }
 

@@ -1,0 +1,9 @@
+format foundation.package/v1
+name remolo.mux
+version 1.0.0
+language 1
+fcs standard
+source src
+test_source tests
+dependency remolo.transport 1.0.0 path ../transport
+

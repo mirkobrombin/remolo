@@ -1,0 +1,1106 @@
+package remolo.mux
+
+import remolo.transport
+import std.bytes
+import std.collections
+import std.concurrent
+import std.text
+
+enum streamEvent {
+    Data(value own bytes.Bytes)
+    Fin
+    Reset
+}
+
+@concurrent.Transferable()
+struct Reader {
+    id u64
+    inbox Receiver<streamEvent>
+    control Sender<request>
+}
+
+@concurrent.Transferable()
+struct Writer {
+    id u64
+    control Sender<request>
+}
+
+@concurrent.Transferable()
+struct Stream {
+    ID u64
+    Reader own Reader
+    Writer own Writer
+}
+
+struct ReadOutcome {
+    Reader own Reader
+    Value Result<own bytes.Bytes, Error>
+}
+
+struct WriteOutcome {
+    Writer own Writer
+    Value Result<void, Error>
+}
+
+enum streamResponse {
+    Opened(value Stream)
+    Failed(error Error)
+}
+
+enum voidResponse {
+    Done
+    Failed(error Error)
+}
+
+struct openRequest {
+    reply Sender<streamResponse>
+}
+
+struct acceptRequest {
+    reply Sender<streamResponse>
+}
+
+struct writeRequest {
+    id u64
+    data own bytes.Bytes
+    reply Sender<voidResponse>
+}
+
+struct consumedRequest {
+    id u64
+    length u64
+}
+
+struct closeRequest {
+    id u64
+    reply Sender<voidResponse>
+}
+
+enum request {
+    Open(value openRequest)
+    Accept(value acceptRequest)
+    Write(value writeRequest)
+    Consumed(value consumedRequest)
+    Close(value closeRequest)
+    Inbound(value packet)
+    TransportFailed
+    Shutdown(reply Sender<void>)
+}
+
+struct pendingWrite {
+    data own bytes.Bytes
+    reply Sender<voidResponse>
+}
+
+struct streamState {
+    id u64
+    inbound Sender<streamEvent>
+    sendWindow u64
+    receiveWindow u64
+    pending own collections.List<pendingWrite>
+    localClosed bool
+    remoteClosed bool
+}
+
+struct state {
+    streams own collections.List<streamState>
+    accepted own collections.List<Stream>
+    acceptWaiters own collections.List<acceptRequest>
+    nextStreamID u64
+    remoteGoAway bool
+    localGoAway bool
+}
+
+struct openEffect {
+    reply Sender<streamResponse>
+    value streamResponse
+}
+
+struct voidEffect {
+    reply Sender<voidResponse>
+    value voidResponse
+}
+
+struct streamEffect {
+    reply Sender<streamEvent>
+    value streamEvent
+}
+
+enum effect {
+    Frame(value packet)
+    Open(value openEffect)
+    Void(value voidEffect)
+    Stream(value streamEffect)
+}
+
+struct Handle {
+    sender Sender<request>
+    peer String
+
+    fn Clone(self) Handle {
+        Handle { sender = self.sender.clone() peer = text.Copy(self.peer) }
+    }
+
+    fn PeerAddress(self) String {
+        text.Copy(self.peer)
+    }
+
+    fn Open(self) Task<Result<Stream, Error>> {
+        spawn open(self.sender.clone())
+    }
+
+    fn Accept(self) Task<Result<Stream, Error>> {
+        spawn accept(self.sender.clone())
+    }
+}
+
+struct Session {
+    actor Task<void>
+    reader Task<void>
+    writer Task<void>
+    controller own transport.SecureController
+    handle Handle
+
+    fn Handle(self) Handle {
+        self.handle.Clone()
+    }
+
+    fn PeerAddress(self) String {
+        self.handle.PeerAddress()
+    }
+}
+
+fn NewClient($stream transport.SecureStream) own Session {
+    newSession($stream, 1)
+}
+
+fn NewServer($stream transport.SecureStream) own Session {
+    newSession($stream, 2)
+}
+
+fn newSession(
+    $stream transport.SecureStream,
+    nextStreamID u64
+) own Session {
+    const transport.SecureStream { Reader Writer Controller Peer } = stream
+    const Channel { sender receiver } = channel<request>(64)
+    const Channel { sender as outgoing receiver as writes } = channel<packet>(64)
+    const actor = spawn serve(
+        $receiver,
+        sender.clone(),
+        $outgoing,
+        nextStreamID
+    )
+    const reader = spawn readTransport($Reader, sender.clone())
+    const writer = spawn writeTransport($Writer, $writes, sender.clone())
+    own Session {
+        actor = actor
+        reader = reader
+        writer = writer
+        controller = Controller
+        handle = Handle { sender = sender peer = Peer }
+    }
+}
+
+task open($control Sender<request>) Result<Stream, Error> {
+    const Channel { sender receiver } = channel<streamResponse>(1)
+    select {
+        control.send(.Open(value = openRequest { reply = sender })): {}
+        else error: return .Err(channelError(error))
+    }
+    const received = receiver.receive()
+    match received {
+        Ok(value): match value {
+            Opened(value): .Ok(value)
+            Failed(error): .Err(error)
+        }
+        Err(error): .Err(channelError(error))
+    }
+}
+
+task accept($control Sender<request>) Result<Stream, Error> {
+    const Channel { sender receiver } = channel<streamResponse>(1)
+    select {
+        control.send(.Accept(value = acceptRequest { reply = sender })): {}
+        else error: return .Err(channelError(error))
+    }
+    const received = receiver.receive()
+    match received {
+        Ok(value): match value {
+            Opened(value): .Ok(value)
+            Failed(error): .Err(error)
+        }
+        Err(error): .Err(channelError(error))
+    }
+}
+
+task Read($reader own Reader) ReadOutcome {
+    const Reader { id inbox control } = reader
+    const received = inbox.receive()
+    match received {
+        Ok(event): match event {
+            Data(value): {
+                const length = value.Len() else error {
+                    discard error
+                    return ReadOutcome {
+                        Reader = own Reader { id = id inbox = inbox control = control }
+                        Value = .Err(.Transport)
+                    }
+                }
+                discard control.send(.Consumed(value = consumedRequest {
+                    id = id
+                    length = length
+                }))
+                ReadOutcome {
+                    Reader = own Reader { id = id inbox = inbox control = control }
+                    Value = .Ok(value)
+                }
+            }
+            Fin: ReadOutcome {
+                Reader = own Reader { id = id inbox = inbox control = control }
+                Value = .Err(.Closed)
+            }
+            Reset: ReadOutcome {
+                Reader = own Reader { id = id inbox = inbox control = control }
+                Value = .Err(.Reset)
+            }
+        }
+        Err(error): ReadOutcome {
+            Reader = own Reader { id = id inbox = inbox control = control }
+            Value = .Err(channelError(error))
+        }
+    }
+}
+
+task WriteAll(
+    $writer own Writer,
+    $value own bytes.Bytes
+) WriteOutcome {
+    const Writer { id control } = writer
+    const length = value.Len() else error {
+        discard error
+        return WriteOutcome {
+            Writer = own Writer { id = id control = control }
+            Value = .Err(.Transport)
+        }
+    }
+    var offset u64 = 0
+    while offset < length {
+        var end = offset + 65536
+        if end > length { end = length }
+        const chunk = value.Slice(offset, end) else error {
+            discard error
+            return WriteOutcome {
+                Writer = own Writer { id = id control = control }
+                Value = .Err(.Transport)
+            }
+        }
+        const pending = spawn sendWrite(control.clone(), id, $chunk)
+        const written = $pending.wait()
+        match written {
+            Ok: {}
+            Err(error): {
+                return WriteOutcome {
+                    Writer = own Writer { id = id control = control }
+                    Value = .Err(error)
+                }
+            }
+        }
+        offset = end
+    }
+    discard value
+    WriteOutcome {
+        Writer = own Writer { id = id control = control }
+        Value = .Ok
+    }
+}
+
+task CloseWriter($writer own Writer) Result<void, Error> {
+    const Writer { id control } = writer
+    const Channel { sender receiver } = channel<voidResponse>(1)
+    select {
+        control.send(.Close(value = closeRequest { id = id reply = sender })): {}
+        else error: return .Err(channelError(error))
+    }
+    const received = receiver.receive()
+    match received {
+        Ok(value): match value {
+            Done: .Ok
+            Failed(error): .Err(error)
+        }
+        Err(error): .Err(channelError(error))
+    }
+}
+
+fn Close($session own Session) void {
+    const Session { actor reader writer controller handle } = session
+    const Handle { sender peer } = handle
+    discard peer
+    const Channel { sender as reply receiver } = channel<void>(1)
+    const stopping = spawn stop($sender, $reply)
+    discard $stopping.wait()
+    discard $writer.wait()
+    var activeController = controller
+    const aborted = activeController.Abort()
+    discard aborted
+    discard activeController
+    discard $reader.wait()
+    discard $actor.wait()
+    discard receiver
+}
+
+task stop(
+    $control Sender<request>,
+    $reply Sender<void>
+) void {
+    discard control.send(.Shutdown(reply = reply))
+}
+
+task sendWrite(
+    $control Sender<request>,
+    id u64,
+    $data own bytes.Bytes
+) Result<void, Error> {
+    const Channel { sender receiver } = channel<voidResponse>(1)
+    select {
+        control.send(.Write(value = writeRequest {
+            id = id
+            data = data
+            reply = sender
+        })): {}
+        else error: return .Err(channelError(error))
+    }
+    const received = receiver.receive()
+    match received {
+        Ok(value): match value {
+            Done: .Ok
+            Failed(error): .Err(error)
+        }
+        Err(error): .Err(channelError(error))
+    }
+}
+
+task serve(
+    $receiver Receiver<request>,
+    $control Sender<request>,
+    $outgoing Sender<packet>,
+    nextStreamID u64
+) void {
+    var inbox = receiver
+    var current = own state {
+        streams = collections.NewList<streamState>()
+        accepted = collections.NewList<Stream>()
+        acceptWaiters = collections.NewList<acceptRequest>()
+        nextStreamID = nextStreamID
+        remoteGoAway = false
+        localGoAway = false
+    }
+    while true {
+        const incoming = inbox.receive()
+        match incoming {
+            Err(error): {
+                discard error
+                return
+            }
+            Ok(message): {
+                var effects = collections.NewList<effect>()
+                var keepRunning = true
+                match message {
+                    Open(value): applyOpen(&current, control.clone(), &effects, $value)
+                    Accept(value): applyAccept(&current, &effects, $value)
+                    Write(value): applyWrite(&current, &effects, $value)
+                    Consumed(value): applyConsumed(&current, &effects, value)
+                    Close(value): applyClose(&current, &effects, $value)
+                    Inbound(value): {
+                        keepRunning = applyInbound(
+                            &current,
+                            control.clone(),
+                            &effects,
+                            $value
+                        )
+                    }
+                    TransportFailed: {
+                        return
+                    }
+                    Shutdown(reply): {
+                        current.localGoAway = true
+                        effects.PushFront(.Frame(value = packet {
+                            header = header {
+                                frameType = .GoAway
+                                flags = 0
+                                streamID = 0
+                                length = 0
+                            }
+                            body = bytes.FromText("")
+                        }))
+                        const pending = spawn runEffects($effects, outgoing.clone())
+                        discard $pending.wait()
+                        discard reply.send()
+                        return
+                    }
+                }
+                const pending = spawn runEffects($effects, outgoing.clone())
+                discard $pending.wait()
+                if !keepRunning return
+            }
+        }
+    }
+}
+
+fn applyOpen(
+    &current state,
+    $control Sender<request>,
+    &effects collections.List<effect>,
+    $value openRequest
+) void {
+    const openRequest { reply } = value
+    if current.remoteGoAway {
+        effects.PushFront(.Open(value = openEffect {
+            reply = reply
+            value = .Failed(error = .RemoteGoAway)
+        }))
+        return
+    }
+    if current.nextStreamID > 4294967293 {
+        effects.PushFront(.Open(value = openEffect {
+            reply = reply
+            value = .Failed(error = .StreamsExhausted)
+        }))
+        return
+    }
+    const id = current.nextStreamID
+    current.nextStreamID = current.nextStreamID + 2
+    const created = createStream($control, id)
+    const createdStream { stream state } = created
+    current.streams.PushFront($state)
+    effects.PushFront(.Frame(value = packet {
+        header = header {
+            frameType = .WindowUpdate
+            flags = 1
+            streamID = id
+            length = 0
+        }
+        body = bytes.FromText("")
+    }))
+    effects.PushFront(.Open(value = openEffect {
+        reply = reply
+        value = .Opened(value = stream)
+    }))
+}
+
+fn applyAccept(
+    &current state,
+    &effects collections.List<effect>,
+    $value acceptRequest
+) void {
+    const acceptRequest { reply } = value
+    match current.accepted.PopFront() {
+        Some(stream): {
+            effects.PushFront(.Frame(value = windowPacket(stream.ID, 2, 0)))
+            effects.PushFront(.Open(value = openEffect {
+                reply = reply
+                value = .Opened(value = stream)
+            }))
+        }
+        None: {
+            const queued = replace current.acceptWaiters with
+            collections.NewList<acceptRequest>()
+            current.acceptWaiters = appendList<acceptRequest>(
+                $queued,
+                acceptRequest { reply = reply }
+            )
+        }
+    }
+}
+
+fn applyWrite(
+    &current state,
+    &effects collections.List<effect>,
+    $value writeRequest
+) void {
+    const writeRequest { id data reply } = value
+    const selected = takeStream(&current, id)
+    match selected {
+        None: {
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Failed(error = .Closed)
+            }))
+        }
+        Some(state): {
+            var stream = state
+            const length = data.Len() else error {
+                discard error
+                effects.PushFront(.Void(value = voidEffect {
+                    reply = reply
+                    value = .Failed(error = .Transport)
+                }))
+                current.streams.PushFront($stream)
+                return
+            }
+            if stream.localClosed {
+                effects.PushFront(.Void(value = voidEffect {
+                    reply = reply
+                    value = .Failed(error = .Closed)
+                }))
+                current.streams.PushFront($stream)
+                return
+            }
+            if length > stream.sendWindow {
+                const queued = replace stream.pending with
+                collections.NewList<pendingWrite>()
+                stream.pending = appendList<pendingWrite>(
+                    $queued,
+                    pendingWrite { data = data reply = reply }
+                )
+                current.streams.PushFront($stream)
+                return
+            }
+            stream.sendWindow = stream.sendWindow - length
+            effects.PushFront(.Frame(value = packet {
+                header = header {
+                    frameType = .Data
+                    flags = 0
+                    streamID = id
+                    length = length
+                }
+                body = data
+            }))
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Done
+            }))
+            current.streams.PushFront($stream)
+        }
+    }
+}
+
+fn applyConsumed(
+    &current state,
+    &effects collections.List<effect>,
+    value consumedRequest
+) void {
+    const selected = takeStream(&current, value.id)
+    match selected {
+        None: {
+            return
+        }
+        Some(state): {
+            var stream = state
+            if stream.receiveWindow <= 262144 - value.length {
+                stream.receiveWindow = stream.receiveWindow + value.length
+                effects.PushFront(.Frame(value = windowPacket(
+                            value.id,
+                            0,
+                            value.length
+                        )))
+            }
+            current.streams.PushFront($stream)
+        }
+    }
+}
+
+fn applyClose(
+    &current state,
+    &effects collections.List<effect>,
+    $value closeRequest
+) void {
+    const closeRequest { id reply } = value
+    const selected = takeStream(&current, id)
+    match selected {
+        None: {
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Done
+            }))
+        }
+        Some(state): {
+            var stream = state
+            if !stream.localClosed {
+                stream.localClosed = true
+                effects.PushFront(.Frame(value = windowPacket(id, 4, 0)))
+            }
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Done
+            }))
+            if stream.remoteClosed {
+                discard stream
+            } else {
+                current.streams.PushFront($stream)
+            }
+        }
+    }
+}
+
+fn applyInbound(
+    &current state,
+    $control Sender<request>,
+    &effects collections.List<effect>,
+    $value packet
+) bool {
+    const packet { header as incoming body } = value
+    match incoming.frameType {
+        Ping: {
+            if (incoming.flags & 1) != 0 {
+                effects.PushFront(.Frame(value = packet {
+                    header = header {
+                        frameType = .Ping
+                        flags = 2
+                        streamID = 0
+                        length = incoming.length
+                    }
+                    body = bytes.FromText("")
+                }))
+            }
+            discard body
+            return true
+        }
+        GoAway: {
+            current.remoteGoAway = true
+            discard body
+            return incoming.length == 0
+        }
+        Data: {}
+        WindowUpdate: {}
+    }
+    if (incoming.flags & 1) != 0 {
+        if containsStream(&current, incoming.streamID) {
+            discard body
+            return false
+        }
+        const created = createStream($control, incoming.streamID)
+        const createdStream { stream state } = created
+        current.streams.PushFront($state)
+        match current.acceptWaiters.PopFront() {
+            Some(waiter): {
+                const acceptRequest { reply } = waiter
+                effects.PushFront(.Frame(value = windowPacket(
+                            incoming.streamID,
+                            2,
+                            0
+                        )))
+                effects.PushFront(.Open(value = openEffect {
+                    reply = reply
+                    value = .Opened(value = stream)
+                }))
+            }
+            None: {
+                const queued = replace current.accepted with
+                collections.NewList<Stream>()
+                current.accepted = appendList<Stream>($queued, $stream)
+            }
+        }
+    }
+    const selected = takeStream(&current, incoming.streamID)
+    match selected {
+        None: {
+            discard body
+            return true
+        }
+        Some(state): {
+            var stream = state
+            if (incoming.flags & 8) != 0 {
+                effects.PushFront(.Stream(value = streamEffect {
+                    reply = stream.inbound.clone()
+                    value = .Reset
+                }))
+                discard stream
+                discard body
+                return true
+            }
+            if isWindowUpdate(incoming.frameType) {
+                if incoming.length > 4294967295 - stream.sendWindow {
+                    discard stream
+                    discard body
+                    return false
+                }
+                stream.sendWindow = stream.sendWindow + incoming.length
+                flushWrites(&stream, &effects)
+            } else {
+                if incoming.length > stream.receiveWindow {
+                    discard stream
+                    discard body
+                    return false
+                }
+                stream.receiveWindow = stream.receiveWindow - incoming.length
+                if incoming.length > 0 {
+                    effects.PushFront(.Stream(value = streamEffect {
+                        reply = stream.inbound.clone()
+                        value = .Data(value = body)
+                    }))
+                } else {
+                    discard body
+                }
+            }
+            if (incoming.flags & 4) != 0 {
+                stream.remoteClosed = true
+                effects.PushFront(.Stream(value = streamEffect {
+                    reply = stream.inbound.clone()
+                    value = .Fin
+                }))
+            }
+            if stream.localClosed && stream.remoteClosed {
+                discard stream
+            } else {
+                current.streams.PushFront($stream)
+            }
+            true
+        }
+    }
+}
+
+fn flushWrites(
+    &stream streamState,
+    &effects collections.List<effect>
+) void {
+    var pending = collections.NewList<pendingWrite>()
+    var blocked = false
+    while !stream.pending.IsEmpty() {
+        const value = pendingWriteValue(stream.pending.PopFront())
+        const pendingWrite { data reply } = value
+        const length = data.Len() else error {
+            discard error
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Failed(error = .Transport)
+            }))
+            continue
+        }
+        if blocked || length > stream.sendWindow {
+            blocked = true
+            pending.PushFront(pendingWrite { data = data reply = reply })
+        } else {
+            stream.sendWindow = stream.sendWindow - length
+            effects.PushFront(.Frame(value = packet {
+                header = header {
+                    frameType = .Data
+                    flags = 0
+                    streamID = stream.id
+                    length = length
+                }
+                body = data
+            }))
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Done
+            }))
+        }
+    }
+    while !pending.IsEmpty() {
+        stream.pending.PushFront(pendingWriteValue(pending.PopFront()))
+    }
+}
+
+task runEffects(
+    $values own collections.List<effect>,
+    $outgoing Sender<packet>
+) void {
+    var pending = reverseEffects($values)
+    while !pending.IsEmpty() {
+        const current = effectValue(pending.PopFront())
+        match current {
+            Frame(value): {
+                select {
+                    outgoing.send(value): {}
+                    else error: {
+                        discard error
+                        return
+                    }
+                }
+            }
+            Open(value): {
+                const openEffect { reply value as result } = value
+                discard reply.send($result)
+            }
+            Void(value): {
+                const voidEffect { reply value as result } = value
+                discard reply.send($result)
+            }
+            Stream(value): {
+                const streamEffect { reply value as event } = value
+                discard reply.send(event)
+            }
+        }
+    }
+}
+
+fn reverseEffects(
+    $values own collections.List<effect>
+) own collections.List<effect> {
+    var pending = values
+    var result = collections.NewList<effect>()
+    while !pending.IsEmpty() {
+        result.PushFront(effectValue(pending.PopFront()))
+    }
+    result
+}
+
+fn appendList<T>(
+    $values own collections.List<T>,
+    $value T
+) own collections.List<T> {
+    var reversed = reverseList<T>($values)
+    reversed.PushFront($value)
+    reverseList<T>($reversed)
+}
+
+fn reverseList<T>(
+    $values own collections.List<T>
+) own collections.List<T> {
+    var pending = values
+    var result = collections.NewList<T>()
+    while !pending.IsEmpty() {
+        result.PushFront(listValue<T>(pending.PopFront()))
+    }
+    result
+}
+
+fn listValue<T>($value Option<T>) T {
+    match value {
+        Some(value): value
+        None: missingListValue<T>()
+    }
+}
+
+fn missingListValue<T>() T {
+    panic("yamux list invariant failed")
+}
+
+fn effectValue($value Option<effect>) effect {
+    match value {
+        Some(value): value
+        None: missingEffect()
+    }
+}
+
+fn missingEffect() effect {
+    panic("yamux effect invariant failed")
+}
+
+task readTransport(
+    $reader own transport.SecureReader,
+    $control Sender<request>
+) void {
+    var active = reader
+    while true {
+        const headerPending = spawn transport.ReadSecureExact($active, 12)
+        const headerRead = $headerPending.wait()
+        const transport.SecureBytesOutcome { Reader Value } = headerRead
+        active = Reader
+        const rawHeader = match Value {
+            Ok(value): value
+            Err(error): {
+                discard error
+                discard control.send(.TransportFailed)
+                return
+            }
+        }
+        const decoded = decodeHeader(rawHeader) else error {
+            discard error
+            discard control.send(.TransportFailed)
+            return
+        }
+        var body = bytes.FromText("")
+        if isData(decoded.frameType) && decoded.length > 0 {
+            const bodyPending = spawn transport.ReadSecureExact($active, decoded.length)
+            const bodyRead = $bodyPending.wait()
+            const transport.SecureBytesOutcome {
+                Reader as afterBody
+                Value as bodyValue
+            } = bodyRead
+            active = afterBody
+            body = match bodyValue {
+                Ok(value): value
+                Err(error): {
+                    discard error
+                    discard control.send(.TransportFailed)
+                    return
+                }
+            }
+        }
+        select {
+            control.send(.Inbound(value = packet {
+                header = decoded
+                body = body
+            })): {}
+            else error: {
+                discard error
+                return
+            }
+        }
+    }
+}
+
+task writeTransport(
+    $writer own transport.SecureWriter,
+    $receiver Receiver<packet>,
+    $control Sender<request>
+) void {
+    var active = writer
+    var inbox = receiver
+    while true {
+        const received = inbox.receive()
+        const value = match received {
+            Ok(packet): packet
+            Err(error): {
+                discard error
+                return
+            }
+        }
+        const packet { header body } = value
+        const encoded = encodePacket(header, body) else error {
+            discard error
+            discard control.send(.TransportFailed)
+            return
+        }
+        const pending = spawn transport.WriteSecureRaw($active, $encoded)
+        const written = $pending.wait()
+        const transport.SecureWriteOutcome { Writer Value } = written
+        active = Writer
+        match Value {
+            Ok: {}
+            Err(error): {
+                discard error
+                discard control.send(.TransportFailed)
+                return
+            }
+        }
+    }
+}
+
+struct createdStream {
+    stream Stream
+    state streamState
+}
+
+fn createStream(
+    $control Sender<request>,
+    id u64
+) createdStream {
+    const Channel { sender receiver } = channel<streamEvent>(4)
+    createdStream {
+        stream = Stream {
+            ID = id
+            Reader = own Reader {
+                id = id
+                inbox = receiver
+                control = control.clone()
+            }
+            Writer = own Writer { id = id control = control }
+        }
+        state = streamState {
+            id = id
+            inbound = sender
+            sendWindow = 262144
+            receiveWindow = 262144
+            pending = collections.NewList<pendingWrite>()
+            localClosed = false
+            remoteClosed = false
+        }
+    }
+}
+
+fn windowPacket(
+    streamID u64,
+    flags u64,
+    length u64
+) packet {
+    packet {
+        header = header {
+            frameType = .WindowUpdate
+            flags = flags
+            streamID = streamID
+            length = length
+        }
+        body = bytes.FromText("")
+    }
+}
+
+fn containsStream(&current state, id u64) bool {
+    const selected = takeStream(&current, id)
+    match selected {
+        None: false
+        Some(stream): {
+            current.streams.PushFront($stream)
+            true
+        }
+    }
+}
+
+fn takeStream(&current state, id u64) Option<streamState> {
+    var active = replace current.streams with collections.NewList<streamState>()
+    var restored = collections.NewList<streamState>()
+    while !active.IsEmpty() {
+        const stream = streamStateValue(active.PopFront())
+        if stream.id == id {
+            while !active.IsEmpty() {
+                restored.PushFront(streamStateValue(active.PopFront()))
+            }
+            current.streams = reverseStreams($restored)
+            return .Some(stream)
+        }
+        restored.PushFront($stream)
+    }
+    current.streams = reverseStreams($restored)
+    .None
+}
+
+fn reverseStreams(
+    $values own collections.List<streamState>
+) own collections.List<streamState> {
+    var pending = values
+    var result = collections.NewList<streamState>()
+    while !pending.IsEmpty() {
+        result.PushFront(streamStateValue(pending.PopFront()))
+    }
+    result
+}
+
+fn isData(value frameType) bool {
+    match value {
+        Data: true
+        WindowUpdate: false
+        Ping: false
+        GoAway: false
+    }
+}
+
+fn isWindowUpdate(value frameType) bool {
+    match value {
+        Data: false
+        WindowUpdate: true
+        Ping: false
+        GoAway: false
+    }
+}
+
+fn streamStateValue($value Option<streamState>) streamState {
+    match value {
+        Some(state): state
+        None: missingStreamState()
+    }
+}
+
+fn pendingWriteValue($value Option<pendingWrite>) pendingWrite {
+    match value {
+        Some(value): value
+        None: missingPendingWrite()
+    }
+}
+
+fn missingStreamState() streamState {
+    panic("yamux stream state invariant failed")
+}
+
+fn missingPendingWrite() pendingWrite {
+    panic("yamux pending write invariant failed")
+}
+
+fn channelError(error ChannelError) Error {
+    match error {
+        Closed: .Closed
+        Cancelled: .Closed
+        Timeout: .Closed
+    }
+}

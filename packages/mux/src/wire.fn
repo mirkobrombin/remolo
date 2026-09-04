@@ -1,0 +1,193 @@
+package remolo.mux
+
+import std.bytes
+
+enum Error {
+    InvalidVersion
+    InvalidType
+    InvalidFlags
+    InvalidStream
+    InvalidLength
+    DuplicateStream
+    StreamsExhausted
+    ReceiveWindowExceeded
+    RemoteGoAway
+    Reset
+    Closed
+    Transport
+}
+
+enum frameType {
+    Data
+    WindowUpdate
+    Ping
+    GoAway
+}
+
+struct header {
+    frameType frameType
+    flags u64
+    streamID u64
+    length u64
+}
+
+struct packet {
+    header header
+    body own bytes.Bytes
+}
+
+fn decodeHeader(value bytes.Bytes) Result<header, Error> {
+    const size = value.Len() else error {
+        discard error
+        return .Err(.InvalidLength)
+    }
+    if size != 12 return .Err(.InvalidLength)
+    if byteAt(value, 0) != 0 return .Err(.InvalidVersion)
+    const kind = frameTypeFor(byteAt(value, 1)) else error {
+        return .Err(error)
+    }
+    const flags = (byteAt(value, 2) << 8) | byteAt(value, 3)
+    if flags > 15 return .Err(.InvalidFlags)
+    const streamID = readU32(value, 4)
+    const length = readU32(value, 8)
+    match kind {
+        Data: {
+            if streamID == 0 return .Err(.InvalidStream)
+        }
+        WindowUpdate: {
+            if streamID == 0 return .Err(.InvalidStream)
+        }
+        Ping: {
+            if streamID != 0 return .Err(.InvalidStream)
+        }
+        GoAway: {
+            if streamID != 0 return .Err(.InvalidStream)
+            if flags != 0 return .Err(.InvalidFlags)
+            if length > 2 return .Err(.InvalidLength)
+        }
+    }
+    .Ok(header {
+        frameType = kind
+        flags = flags
+        streamID = streamID
+        length = length
+    })
+}
+
+fn encodePacket(
+    value header,
+    body bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const bodyLength = body.Len() else error {
+        discard error
+        return .Err(.InvalidLength)
+    }
+    match value.frameType {
+        Data: {
+            if bodyLength != value.length return .Err(.InvalidLength)
+        }
+        WindowUpdate: {
+            if bodyLength != 0 return .Err(.InvalidLength)
+        }
+        Ping: {
+            if bodyLength != 0 return .Err(.InvalidLength)
+        }
+        GoAway: {
+            if bodyLength != 0 return .Err(.InvalidLength)
+        }
+    }
+    if value.flags > 15 || value.streamID > 4294967295 ||
+        value.length > 4294967295 {
+        return .Err(.InvalidLength)
+    }
+    const opened = bytes.NewBuilder(bodyLength + 12) else error {
+        discard error
+        return .Err(.InvalidLength)
+    }
+    var builder = opened
+    writeByte(&builder, 0) else error { return .Err(error) }
+    writeByte(&builder, frameTypeValue(value.frameType)) else error {
+        return .Err(error)
+    }
+    writeU16(&builder, value.flags) else error { return .Err(error) }
+    writeU32(&builder, value.streamID) else error { return .Err(error) }
+    writeU32(&builder, value.length) else error { return .Err(error) }
+    builder.Write(body) else error {
+        discard error
+        return .Err(.InvalidLength)
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.InvalidLength)
+    }
+    .Ok(result)
+}
+
+fn frameTypeFor(value u64) Result<frameType, Error> {
+    if value == 0 return .Ok(.Data)
+    if value == 1 return .Ok(.WindowUpdate)
+    if value == 2 return .Ok(.Ping)
+    if value == 3 return .Ok(.GoAway)
+    .Err(.InvalidType)
+}
+
+fn frameTypeValue(value frameType) u64 {
+    match value {
+        Data: 0
+        WindowUpdate: 1
+        Ping: 2
+        GoAway: 3
+    }
+}
+
+fn readU32(value bytes.Bytes, offset u64) u64 {
+    byteAt(value, offset) << 24 |
+        byteAt(value, offset + 1) << 16 |
+        byteAt(value, offset + 2) << 8 |
+        byteAt(value, offset + 3)
+}
+
+fn writeU16(
+    &builder bytes.Builder,
+    value u64
+) Result<void, Error> {
+    writeByte(&builder, (value >> 8) & 255) else error {
+        return .Err(error)
+    }
+    writeByte(&builder, value & 255)
+}
+
+fn writeU32(
+    &builder bytes.Builder,
+    value u64
+) Result<void, Error> {
+    writeByte(&builder, (value >> 24) & 255) else error {
+        return .Err(error)
+    }
+    writeByte(&builder, (value >> 16) & 255) else error {
+        return .Err(error)
+    }
+    writeByte(&builder, (value >> 8) & 255) else error {
+        return .Err(error)
+    }
+    writeByte(&builder, value & 255)
+}
+
+fn writeByte(
+    &builder bytes.Builder,
+    value u64
+) Result<void, Error> {
+    builder.WriteByte(value) else error {
+        discard error
+        return .Err(.InvalidLength)
+    }
+    .Ok
+}
+
+fn byteAt(value bytes.Bytes, index u64) u64 {
+    const result = value.At(index) else error {
+        discard error
+        panic("yamux header invariant failed")
+    }
+    result
+}

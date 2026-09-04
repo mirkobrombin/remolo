@@ -16,9 +16,19 @@ struct SecureWriter {
     inner own tls.OpenSSLWriter
 }
 
+@concurrent.Transferable()
+struct SecureController {
+    inner own tls.OpenSSLController
+
+    fn Abort(&self) bool {
+        self.inner.Abort()
+    }
+}
+
 struct SecureStream {
     Reader own SecureReader
     Writer own SecureWriter
+    Controller own SecureController
     Peer String
 }
 
@@ -30,6 +40,11 @@ struct SecureReadOutcome {
 struct SecureWriteOutcome {
     Writer own SecureWriter
     Value Result<void, Error>
+}
+
+struct SecureBytesOutcome {
+    Reader own SecureReader
+    Value Result<own bytes.Bytes, Error>
 }
 
 struct SecureListener {
@@ -181,19 +196,60 @@ task WriteSecureFrame(
     }
 }
 
+task ReadSecureExact(
+    $reader own SecureReader,
+    length u64
+) SecureBytesOutcome {
+    const SecureReader { inner } = reader
+    const pending = spawn tls.OpenSSLReadExactBytes($inner, length)
+    const read = $pending.wait()
+    const tls.OpenSSLReadOutcome { Reader Value } = read
+    match Value {
+        Ok(value): SecureBytesOutcome {
+            Reader = own SecureReader { inner = Reader }
+            Value = .Ok(value)
+        }
+        Err(error): SecureBytesOutcome {
+            Reader = own SecureReader { inner = Reader }
+            Value = .Err(secureError(error))
+        }
+    }
+}
+
+task WriteSecureRaw(
+    $writer own SecureWriter,
+    $value own bytes.Bytes
+) SecureWriteOutcome {
+    const SecureWriter { inner } = writer
+    const pending = spawn tls.OpenSSLWriteAllBytes($inner, $value)
+    const written = $pending.wait()
+    const tls.OpenSSLWriteOutcome { Writer Value } = written
+    match Value {
+        Ok: SecureWriteOutcome {
+            Writer = own SecureWriter { inner = Writer }
+            Value = .Ok
+        }
+        Err(error): SecureWriteOutcome {
+            Writer = own SecureWriter { inner = Writer }
+            Value = .Err(secureError(error))
+        }
+    }
+}
+
 fn openSecureStream(
     $connection own tls.OpenSSLConnection
 ) Result<SecureStream, Error> {
     const peer = connection.PeerAddress() else error {
         return .Err(secureError(error))
     }
-    const split = connection.Split() else error {
+    const split = connection.SplitControlled() else error {
         return .Err(secureError(error))
     }
-    const tls.OpenSSLStreamPair { Reader Writer } = split
+    const tls.OpenSSLControlledStream { Reader Writer Controller } = split
     .Ok(SecureStream {
         Reader = own SecureReader { inner = Reader }
         Writer = own SecureWriter { inner = Writer }
+        Controller = own SecureController { inner = Controller }
         Peer = peer
     })
 }
