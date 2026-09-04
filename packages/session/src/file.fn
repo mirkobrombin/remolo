@@ -78,6 +78,20 @@ task ServeFile(
         discard rootPath
         return .Err(.Multiplex)
     }
+    const serving = spawn serveFileChannel(
+        $channel,
+        $rootPath,
+        allowWrite
+    )
+    const result = $serving.wait()
+    result
+}
+
+task serveFileChannel(
+    $channel mux.AcceptedChannel,
+    $rootPath String,
+    allowWrite bool
+) Result<void, Error> {
     const mux.AcceptedChannel { Open Stream } = channel
     if !fileKind(Open.Kind) {
         discard Open

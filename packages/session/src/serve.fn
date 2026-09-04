@@ -1,0 +1,126 @@
+package remolo.session
+
+import foundation.worker
+import remolo.mux
+import remolo.tunnel
+import std.text
+
+task ServePeer(
+    $peer own Peer,
+    $rootPath String,
+    allowWrite bool
+) Result<void, Error> {
+    var active = peer
+    const handle = active.Handle()
+    const channels = worker.NewSupervisor()
+    while true {
+        const accepting = spawn mux.AcceptChannel($handle.Clone())
+        const accepted = $accepting.wait()
+        const channel = accepted else error {
+            const result = acceptResult(error)
+            discard handle
+            discard rootPath
+            ClosePeer($active)
+            channels.Shutdown()
+            return result
+        }
+        channels.Start(channelTask(
+                $channel,
+                $text.Copy(rootPath),
+                allowWrite
+            ))
+    }
+    .Ok
+}
+
+fn channelTask(
+    $channel mux.AcceptedChannel,
+    $rootPath String,
+    allowWrite bool
+) Task<void> {
+    const kind = channel.Open.Kind
+    match kind {
+        Exec: {
+            discard rootPath
+            spawn runExecChannel($channel)
+        }
+        File: {
+            spawn runFileChannel(
+                $channel,
+                $rootPath,
+                allowWrite
+            )
+        }
+        Sync: {
+            spawn runDirectoryChannel(
+                $channel,
+                $rootPath,
+                allowWrite
+            )
+        }
+        Forward: {
+            discard rootPath
+            spawn runForwardChannel($channel)
+        }
+        _: {
+            discard rootPath
+            spawn rejectChannel($channel)
+        }
+    }
+}
+
+task runExecChannel($channel mux.AcceptedChannel) void {
+    const serving = spawn serveExecChannel($channel)
+    const result = $serving.wait()
+    discard result
+}
+
+task runFileChannel(
+    $channel mux.AcceptedChannel,
+    $rootPath String,
+    allowWrite bool
+) void {
+    const serving = spawn serveFileChannel(
+        $channel,
+        $rootPath,
+        allowWrite
+    )
+    const result = $serving.wait()
+    discard result
+}
+
+task runDirectoryChannel(
+    $channel mux.AcceptedChannel,
+    $rootPath String,
+    allowWrite bool
+) void {
+    const serving = spawn serveDirectoryChannel(
+        $channel,
+        $rootPath,
+        allowWrite
+    )
+    const result = $serving.wait()
+    discard result
+}
+
+task runForwardChannel($channel mux.AcceptedChannel) void {
+    const serving = spawn tunnel.ServeForwardChannel($channel)
+    const result = $serving.wait()
+    discard result
+}
+
+task rejectChannel($channel mux.AcceptedChannel) void {
+    const control = channel.Stream.Control()
+    discard channel
+    const closing = spawn mux.CloseStream($control)
+    const result = $closing.wait()
+    discard result
+}
+
+fn acceptResult(error mux.Error) Result<void, Error> {
+    match error {
+        Closed: .Ok
+        Transport: .Ok
+        _: .Err(.Multiplex)
+    }
+}

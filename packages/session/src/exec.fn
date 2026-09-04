@@ -118,6 +118,14 @@ task ServeExec($handle mux.Handle) Result<void, Error> {
         discard error
         return .Err(.Multiplex)
     }
+    const serving = spawn serveExecChannel($accepted)
+    const result = $serving.wait()
+    result
+}
+
+task serveExecChannel(
+    $accepted mux.AcceptedChannel
+) Result<void, Error> {
     const mux.AcceptedChannel { Open Stream } = accepted
     if !execKind(Open.Kind) {
         discard Open

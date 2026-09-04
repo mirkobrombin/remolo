@@ -15,6 +15,15 @@ struct LocalForward {
     fn Port(self) u64 {
         self.listener.Port
     }
+
+    // Creates independent control for stopping the local accept loop.
+    fn Control(self) Result<own net.TcpListenerController, Error> {
+        const controller = self.listener.Control() else error {
+            discard error
+            return .Err(.Listen)
+        }
+        .Ok(controller)
+    }
 }
 
 struct SocksForward {
@@ -24,6 +33,15 @@ struct SocksForward {
     // Reports the local port, including an operating-system-selected port.
     fn Port(self) u64 {
         self.listener.Port
+    }
+
+    // Creates independent control for stopping the SOCKS accept loop.
+    fn Control(self) Result<own net.TcpListenerController, Error> {
+        const controller = self.listener.Control() else error {
+            discard error
+            return .Err(.Listen)
+        }
+        .Ok(controller)
     }
 }
 
@@ -75,10 +93,14 @@ task ServeLocal($forward own LocalForward) Result<void, Error> {
                     $text.Copy(target)
                 ))
             Err(error): {
-                discard error
+                const stopped = acceptStopped(error)
                 discard active
                 discard handle
                 discard target
+                if stopped {
+                    clients.Shutdown()
+                    return .Ok
+                }
                 clients.Cancel()
                 return .Err(.Accept)
             }
@@ -102,15 +124,26 @@ task ServeSocks($forward own SocksForward) Result<void, Error> {
                     $handle.Clone()
                 ))
             Err(error): {
-                discard error
+                const stopped = acceptStopped(error)
                 discard active
                 discard handle
+                if stopped {
+                    clients.Shutdown()
+                    return .Ok
+                }
                 clients.Cancel()
                 return .Err(.Accept)
             }
         }
     }
     .Ok
+}
+
+fn acceptStopped(error net.Error) bool {
+    match error {
+        Closed: true
+        _: false
+    }
 }
 
 task ServeForward($handle mux.Handle) Result<void, Error> {
@@ -120,6 +153,14 @@ task ServeForward($handle mux.Handle) Result<void, Error> {
         discard error
         return .Err(.Multiplex)
     }
+    const serving = spawn ServeForwardChannel($accepted)
+    const result = $serving.wait()
+    result
+}
+
+task ServeForwardChannel(
+    $accepted mux.AcceptedChannel
+) Result<void, Error> {
     const mux.AcceptedChannel { Open Stream } = accepted
     const protocol.Open {
         Kind

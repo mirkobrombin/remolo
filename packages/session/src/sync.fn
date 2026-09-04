@@ -84,6 +84,20 @@ task ServeDirectory(
         discard rootPath
         return .Err(.Multiplex)
     }
+    const serving = spawn serveDirectoryChannel(
+        $channel,
+        $rootPath,
+        allowWrite
+    )
+    const result = $serving.wait()
+    result
+}
+
+task serveDirectoryChannel(
+    $channel mux.AcceptedChannel,
+    $rootPath String,
+    allowWrite bool
+) Result<void, Error> {
     const mux.AcceptedChannel { Open Stream } = channel
     if !syncKind(Open.Kind) {
         discard Open

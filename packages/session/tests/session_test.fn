@@ -788,6 +788,10 @@ test "local forwarding carries bytes through an authenticated channel" {
         discard error
         fail("local forward listen failed")
     }
+    const localControlValue = forward.Control() else {
+        fail("local forward control failed")
+    }
+    var localControl = localControlValue
     const forwardPort = forward.Port()
     const servingLocal = spawn tunnel.ServeLocal($forward)
     const servingRemote = spawn tunnel.ServeForward($peer.Handle())
@@ -816,9 +820,15 @@ test "local forwarding carries bytes through an authenticated channel" {
         fail("remote forward failed")
     }
     discard $echoing.wait()
-    discard servingLocal
     CloseClient($client)
     ClosePeer($peer)
+    expect(localControl.Close())
+    const localResult = $servingLocal.wait()
+    localResult else error {
+        discard error
+        fail("local forward stop failed")
+    }
+    discard localControl
     expect(host.Close())
 }
 
@@ -852,6 +862,10 @@ test "SOCKS5 forwards domain targets and rejects unsupported commands" {
         discard error
         fail("SOCKS listen failed")
     }
+    const socksControlValue = forward.Control() else {
+        fail("SOCKS control failed")
+    }
+    var socksControl = socksControlValue
     const socksPort = forward.Port()
     const servingSocks = spawn tunnel.ServeSocks($forward)
     const servingRemote = spawn tunnel.ServeForward($peer.Handle())
@@ -970,9 +984,84 @@ test "SOCKS5 forwards domain targets and rejects unsupported commands" {
     expect(authStatus == 255)
     discard authFinalReader
     discard authFinalWriter
-    discard servingSocks
     CloseClient($client)
     ClosePeer($peer)
+    expect(socksControl.Close())
+    const socksResult = $servingSocks.wait()
+    socksResult else error {
+        discard error
+        fail("SOCKS stop failed")
+    }
+    discard socksControl
+    expect(host.Close())
+}
+
+test "peer dispatcher serves concurrent exec and file channels" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const localCreated = fs.CreateTempDirectory(".", "remolo-dispatch-local-") else {
+        fail("dispatcher local directory creation failed")
+    }
+    const local = fs.Canonicalize(localCreated) else {
+        fail("dispatcher local directory resolution failed")
+    }
+    const remoteCreated = fs.CreateTempDirectory(".", "remolo-dispatch-remote-") else {
+        fail("dispatcher remote directory creation failed")
+    }
+    const remote = fs.Canonicalize(remoteCreated) else {
+        fail("dispatcher remote directory resolution failed")
+    }
+    const source = local + "/source.txt"
+    fs.WriteTextAtomic(source, "dispatcher-file", 64) else {
+        fail("dispatcher source write failed")
+    }
+
+    const serving = spawn ServePeer($peer, $text.Copy(remote), true)
+    const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const putting = spawn PutFile(
+        $client.Handle(),
+        $text.Copy(source),
+        $"uploaded.txt"
+    )
+    const executed = $executing.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const uploaded = $putting.wait()
+    uploaded else error { panic(sessionFailure(error)) }
+
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("dispatcher stdout failed") }
+    const stderr = Stderr.Text() else { fail("dispatcher stderr failed") }
+    expect(Exit.Code == 7)
+    expect(stdout == "foundation-exec\n")
+    expect(stderr == "foundation-stderr\n")
+    const stored = fs.ReadBytesSync(remote + "/uploaded.txt", 64) else {
+        fail("dispatcher upload read failed")
+    }
+    const storedText = stored.Text() else {
+        fail("dispatcher upload text failed")
+    }
+    expect(storedText == "dispatcher-file")
+
+    CloseClient($client)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    fs.RemoveTree(local, 16, 4) else { fail("dispatcher local cleanup failed") }
+    fs.RemoveTree(remote, 16, 4) else { fail("dispatcher remote cleanup failed") }
     expect(host.Close())
 }
 
