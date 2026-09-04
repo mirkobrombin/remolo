@@ -1,0 +1,506 @@
+package remolo.session
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.collections
+import std.concurrent
+import std.env
+import std.process
+import std.text
+
+enum PTYEvent {
+    Data(value own bytes.Bytes)
+    Exit(value protocol.Exit)
+}
+
+@concurrent.Transferable()
+struct PTYReader {
+    reader own mux.Reader
+}
+
+@concurrent.Transferable()
+struct PTYWriter {
+    writer own mux.Writer
+}
+
+@concurrent.Transferable()
+struct PTYController {
+    controller mux.StreamControl
+}
+
+@concurrent.Transferable()
+struct RemotePTY {
+    Reader own PTYReader
+    Writer own PTYWriter
+    Controller own PTYController
+}
+
+struct PTYReadOutcome {
+    Reader own PTYReader
+    Value Result<PTYEvent, Error>
+}
+
+task OpenPTY(
+    $handle mux.Handle,
+    $descriptor protocol.Open
+) Result<own RemotePTY, Error> {
+    if !ptyKind(descriptor.Kind) return .Err(.Protocol)
+    const opening = spawn mux.OpenChannel($handle, $descriptor)
+    const openedResult = $opening.wait()
+    const opened = openedResult else error {
+        discard error
+        return .Err(.Multiplex)
+    }
+    const control = opened.Control()
+    const mux.Stream { ID Reader Writer } = opened
+    discard ID
+    .Ok(own RemotePTY {
+        Reader = own PTYReader { reader = Reader }
+        Writer = own PTYWriter { writer = Writer }
+        Controller = own PTYController { controller = control }
+    })
+}
+
+task ReadPTY($reader own PTYReader) PTYReadOutcome {
+    const PTYReader { reader as source } = reader
+    const pending = spawn mux.ReadFrame($source)
+    const outcome = $pending.wait()
+    const mux.FrameReadOutcome { Reader Value } = outcome
+    const restored = own PTYReader { reader = Reader }
+    const frame = Value else error {
+        return PTYReadOutcome {
+            Reader = restored
+            Value = .Err(muxError(error))
+        }
+    }
+    const protocol.Frame { Type Payload } = frame
+    match Type {
+        Data: PTYReadOutcome {
+            Reader = restored
+            Value = .Ok(.Data(value = Payload))
+        }
+        Exit: decodePTYExit($restored, $Payload)
+        _: {
+            discard Payload
+            PTYReadOutcome { Reader = restored Value = .Err(.Protocol) }
+        }
+    }
+}
+
+task WritePTY(
+    $writer own PTYWriter,
+    $value own bytes.Bytes
+) Result<own PTYWriter, Error> {
+    const PTYWriter { writer as destination } = writer
+    const pending = spawn sendFrame($destination, .Data, $value)
+    const result = $pending.wait()
+    match result {
+        Ok(restored): .Ok(own PTYWriter { writer = restored })
+        Err(error): .Err(error)
+    }
+}
+
+task ResizePTY(
+    $writer own PTYWriter,
+    columns u16,
+    rows u16
+) Result<own PTYWriter, Error> {
+    const payload = protocol.EncodeResize(protocol.Resize {
+        Cols = columns
+        Rows = rows
+    }) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    const PTYWriter { writer as destination } = writer
+    const pending = spawn sendFrame($destination, .Resize, $payload)
+    const result = $pending.wait()
+    match result {
+        Ok(restored): .Ok(own PTYWriter { writer = restored })
+        Err(error): .Err(error)
+    }
+}
+
+task ClosePTYInput($writer own PTYWriter) Result<void, Error> {
+    const empty = bytes.FromText("")
+    const PTYWriter { writer as destination } = writer
+    const sending = spawn sendFrame($destination, .EOF, $empty)
+    const sent = $sending.wait()
+    const restored = sent else error { return .Err(error) }
+    const closing = spawn mux.CloseWriter($restored)
+    const closed = $closing.wait()
+    match closed {
+        Ok: .Ok
+        Err(error): .Err(muxError(error))
+    }
+}
+
+task ClosePTYChannel($controller own PTYController) Result<void, Error> {
+    const PTYController { controller as active } = controller
+    const closing = spawn mux.CloseStream($active)
+    const closed = $closing.wait()
+    match closed {
+        Ok: .Ok
+        Err(error): .Err(muxError(error))
+    }
+}
+
+task servePTYChannel(
+    $channel mux.AcceptedChannel
+) Result<void, Error> {
+    const mux.AcceptedChannel { Open Stream } = channel
+    if !ptyKind(Open.Kind) {
+        discard Open
+        discard Stream
+        return .Err(.Protocol)
+    }
+    const prepared = prepareProcessPTY($Open) else error {
+        discard Stream
+        return .Err(error)
+    }
+    const starting = spawn process.StartPTY($prepared)
+    const started = $starting.wait()
+    const active = started else error {
+        discard Stream
+        return .Err(processError(error))
+    }
+    const process.PTY {
+        Reader as processReader
+        Writer as processWriter
+        Controller as processController
+        Waiter as processWaiter
+    } = active
+    const mux.Stream {
+        ID
+        Reader as channelReader
+        Writer as channelWriter
+    } = Stream
+    discard ID
+    const input = spawn pumpPTYInput(
+        $channelReader,
+        $processWriter,
+        $processController
+    )
+    const waiting = spawn process.WaitPTY($processWaiter)
+    const output = spawn pumpPTYOutput($processReader, $channelWriter)
+    const outputResult = $output.wait()
+    const Writer = outputResult else error {
+        discard input
+        discard waiting
+        return .Err(error)
+    }
+    const exitResult = $waiting.wait()
+    const exitCode = exitResult else error {
+        discard input
+        discard Writer
+        return .Err(processError(error))
+    }
+    const payload = protocol.EncodeExit(protocol.Exit {
+        Code = exitCode
+        Error = ""
+    }) else error {
+        discard error
+        discard input
+        discard Writer
+        return .Err(.Protocol)
+    }
+    const sending = spawn sendFrame($Writer, .Exit, $payload)
+    const sent = $sending.wait()
+    const finalWriter = sent else error {
+        discard input
+        return .Err(error)
+    }
+    const closing = spawn mux.CloseWriter($finalWriter)
+    const closed = $closing.wait()
+    closed else error {
+        discard input
+        return .Err(muxError(error))
+    }
+    discard input
+    .Ok
+}
+
+task pumpPTYInput(
+    $reader own mux.Reader,
+    $writer own process.PTYWriter,
+    $controller own process.PTYController
+) void {
+    var source = reader
+    var destination = writer
+    var active = controller
+    var eof = false
+    while true {
+        const pending = spawn mux.ReadFrame($source)
+        const outcome = $pending.wait()
+        const mux.FrameReadOutcome { Reader Value } = outcome
+        source = Reader
+        const frame = Value else error {
+            discard error
+            if !eof { discard active.Abort() }
+            discard source
+            discard destination
+            discard active
+            return
+        }
+        const protocol.Frame { Type Payload } = frame
+        if resizeFrame(Type) {
+            resizeProcessPTY(&active, Payload)
+            continue
+        }
+        if eofFrame(Type) {
+            discard Payload
+            eof = true
+            continue
+        }
+        if !dataFrame(Type) {
+            discard Payload
+            discard active.Abort()
+            discard source
+            discard destination
+            discard active
+            return
+        }
+        const writing = spawn process.WritePTY($destination, $Payload)
+        const written = $writing.wait()
+        const process.PTYWriteOutcome {
+            Writer as restored
+            Value as writeValue
+        } = written
+        writeValue else error {
+            discard error
+            discard active.Abort()
+            discard source
+            discard restored
+            discard active
+            return
+        }
+        destination = restored
+    }
+}
+
+task pumpPTYOutput(
+    $reader own process.PTYReader,
+    $writer own mux.Writer
+) Result<own mux.Writer, Error> {
+    var source = reader
+    var destination = writer
+    while true {
+        const reading = spawn process.ReadPTY($source, 32768)
+        const outcome = $reading.wait()
+        const process.PTYReadOutcome {
+            Reader as restored
+            Value
+        } = outcome
+        source = restored
+        const next = Value else error {
+            discard source
+            discard destination
+            return .Err(processError(error))
+        }
+        const value = match next {
+            None: {
+                discard source
+                return .Ok(destination)
+            }
+            Some(found): found
+        }
+        const sending = spawn sendFrame($destination, .Data, $value)
+        const sent = $sending.wait()
+        const writerResult = sent else error {
+            discard source
+            return .Err(error)
+        }
+        destination = writerResult
+    }
+    .Ok(destination)
+}
+
+fn prepareProcessPTY(
+    $descriptor protocol.Open
+) Result<own process.PTYCommand, Error> {
+    const protocol.Open {
+        Kind
+        Cols
+        Rows
+        Command
+        Env
+        Term
+        Dir
+        Target
+        ResumeID
+    } = descriptor
+    discard Kind
+    discard Target
+    discard ResumeID
+    var arguments = Command
+    const program = ptyProgram(&arguments)
+    var directory Option<String> = .None
+    if !text.IsEmpty(Dir) { directory = .Some(Dir) }
+    const opened = process.Open(program, $process.Options {
+        WorkingDirectory = directory
+        InheritEnvironment = true
+        OutputLimit = 0
+    }) else error {
+        discard arguments
+        discard Env
+        return .Err(processError(error))
+    }
+    var command = opened
+    addPTYArguments(&command, $arguments) else error {
+        discard Env
+        return .Err(error)
+    }
+    addPTYEnvironment(&command, $Env, Term) else error {
+        return .Err(error)
+    }
+    const prepared = process.PreparePTY(
+        $command,
+        defaultPTYDimension(Cols, 80),
+        defaultPTYDimension(Rows, 24)
+    ) else error {
+        return .Err(processError(error))
+    }
+    .Ok(prepared)
+}
+
+fn addPTYArguments(
+    &command process.Command,
+    $values own collections.List<String>
+) Result<void, Error> {
+    var pending = values
+    while !pending.IsEmpty() {
+        const value = optionString(pending.PopFront())
+        command.AddArgument(value) else error {
+            discard pending
+            return .Err(processError(error))
+        }
+    }
+    .Ok
+}
+
+fn addPTYEnvironment(
+    &command process.Command,
+    $values own collections.List<protocol.Environment>,
+    term String
+) Result<void, Error> {
+    var pending = values
+    while !pending.IsEmpty() {
+        const value = optionEnvironment(pending.PopFront())
+        if value.Name != "TERM" {
+            command.AddEnvironment(value.Name + "=" + value.Value) else error {
+                discard pending
+                return .Err(processError(error))
+            }
+        }
+    }
+    const terminal = if text.IsEmpty(term) {
+        "xterm-256color"
+    } else {
+        text.Copy(term)
+    }
+    command.AddEnvironment("TERM=" + terminal) else error {
+        return .Err(processError(error))
+    }
+    .Ok
+}
+
+fn decodePTYExit(
+    $reader own PTYReader,
+    $payload own bytes.Bytes
+) PTYReadOutcome {
+    const decoded = protocol.DecodeExit(payload) else error {
+        discard error
+        return PTYReadOutcome { Reader = reader Value = .Err(.Protocol) }
+    }
+    PTYReadOutcome { Reader = reader Value = .Ok(.Exit(value = decoded)) }
+}
+
+fn resizeProcessPTY(
+    &controller process.PTYController,
+    payload bytes.Bytes
+) void {
+    const decoded = protocol.DecodeResize(payload) else error {
+        discard error
+        return
+    }
+    const result = controller.Resize(decoded.Cols, decoded.Rows)
+    match result {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
+fn ptyProgram(&arguments collections.List<String>) String {
+    const first = arguments.PopFront()
+    match first {
+        Some(value): value
+        None: defaultPTYProgram()
+    }
+}
+
+fn defaultPTYDimension(value u16, fallback u16) u16 {
+    if value == 0 return fallback
+    value
+}
+
+@target(linux)
+fn defaultPTYProgram() String {
+    posixPTYProgram()
+}
+
+@target(macos)
+fn defaultPTYProgram() String {
+    posixPTYProgram()
+}
+
+@target(windows)
+fn defaultPTYProgram() String {
+    const found = env.Get("COMSPEC") else error {
+        discard error
+        return "cmd.exe"
+    }
+    match found {
+        Some(value): if text.IsEmpty(value) { "cmd.exe" } else { value }
+        None: "cmd.exe"
+    }
+}
+
+fn posixPTYProgram() String {
+    const found = env.Get("SHELL") else error {
+        discard error
+        return "/bin/sh"
+    }
+    match found {
+        Some(value): if text.IsEmpty(value) { "/bin/sh" } else { value }
+        None: "/bin/sh"
+    }
+}
+
+fn ptyKind(value protocol.Kind) bool {
+    match value {
+        PTY: true
+        _: false
+    }
+}
+
+fn dataFrame(value protocol.FrameType) bool {
+    match value {
+        Data: true
+        _: false
+    }
+}
+
+fn resizeFrame(value protocol.FrameType) bool {
+    match value {
+        Resize: true
+        _: false
+    }
+}
+
+fn eofFrame(value protocol.FrameType) bool {
+    match value {
+        EOF: true
+        _: false
+    }
+}

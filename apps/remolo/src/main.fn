@@ -2,6 +2,7 @@ package remolo.cli
 
 enum cliCommand {
     Host
+    Connect
     Exec
     Put
     Get
@@ -13,6 +14,7 @@ fn usage() String {
     "usage:\n" +
         "  remolo host [--bind HOST:PORT] [--advertise IP] [--ttl SECONDS] " +
         "[--identity PATH] [--file-root PATH] [--ro] [--once]\n" +
+        "  remolo connect TOKEN [COMMAND [ARG...]]\n" +
         "  remolo exec TOKEN COMMAND [ARG...]\n" +
         "  remolo put TOKEN LOCAL REMOTE\n" +
         "  remolo get TOKEN REMOTE LOCAL\n" +
@@ -21,6 +23,7 @@ fn usage() String {
 
 fn commandFor(value String) Option<cliCommand> {
     if value == "host" return .Some(.Host)
+    if value == "connect" return .Some(.Connect)
     if value == "exec" return .Some(.Exec)
     if value == "put" return .Some(.Put)
     if value == "get" return .Some(.Get)
@@ -34,6 +37,7 @@ fn commandFor(value String) Option<cliCommand> {
 fn executeCommand(command cliCommand, args [String]) Result<i32, failure> {
     match command {
         Host: runHost(args)
+        Connect: runShell(args)
         Exec: runExec(args)
         Put: runPut(args)
         Get: runGet(args)

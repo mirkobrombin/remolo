@@ -9,7 +9,7 @@ package remolo.identity 1.0.0 sha256:5066d6ee82c3977d591a73bddf1ef874e3c5e1e7d83
 package remolo.mux 1.0.0 sha256:1e4c7941c9b6cf65afc251c5328e5e9f925c57ff0939f4c362141bfba39b5fff path ../../packages/mux
 package remolo.protocol 1.0.0 sha256:74407c717e7e42480eaa46fa54f81ddeae0690473e744ef2998d5d424284e405 path ../../packages/protocol
 package remolo.relay 1.0.0 sha256:7c735240fee864e6cf8556c811fdba8ad27410656206bb64dda397e4ddacee69 path ../../packages/relay
-package remolo.session 1.0.0 sha256:fb0d9bd16806c7040e8ad1623b07353d078802ddbfbca26269f569f7337d39f6 path ../../packages/session
+package remolo.session 1.0.0 sha256:ef3a8f1bcb138a84124d504f8b853f42febeb371c0fae05cfb08e18a776b1de1 path ../../packages/session
 package remolo.token 1.0.0 sha256:59a45efec141d890479a3fe1bb2c2a86fa7d300a9241c4242915a3162019bbb8 path ../../packages/token
 package remolo.transport 1.0.0 sha256:c45ab9abf13fdf0815933c5d7827982965f831195abfbdfdda22b2f7c0a217dd path ../../packages/transport
 package remolo.tunnel 1.0.0 sha256:af319117578c29494644e99554369bd0afe5b44032f902d5371b1b443cdede1e path ../../packages/tunnel

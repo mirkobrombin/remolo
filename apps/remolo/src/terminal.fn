@@ -1,0 +1,237 @@
+package remolo.cli
+
+import remolo.protocol
+import remolo.session
+import std.bytes
+import std.env
+import std.terminal
+import std.text
+
+struct terminalForwardOutcome {
+    Writer Option<own session.PTYWriter>
+    Value Result<void, failure>
+    Done bool
+}
+
+fn runShell(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("shell requires a token"))
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const openedTerminal = terminal.Open() else error {
+        discard error
+        session.CloseClient($client)
+        return .Err(failed("standard input is not an interactive terminal"))
+    }
+    const terminal.Terminal {
+        Size
+        Reader as localReader
+        Controller as localController
+    } = openedTerminal
+    const descriptor = shellDescriptor(args, Size)
+    const opening = spawn session.OpenPTY(client.Handle(), $descriptor)
+    const opened = $opening.wait() else error {
+        discard localReader
+        discard localController
+        session.CloseClient($client)
+        discard error
+        return .Err(failed("could not open the remote terminal"))
+    }
+    const session.RemotePTY {
+        Reader as remoteReader
+        Writer as remoteWriter
+        Controller as remoteController
+    } = opened
+    var terminalControl = localController
+    const input = spawn forwardTerminalInput($localReader, $remoteWriter)
+    const output = spawn forwardTerminalOutput($remoteReader)
+    const result = $output.wait()
+    discard terminalControl.Close()
+    discard terminalControl
+    const inputResult = $input.wait()
+    match inputResult {
+        Ok: {}
+        Err(error): { discard error }
+    }
+    const closing = spawn session.ClosePTYChannel($remoteController)
+    discard $closing.wait()
+    session.CloseClient($client)
+    result
+}
+
+task forwardTerminalInput(
+    $reader own terminal.Reader,
+    $writer own session.PTYWriter
+) Result<void, failure> {
+    var source = reader
+    var destination = writer
+    while true {
+        const reading = spawn terminal.Read($source, 32768)
+        const outcome = $reading.wait()
+        const terminal.ReadOutcome { Reader Value as readValue } = outcome
+        source = Reader
+        const event = readValue else error {
+            discard source
+            discard destination
+            if terminalClosed(error) return .Ok
+            return .Err(failed("could not read the local terminal"))
+        }
+        const forwarding = match event {
+            Data(value): spawn forwardTerminalData($destination, $value)
+            Resize(value): spawn forwardTerminalResize($destination, value)
+            EOF: spawn forwardTerminalEOF($destination)
+        }
+        const forwarded = $forwarding.wait()
+        const terminalForwardOutcome {
+            Writer
+            Value as forwardValue
+            Done
+        } = forwarded
+        forwardValue else error {
+            discard source
+            discard Writer
+            return .Err(error)
+        }
+        if Done {
+            discard source
+            discard Writer
+            return .Ok
+        }
+        destination = match Writer {
+            Some(value): value
+            None: panic("terminal writer invariant failed")
+        }
+    }
+    .Ok
+}
+
+task forwardTerminalData(
+    $writer own session.PTYWriter,
+    $value own bytes.Bytes
+) terminalForwardOutcome {
+    const writing = spawn session.WritePTY($writer, $value)
+    const written = $writing.wait()
+    match written {
+        Ok(restored): terminalForwardOutcome {
+            Writer = .Some(restored)
+            Value = .Ok
+            Done = false
+        }
+        Err(error): {
+            discard error
+            terminalForwardOutcome {
+                Writer = .None
+                Value = .Err(failed("could not write to the remote terminal"))
+                Done = true
+            }
+        }
+    }
+}
+
+task forwardTerminalResize(
+    $writer own session.PTYWriter,
+    size terminal.Size
+) terminalForwardOutcome {
+    const resizing = spawn session.ResizePTY(
+        $writer,
+        size.Columns,
+        size.Rows
+    )
+    const resized = $resizing.wait()
+    match resized {
+        Ok(restored): terminalForwardOutcome {
+            Writer = .Some(restored)
+            Value = .Ok
+            Done = false
+        }
+        Err(error): {
+            discard error
+            terminalForwardOutcome {
+                Writer = .None
+                Value = .Err(failed("could not resize the remote terminal"))
+                Done = true
+            }
+        }
+    }
+}
+
+task forwardTerminalEOF(
+    $writer own session.PTYWriter
+) terminalForwardOutcome {
+    const closing = spawn session.ClosePTYInput($writer)
+    const closed = $closing.wait()
+    match closed {
+        Ok: terminalForwardOutcome {
+            Writer = .None
+            Value = .Ok
+            Done = true
+        }
+        Err(error): {
+            discard error
+            terminalForwardOutcome {
+                Writer = .None
+                Value = .Err(failed("could not close remote terminal input"))
+                Done = true
+            }
+        }
+    }
+}
+
+task forwardTerminalOutput(
+    $reader own session.PTYReader
+) Result<i32, failure> {
+    var source = reader
+    while true {
+        const reading = spawn session.ReadPTY($source)
+        const outcome = $reading.wait()
+        const session.PTYReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error {
+            discard source
+            discard error
+            return .Err(failed("could not read the remote terminal"))
+        }
+        match event {
+            Data(value): {
+                writeStdoutBytes(value) else error {
+                    discard source
+                    return .Err(error)
+                }
+            }
+            Exit(value): {
+                discard source
+                if !text.IsEmpty(value.Error) {
+                    return .Err(failed("remote terminal: " + value.Error))
+                }
+                return .Ok(value.Code)
+            }
+        }
+    }
+    .Ok(0)
+}
+
+fn shellDescriptor(args [String], size terminal.Size) protocol.Open {
+    var descriptor = protocol.NewOpen(.PTY)
+    descriptor.Cols = size.Columns
+    descriptor.Rows = size.Rows
+    descriptor.Term = terminalName()
+    const empty = replace descriptor.Command with commandArguments(args, 2)
+    discard empty
+    descriptor
+}
+
+fn terminalName() String {
+    const found = env.Get("TERM") else error {
+        discard error
+        return "xterm-256color"
+    }
+    match found {
+        Some(value): if text.IsEmpty(value) { "xterm-256color" } else { value }
+        None: "xterm-256color"
+    }
+}
+
+fn terminalClosed(error terminal.Error) bool {
+    match error {
+        Closed: true
+        _: false
+    }
+}

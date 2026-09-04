@@ -189,6 +189,169 @@ fn execDescriptor() protocol.Open {
     }
 }
 
+test "interactive PTY forwards input resize output and exit" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+    const serving = spawn ServePeer($peer, $".", true)
+    const opening = spawn OpenPTY($client.Handle(), $ptyDescriptor())
+    const remote = $opening.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const RemotePTY { Reader Writer Controller } = remote
+    var writer = Writer
+    const resizing = spawn ResizePTY($writer, 111, 37)
+    const resized = $resizing.wait()
+    const afterResize = resized else error {
+        panic(sessionFailure(error))
+    }
+    writer = afterResize
+    const writing = spawn WritePTY($writer, $bytes.FromText(ptyInput()))
+    const written = $writing.wait()
+    const afterWrite = written else error {
+        panic(sessionFailure(error))
+    }
+    writer = afterWrite
+    const closing = spawn ClosePTYInput($writer)
+    const closed = $closing.wait()
+    closed else error { panic(sessionFailure(error)) }
+    const result = readPTYResult($Reader)
+    expect(result.exit.Code == 3)
+    expect(result.exit.Error == "")
+    expect(text.Contains(result.output, "FOUNDATION-PTY:answer"))
+    const expectedSize = ptyExpectedSize()
+    if !text.IsEmpty(expectedSize) {
+        expect(text.Contains(result.output, expectedSize))
+    }
+    discard Controller
+    CloseClient($client)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    expect(host.Close())
+}
+
+struct ptyTestResult {
+    output String
+    exit protocol.Exit
+}
+
+fn readPTYResult($reader own PTYReader) ptyTestResult {
+    const opened = bytes.NewBuilder(65536) else {
+        fail("PTY output builder failed")
+    }
+    var builder = opened
+    var source = reader
+    while true {
+        const reading = spawn ReadPTY($source)
+        const outcome = $reading.wait()
+        const PTYReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error { panic(sessionFailure(error)) }
+        match event {
+            Data(value): {
+                builder.Write(value) else { fail("PTY output write failed") }
+            }
+            Exit(value): {
+                discard source
+                const bytesValue = builder.Finish() else {
+                    fail("PTY output finish failed")
+                }
+                const output = bytesValue.Text() else {
+                    fail("PTY output text failed")
+                }
+                return ptyTestResult { output = output exit = value }
+            }
+        }
+    }
+    panic("PTY event loop invariant failed")
+}
+
+@target(linux)
+fn ptyDescriptor() protocol.Open {
+    posixPTYDescriptor()
+}
+
+@target(macos)
+fn ptyDescriptor() protocol.Open {
+    posixPTYDescriptor()
+}
+
+@target(windows)
+fn ptyDescriptor() protocol.Open {
+    var command = collections.NewList<String>()
+    command.PushFront($"set /p value=& echo FOUNDATION-PTY:%value%& exit /b 3")
+    command.PushFront($"/c")
+    command.PushFront($"cmd.exe")
+    ptyDescriptorFor($command)
+}
+
+fn posixPTYDescriptor() protocol.Open {
+    var command = collections.NewList<String>()
+    command.PushFront($"read value; stty size; printf 'FOUNDATION-PTY:%s\\n' " +
+        "$value; exit 3")
+    command.PushFront($"-c")
+    command.PushFront($"/bin/sh")
+    ptyDescriptorFor($command)
+}
+
+fn ptyDescriptorFor(
+    $command own collections.List<String>
+) protocol.Open {
+    protocol.Open {
+        Kind = .PTY
+        Cols = 80
+        Rows = 24
+        Command = command
+        Env = collections.NewList<protocol.Environment>()
+        Term = "xterm-256color"
+        Dir = ""
+        Target = ""
+        ResumeID = ""
+    }
+}
+
+@target(linux)
+fn ptyInput() String {
+    "answer\n"
+}
+
+@target(macos)
+fn ptyInput() String {
+    "answer\n"
+}
+
+@target(windows)
+fn ptyInput() String {
+    "answer\r\n"
+}
+
+@target(linux)
+fn ptyExpectedSize() String {
+    "37 111"
+}
+
+@target(macos)
+fn ptyExpectedSize() String {
+    "37 111"
+}
+
+@target(windows)
+fn ptyExpectedSize() String {
+    ""
+}
+
 test "client authentication rejects a changed token secret" {
     const expiry = time.Now().Unix() + 3600
     const listening = ListenLocal($testCapabilities(), expiry) else error {

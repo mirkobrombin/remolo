@@ -92,9 +92,15 @@ fn channelTask(
 ) Task<void> {
     const kind = channel.Open.Kind
     match kind {
+        PTY: {
+            discard rootPath
+            if allowWrite return spawn runPTYChannel($channel)
+            spawn rejectChannel($channel)
+        }
         Exec: {
             discard rootPath
-            spawn runExecChannel($channel)
+            if allowWrite return spawn runExecChannel($channel)
+            spawn rejectChannel($channel)
         }
         File: {
             spawn runFileChannel(
@@ -119,6 +125,12 @@ fn channelTask(
             spawn rejectChannel($channel)
         }
     }
+}
+
+task runPTYChannel($channel mux.AcceptedChannel) void {
+    const serving = spawn servePTYChannel($channel)
+    const result = $serving.wait()
+    discard result
 }
 
 task runExecChannel($channel mux.AcceptedChannel) void {
