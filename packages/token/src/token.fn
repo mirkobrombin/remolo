@@ -1,0 +1,711 @@
+package remolo.token
+
+import remolo.codec
+import std.bytes
+import std.collections
+import std.text
+import std.time
+
+enum TokenError {
+    Empty
+    InvalidEncoding
+    ChecksumMismatch
+    Truncated
+    InvalidCBOR
+    UnsupportedVersion
+    InvalidKey
+    InvalidSession
+    NoEndpoint
+    InvalidCandidate
+    TooLarge
+    Storage
+    EntropyUnavailable
+}
+
+struct Token {
+    Version u8
+    HostPublicKey own bytes.Bytes
+    PSK own bytes.Bytes
+    Candidates own collections.List<Candidate>
+    SessionID own bytes.Bytes
+    Expiry u64
+    Rendezvous String
+
+    fn Expired(self) bool {
+        time.Now().Unix() > self.Expiry
+    }
+}
+
+struct candidateSet {
+    values own collections.List<Candidate>
+    count u64
+}
+
+struct decodedFields {
+    version u64
+    hostPublicKey own bytes.Bytes
+    psk own bytes.Bytes
+    candidates own collections.List<Candidate>
+    candidateCount u64
+    sessionID own bytes.Bytes
+    expiry u64
+    rendezvous String
+    seenVersion bool
+    seenHostPublicKey bool
+    seenPSK bool
+    seenCandidates bool
+    seenSessionID bool
+    seenExpiry bool
+}
+
+fn Prefix() String {
+    "REMOLO1-"
+}
+
+fn New(
+    $hostPublicKey own bytes.Bytes,
+    candidates [Candidate],
+    expiry u64,
+    rendezvous String
+) Result<own Token, TokenError> {
+    const psk = bytes.Random(32) else error {
+        discard error
+        return .Err(.EntropyUnavailable)
+    }
+    const sessionID = bytes.Random(16) else error {
+        discard error
+        return .Err(.EntropyUnavailable)
+    }
+    NewWithSecrets(
+        $hostPublicKey,
+        $psk,
+        candidates,
+        $sessionID,
+        expiry,
+        rendezvous
+    )
+}
+
+fn NewWithSecrets(
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes,
+    candidates [Candidate],
+    $sessionID own bytes.Bytes,
+    expiry u64,
+    rendezvous String
+) Result<own Token, TokenError> {
+    validateLength(hostPublicKey, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(psk, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(sessionID, 16, .InvalidSession) else error {
+        return .Err(error)
+    }
+    const copied = copyCandidates(candidates) else error {
+        return .Err(error)
+    }
+    const candidateSet { values count } = copied
+    if count == 0 && text.IsEmpty(rendezvous) {
+        return .Err(.NoEndpoint)
+    }
+    .Ok(own Token {
+        Version = 1
+        HostPublicKey = hostPublicKey
+        PSK = psk
+        Candidates = values
+        SessionID = sessionID
+        Expiry = expiry
+        Rendezvous = text.Copy(rendezvous)
+    })
+}
+
+fn Encode($value own Token) Result<String, TokenError> {
+    var token = value
+    const candidateCount = validateToken(token) else error { return .Err(error) }
+    const encodedPayload = encodePayload($token, candidateCount) else error {
+        return .Err(error)
+    }
+    const checksum = codec.CRC32C(encodedPayload) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const framed = appendChecksum(encodedPayload, checksum) else error {
+        return .Err(error)
+    }
+    const body = codec.EncodeCrockford(framed) else error {
+        return .Err(codecError(error))
+    }
+    groupToken(body)
+}
+
+fn encodePayload(
+    $token own Token,
+    candidateCount u64
+) Result<own bytes.Bytes, TokenError> {
+    var value = token
+    const opened = bytes.NewBuilder(65536) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var payload = opened
+    writeTokenPrefix(&payload, value, candidateCount) else error {
+        return .Err(error)
+    }
+    writeCandidateValues(&payload, &value.Candidates) else error {
+        return .Err(error)
+    }
+    writeTokenSuffix(&payload, value) else error { return .Err(error) }
+    const result = payload.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn writeTokenPrefix(
+    &payload bytes.Builder,
+    value Token,
+    candidateCount u64
+) Result<void, TokenError> {
+    var fields u64 = 7
+    if text.IsEmpty(value.Rendezvous) {
+        fields = 6
+    }
+    writeCBORMap(&payload, fields) else error { return .Err(error) }
+    writeCBORUnsigned(&payload, 1) else error { return .Err(error) }
+    writeCBORUnsigned(&payload, u64.From(value.Version)) else error { return .Err(error) }
+    writeCBORUnsigned(&payload, 2) else error { return .Err(error) }
+    writeCBORBinary(&payload, value.HostPublicKey) else error { return .Err(error) }
+    writeCBORUnsigned(&payload, 3) else error { return .Err(error) }
+    writeCBORBinary(&payload, value.PSK) else error { return .Err(error) }
+    writeCBORUnsigned(&payload, 4) else error { return .Err(error) }
+    writeCBORArray(&payload, candidateCount) else error { return .Err(error) }
+    .Ok
+}
+
+fn writeCandidateValues(
+    &payload bytes.Builder,
+    &candidates collections.List<Candidate>
+) Result<void, TokenError> {
+    while !candidates.IsEmpty() {
+        const candidate = candidateValue(candidates.PopFront())
+        encodeCandidate(&payload, candidate) else error { return .Err(error) }
+    }
+    .Ok
+}
+
+fn writeTokenSuffix(
+    &payload bytes.Builder,
+    value Token
+) Result<void, TokenError> {
+    writeCBORUnsigned(&payload, 5) else error { return .Err(error) }
+    writeCBORBinary(&payload, value.SessionID) else error { return .Err(error) }
+    writeCBORUnsigned(&payload, 6) else error { return .Err(error) }
+    writeCBORUnsigned(&payload, value.Expiry) else error { return .Err(error) }
+    if !text.IsEmpty(value.Rendezvous) {
+        writeCBORUnsigned(&payload, 7) else error { return .Err(error) }
+        writeCBORText(&payload, value.Rendezvous) else error { return .Err(error) }
+    }
+    .Ok
+}
+
+fn validateToken(value Token) Result<u64, TokenError> {
+    if value.Version != 1 return .Err(.UnsupportedVersion)
+    validateLength(value.HostPublicKey, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(value.PSK, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(value.SessionID, 16, .InvalidSession) else error {
+        return .Err(error)
+    }
+    const count = u64.From(value.Candidates.Len()) else error {
+        discard error
+        panic("candidate length invariant failed")
+    }
+    if count == 0 && text.IsEmpty(value.Rendezvous) return .Err(.NoEndpoint)
+    .Ok(count)
+}
+
+fn Decode(value String) Result<own Token, TokenError> {
+    const body = tokenBody(value) else error {
+        return .Err(error)
+    }
+    if text.IsEmpty(body) return .Err(.Empty)
+    const framed = codec.DecodeCrockford(body, 65536) else error {
+        return .Err(codecError(error))
+    }
+    const length = framed.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if length < 5 return .Err(.Truncated)
+    const payload = framed.Slice(0, length - 4) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const wanted = readU32(framed, length - 4)
+    const actual = codec.CRC32C(payload) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if wanted != actual return .Err(.ChecksumMismatch)
+    decodePayload($payload)
+}
+
+fn encodeCandidate(
+    &builder bytes.Builder,
+    value Candidate
+) Result<void, TokenError> {
+    if value.Port == 0 || !validIP(value.IP) return .Err(.InvalidCandidate)
+    writeCBORMap(&builder, 2) else error { return .Err(error) }
+    writeCBORUnsigned(&builder, 1) else error { return .Err(error) }
+    writeCBORText(&builder, value.IP) else error { return .Err(error) }
+    writeCBORUnsigned(&builder, 2) else error { return .Err(error) }
+    writeCBORUnsigned(&builder, u64.From(value.Port))
+}
+
+fn decodePayload($source own bytes.Bytes) Result<own Token, TokenError> {
+    var reader = newCBORReader($source)
+    const count = reader.ReadMapLength(32) else error {
+        return .Err(error)
+    }
+    var fields = emptyDecodedFields()
+    var index u64 = 0
+    while index < count {
+        const key = reader.ReadUnsigned() else error {
+            return .Err(error)
+        }
+        decodeField(&reader, &fields, key) else error {
+            return .Err(error)
+        }
+        index += 1
+    }
+    if reader.Remaining() != 0 return .Err(.InvalidCBOR)
+    finishDecodedFields($fields)
+}
+
+fn decodeField(
+    &reader cborReader,
+    &fields decodedFields,
+    key u64
+) Result<void, TokenError> {
+    if key == 1 return decodeVersion(&reader, &fields)
+    if key == 2 return decodeHostPublicKey(&reader, &fields)
+    if key == 3 return decodePSK(&reader, &fields)
+    if key == 4 return decodeCandidates(&reader, &fields)
+    if key == 5 return decodeSessionID(&reader, &fields)
+    if key == 6 return decodeExpiry(&reader, &fields)
+    if key == 7 return decodeRendezvous(&reader, &fields)
+    reader.SkipValue(0)
+}
+
+fn decodeVersion(
+    &reader cborReader,
+    &fields decodedFields
+) Result<void, TokenError> {
+    if fields.seenVersion return .Err(.InvalidCBOR)
+    const value = reader.ReadUnsigned() else error { return .Err(error) }
+    fields.version = value
+    fields.seenVersion = true
+    .Ok
+}
+
+fn decodeHostPublicKey(
+    &reader cborReader,
+    &fields decodedFields
+) Result<void, TokenError> {
+    if fields.seenHostPublicKey return .Err(.InvalidCBOR)
+    const value = reader.ReadBinary(32) else error { return .Err(error) }
+    const empty = replace fields.hostPublicKey with value
+    discard empty
+    fields.seenHostPublicKey = true
+    .Ok
+}
+
+fn decodePSK(
+    &reader cborReader,
+    &fields decodedFields
+) Result<void, TokenError> {
+    if fields.seenPSK return .Err(.InvalidCBOR)
+    const value = reader.ReadBinary(32) else error { return .Err(error) }
+    const empty = replace fields.psk with value
+    discard empty
+    fields.seenPSK = true
+    .Ok
+}
+
+fn decodeCandidates(
+    &reader cborReader,
+    &fields decodedFields
+) Result<void, TokenError> {
+    if fields.seenCandidates return .Err(.InvalidCBOR)
+    const value = readCandidates(&reader) else error { return .Err(error) }
+    const candidateSet { values count } = value
+    const empty = replace fields.candidates with values
+    discard empty
+    fields.candidateCount = count
+    fields.seenCandidates = true
+    .Ok
+}
+
+fn decodeSessionID(
+    &reader cborReader,
+    &fields decodedFields
+) Result<void, TokenError> {
+    if fields.seenSessionID return .Err(.InvalidCBOR)
+    const value = reader.ReadBinary(16) else error { return .Err(error) }
+    const empty = replace fields.sessionID with value
+    discard empty
+    fields.seenSessionID = true
+    .Ok
+}
+
+fn decodeExpiry(
+    &reader cborReader,
+    &fields decodedFields
+) Result<void, TokenError> {
+    if fields.seenExpiry return .Err(.InvalidCBOR)
+    const value = reader.ReadUnsigned() else error { return .Err(error) }
+    fields.expiry = value
+    fields.seenExpiry = true
+    .Ok
+}
+
+fn decodeRendezvous(
+    &reader cborReader,
+    &fields decodedFields
+) Result<void, TokenError> {
+    if !text.IsEmpty(fields.rendezvous) return .Err(.InvalidCBOR)
+    const value = reader.ReadText(4096) else error { return .Err(error) }
+    fields.rendezvous = value
+    .Ok
+}
+
+fn finishDecodedFields($fields own decodedFields) Result<own Token, TokenError> {
+    const decodedFields {
+        version
+        hostPublicKey
+        psk
+        candidates
+        candidateCount
+        sessionID
+        expiry
+        rendezvous
+        seenVersion
+        seenHostPublicKey
+        seenPSK
+        seenCandidates
+        seenSessionID
+        seenExpiry
+    } = fields
+    if !seenVersion || !seenHostPublicKey || !seenPSK ||
+        !seenCandidates || !seenSessionID || !seenExpiry {
+        return .Err(.InvalidCBOR)
+    }
+    if version != 1 return .Err(.UnsupportedVersion)
+    validateLength(hostPublicKey, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(psk, 32, .InvalidKey) else error {
+        return .Err(error)
+    }
+    validateLength(sessionID, 16, .InvalidSession) else error {
+        return .Err(error)
+    }
+    if candidateCount == 0 && text.IsEmpty(rendezvous) {
+        return .Err(.NoEndpoint)
+    }
+    .Ok(own Token {
+        Version = 1
+        HostPublicKey = hostPublicKey
+        PSK = psk
+        Candidates = candidates
+        SessionID = sessionID
+        Expiry = expiry
+        Rendezvous = rendezvous
+    })
+}
+
+fn readCandidates(&reader cborReader) Result<candidateSet, TokenError> {
+    const count = reader.ReadArrayLength(64) else error {
+        return .Err(error)
+    }
+    var reversed = collections.NewList<Candidate>()
+    var index u64 = 0
+    while index < count {
+        const candidate = readCandidate(&reader) else error {
+            return .Err(error)
+        }
+        reversed.PushFront($candidate)
+        index += 1
+    }
+    .Ok(candidateSet { values = reverseCandidates($reversed) count = count })
+}
+
+struct candidateFields {
+    ip String
+    port u64
+    seenIP bool
+    seenPort bool
+}
+
+fn readCandidate(&reader cborReader) Result<Candidate, TokenError> {
+    const count = reader.ReadMapLength(8) else error { return .Err(error) }
+    var fields = candidateFields {
+        ip = ""
+        port = 0
+        seenIP = false
+        seenPort = false
+    }
+    var index u64 = 0
+    while index < count {
+        const key = reader.ReadUnsigned() else error { return .Err(error) }
+        readCandidateField(&reader, &fields, key) else error {
+            return .Err(error)
+        }
+        index += 1
+    }
+    const candidateFields { ip port seenIP seenPort } = fields
+    if !seenIP || !seenPort || port == 0 || port > 65535 || !validIP(ip) {
+        return .Err(.InvalidCandidate)
+    }
+    const converted = u16.From(port) else error {
+        discard error
+        return .Err(.InvalidCandidate)
+    }
+    .Ok(Candidate { IP = ip Port = converted })
+}
+
+fn readCandidateField(
+    &reader cborReader,
+    &fields candidateFields,
+    key u64
+) Result<void, TokenError> {
+    if key == 1 return readCandidateIP(&reader, &fields)
+    if key == 2 return readCandidatePort(&reader, &fields)
+    reader.SkipValue(0)
+}
+
+fn readCandidateIP(
+    &reader cborReader,
+    &fields candidateFields
+) Result<void, TokenError> {
+    if fields.seenIP return .Err(.InvalidCBOR)
+    const value = reader.ReadText(255) else error { return .Err(error) }
+    fields.ip = value
+    fields.seenIP = true
+    .Ok
+}
+
+fn readCandidatePort(
+    &reader cborReader,
+    &fields candidateFields
+) Result<void, TokenError> {
+    if fields.seenPort return .Err(.InvalidCBOR)
+    const value = reader.ReadUnsigned() else error { return .Err(error) }
+    fields.port = value
+    fields.seenPort = true
+    .Ok
+}
+
+fn emptyDecodedFields() own decodedFields {
+    own decodedFields {
+        version = 0
+        hostPublicKey = bytes.FromText("")
+        psk = bytes.FromText("")
+        candidates = collections.NewList<Candidate>()
+        candidateCount = 0
+        sessionID = bytes.FromText("")
+        expiry = 0
+        rendezvous = ""
+        seenVersion = false
+        seenHostPublicKey = false
+        seenPSK = false
+        seenCandidates = false
+        seenSessionID = false
+        seenExpiry = false
+    }
+}
+
+fn copyCandidates(values [Candidate]) Result<candidateSet, TokenError> {
+    var reversed = collections.NewList<Candidate>()
+    var count u64 = 0
+    for value in values {
+        if value.Port == 0 || !validIP(value.IP) return .Err(.InvalidCandidate)
+        reversed.PushFront(Candidate { IP = text.Copy(value.IP) Port = value.Port })
+        count += 1
+    }
+    .Ok(candidateSet { values = reverseCandidates($reversed) count = count })
+}
+
+fn reverseCandidates(
+    $source own collections.List<Candidate>
+) own collections.List<Candidate> {
+    var pending = source
+    var result = collections.NewList<Candidate>()
+    while !pending.IsEmpty() {
+        result.PushFront(candidateValue(pending.PopFront()))
+    }
+    result
+}
+
+fn candidateValue($value Option<Candidate>) Candidate {
+    match value {
+        None: panic("candidate list invariant failed")
+        Some(candidate): candidate
+    }
+}
+
+fn validateLength(
+    value bytes.Bytes,
+    expected u64,
+    error TokenError
+) Result<void, TokenError> {
+    const length = value.Len() else storageError {
+        discard storageError
+        return .Err(.Storage)
+    }
+    if length != expected return .Err(error)
+    .Ok
+}
+
+fn appendChecksum(value bytes.Bytes, checksum u32) Result<own bytes.Bytes, TokenError> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const opened = bytes.NewBuilder(length + 4) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var builder = opened
+    builder.Write(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    builder.WriteByte(u64.From(checksum >> 24)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    builder.WriteByte(u64.From(checksum >> 16 & 255)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    builder.WriteByte(u64.From(checksum >> 8 & 255)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    builder.WriteByte(u64.From(checksum & 255)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn readU32(value bytes.Bytes, offset u64) u32 {
+    const first = checksumByte(value, offset)
+    const second = checksumByte(value, offset + 1)
+    const third = checksumByte(value, offset + 2)
+    const fourth = checksumByte(value, offset + 3)
+    const result = first << 24 | second << 16 | third << 8 | fourth
+    const converted = u32.From(result) else error {
+        discard error
+        panic("checksum conversion invariant failed")
+    }
+    converted
+}
+
+fn checksumByte(value bytes.Bytes, offset u64) u64 {
+    const result = value.At(offset) else {
+        panic("checksum byte missing")
+    }
+    result
+}
+
+fn tokenBody(value String) Result<String, TokenError> {
+    const length = text.ByteLen(value)
+    var start u64 = 0
+    while start < length && whitespace(byteAt(value, start)) {
+        start += 1
+    }
+    if prefixAt(value, start) {
+        start += 7
+    }
+    const body = text.Slice(value, start, length) else error {
+        discard error
+        return .Err(.InvalidEncoding)
+    }
+    .Ok(body)
+}
+
+fn prefixAt(value String, start u64) bool {
+    const expected = "REMOLO1"
+    if text.ByteLen(value) - start < 7 return false
+    var offset u64 = 0
+    while offset < 7 {
+        if upper(byteAt(value, start + offset)) != byteAt(expected, offset) return false
+        offset += 1
+    }
+    true
+}
+
+fn groupToken(body String) Result<String, TokenError> {
+    var builder = text.NewBuilder()
+    writeText(&builder, Prefix()) else error { return .Err(error) }
+    const length = text.ByteLen(body)
+    var offset u64 = 0
+    while offset < length {
+        if offset > 0 && offset % 6 == 0 {
+            writeCodePoint(&builder, 45) else error { return .Err(error) }
+        }
+        writeCodePoint(&builder, byteAt(body, offset)) else error { return .Err(error) }
+        offset += 1
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn writeText(&builder text.Builder, value String) Result<void, TokenError> {
+    const written = builder.Write(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if !written return .Err(.Storage)
+    .Ok
+}
+
+fn writeCodePoint(&builder text.Builder, value u64) Result<void, TokenError> {
+    const written = builder.WriteCodePoint(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if !written return .Err(.Storage)
+    .Ok
+}
+
+fn upper(value u64) u64 {
+    value - 32 if value >= 97 && value <= 122 else value
+}
+
+fn whitespace(value u64) bool {
+    value == 32 || (value >= 9 && value <= 13)
+}
+
+fn codecError(error codec.CodecError) TokenError {
+    match error {
+        InvalidEncoding: .InvalidEncoding
+        TooLarge: .TooLarge
+        Storage: .Storage
+    }
+}

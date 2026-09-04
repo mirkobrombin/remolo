@@ -1,0 +1,126 @@
+package remolo.token
+
+import std.format
+import std.text
+
+struct Candidate {
+    IP String
+    Port u16
+
+    fn Addr(self) String {
+        const port = format.U16(self.Port)
+        if text.Contains(self.IP, ":") {
+            return "[" + self.IP + "]:" + port
+        }
+        self.IP + ":" + port
+    }
+}
+
+fn validIP(value String) bool {
+    if text.Contains(value, ":") return validIPv6(value)
+    validIPv4(value)
+}
+
+fn validIPv4(value String) bool {
+    const length = text.ByteLen(value)
+    if length < 7 || length > 15 return false
+    var segments u64 = 0
+    var digits u64 = 0
+    var part u64 = 0
+    var offset u64 = 0
+    while offset <= length {
+        const atEnd = offset == length
+        var byte u64 = 46
+        if !atEnd {
+            byte = byteAt(value, offset)
+        }
+        if byte == 46 {
+            if digits == 0 || digits > 3 || part > 255 return false
+            segments += 1
+            digits = 0
+            part = 0
+        } else {
+            if byte < 48 || byte > 57 return false
+            part = part * 10 + byte - 48
+            digits += 1
+        }
+        offset += 1
+    }
+    segments == 4
+}
+
+struct ipv6State {
+    groups u64
+    digits u64
+    offset u64
+    compressed bool
+}
+
+fn validIPv6(value String) bool {
+    const length = text.ByteLen(value)
+    if length < 2 || length > 39 return false
+    var state = ipv6State {
+        groups = 0
+        digits = 0
+        offset = 0
+        compressed = false
+    }
+    while state.offset < length {
+        const byte = byteAt(value, state.offset)
+        if byte == 58 {
+            if !consumeIPv6Colon(&state, value, length) return false
+        } else {
+            if !consumeIPv6Digit(&state, byte) return false
+        }
+    }
+    if state.digits > 0 {
+        state.groups += 1
+    }
+    if state.compressed return state.groups < 8
+    state.groups == 8
+}
+
+fn consumeIPv6Digit(&state ipv6State, byte u64) bool {
+    if !hexDigit(byte) || state.digits == 4 return false
+    state.digits += 1
+    state.offset += 1
+    true
+}
+
+fn consumeIPv6Colon(
+    &state ipv6State,
+    value String,
+    length u64
+) bool {
+    const pair = state.offset + 1 < length &&
+        byteAt(value, state.offset + 1) == 58
+    if !pair {
+        if state.digits == 0 return false
+        state.groups += 1
+        state.digits = 0
+        state.offset += 1
+        return true
+    }
+    if state.compressed return false
+    if state.digits > 0 {
+        state.groups += 1
+        state.digits = 0
+    }
+    state.compressed = true
+    state.offset += 2
+    true
+}
+
+fn hexDigit(value u64) bool {
+    (value >= 48 && value <= 57) ||
+        (value >= 65 && value <= 70) ||
+        (value >= 97 && value <= 102)
+}
+
+fn byteAt(value String, index u64) u64 {
+    const byte = text.ByteAt(value, index) else error {
+        discard error
+        panic("address byte invariant failed")
+    }
+    byte
+}

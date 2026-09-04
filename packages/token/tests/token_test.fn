@@ -1,0 +1,149 @@
+package remolo.token
+
+import std.bytes
+
+fn sequence(start u64, count u64, descending bool) own bytes.Bytes {
+    const opened = bytes.NewBuilder(count) else {
+        panic("sequence builder failed")
+    }
+    var builder = opened
+    var offset u64 = 0
+    while offset < count {
+        const value = start - offset if descending else start + offset
+        builder.WriteByte(value) else {
+            panic("sequence byte failed")
+        }
+        offset += 1
+    }
+    const result = builder.Finish() else {
+        panic("sequence finish failed")
+    }
+    result
+}
+
+fn fixedToken() own Token {
+    const candidates [2]Candidate = [
+        Candidate { IP = "192.168.1.10" Port = 41000 },
+        Candidate { IP = "fe80::1" Port = 41000 }
+    ]
+    const value = NewWithSecrets(
+        $sequence(0, 32, false),
+        $sequence(255, 32, true),
+        candidates,
+        $sequence(32, 16, false),
+        1767225600,
+        "relay.example:443"
+    ) else error {
+        discard error
+        panic("fixed token failed")
+    }
+    value
+}
+
+fn encodedVector() String {
+    "REMOLO1-MW0G20-JR4000-20G30G-2GC1R8-1450P3-0D1R7H-048J2C-" +
+        "A1A5GQ-30CHM6-RW3MF1-Y0TR43-ZZXZFW-ZFXFKY-7QYVTZ-9WZJY7-" +
+        "REZVQD-XKNYNT-F8WZKE-BS73WB-GY0142-M80PRC-9S68Q3-2DHR5R-" +
+        "RJWC9G-08CT0A-5205KP-CS9R60-X3MC82-36G2G1-AG40GJ-48S44M-" +
+        "K2EA19-58NJRB-9E5W31-MTANQ4-00EWBJ-CNP62Y-9ECNW6-2VBGDH-" +
+        "JKMD1M-6ESJNN-VH"
+}
+
+test "tokens match the Go wire vector" {
+    const encoded = Encode($fixedToken()) else error {
+        discard error
+        fail("token encoding failed")
+    }
+    expect(encoded == encodedVector())
+}
+
+test "tokens decode the Go wire vector" {
+    const decoded = Decode(encodedVector()) else error {
+        discard error
+        fail("token decoding failed")
+    }
+    var token = decoded
+    expect(token.Version == 1)
+    expect(token.Expiry == 1767225600)
+    expect(token.Rendezvous == "relay.example:443")
+    const firstKeyByte = token.HostPublicKey.At(0) else { fail("host key missing") }
+    const lastKeyByte = token.HostPublicKey.At(31) else { fail("host key missing") }
+    expect(firstKeyByte == 0)
+    expect(lastKeyByte == 31)
+    expect(token.Candidates.Len() == 2)
+    const first = candidateValue(token.Candidates.PopFront())
+    const second = candidateValue(token.Candidates.PopFront())
+    expect(first.Addr() == "192.168.1.10:41000")
+    expect(second.Addr() == "[fe80::1]:41000")
+}
+
+test "token decoding ignores case and separators" {
+    const value = Decode(
+        "  remolo1-mw0g20 jr4000 20g30g 2gc1r8 1450p3 0d1r7h 048j2c " +
+        "a1a5gq 30chm6 rw3mf1 y0tr43 zzxzfw zfxfky 7qyvtz 9wzjy7 " +
+        "rezvqd xknynt f8wzke bs73wb gy0142 m80prc 9s68q3 2dhr5r " +
+        "rjwc9g 08ct0a 5205kp cs9r60 x3mc82 36g2g1 ag40gj 48s44m " +
+        "k2ea19 58njrb 9e5w31 mtanq4 00ewbj cnp62y 9ecnw6 2vbgdh " +
+        "jkmd1m 6esjnn vh\n"
+    ) else error {
+        discard error
+        fail("tolerant token decoding failed")
+    }
+    expect(value.Version == 1)
+}
+
+test "token checksum rejects one changed symbol" {
+    const corrupt = "REMOLO1-NW0G20-JR4000-20G30G-2GC1R8-1450P3-0D1R7H-048J2C-" +
+        "A1A5GQ-30CHM6-RW3MF1-Y0TR43-ZZXZFW-ZFXFKY-7QYVTZ-9WZJY7-" +
+        "REZVQD-XKNYNT-F8WZKE-BS73WB-GY0142-M80PRC-9S68Q3-2DHR5R-" +
+        "RJWC9G-08CT0A-5205KP-CS9R60-X3MC82-36G2G1-AG40GJ-48S44M-" +
+        "K2EA19-58NJRB-9E5W31-MTANQ4-00EWBJ-CNP62Y-9ECNW6-2VBGDH-" +
+        "JKMD1M-6ESJNN-VH"
+    match Decode(corrupt) {
+        Ok(value): {
+            discard value
+            fail("corrupt token was accepted")
+        }
+        Err(error): match error {
+            ChecksumMismatch: {}
+            _: fail("wrong corrupt token error")
+        }
+    }
+}
+
+test "token construction rejects invalid credentials and endpoints" {
+    const candidates [1]Candidate = [Candidate { IP = "not-an-ip" Port = 41000 }]
+    match NewWithSecrets(
+        $sequence(0, 5, false),
+        $sequence(255, 32, true),
+        candidates,
+        $sequence(32, 16, false),
+        1767225600,
+        ""
+    ) {
+        Ok(value): {
+            discard value
+            fail("short host key was accepted")
+        }
+        Err(error): match error {
+            InvalidKey: {}
+            _: fail("wrong host key error")
+        }
+    }
+}
+
+test "tokens expose expiration against wall time" {
+    const candidates [1]Candidate = [Candidate { IP = "127.0.0.1" Port = 41000 }]
+    const value = NewWithSecrets(
+        $sequence(0, 32, false),
+        $sequence(255, 32, true),
+        candidates,
+        $sequence(32, 16, false),
+        0,
+        ""
+    ) else error {
+        discard error
+        fail("expired token construction failed")
+    }
+    expect(value.Expired())
+}
