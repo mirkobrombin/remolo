@@ -1,0 +1,113 @@
+package remolo.protocol
+
+import std.bytes
+import std.collections
+
+fn openFixture() Open {
+    var command = collections.NewList<String>()
+    command.PushFront($"-l")
+    command.PushFront($"bash")
+    var env = collections.NewList<Environment>()
+    env.PushFront(Environment { Name = "LANG" Value = "C.UTF-8" })
+    Open {
+        Kind = .PTY
+        Cols = 120
+        Rows = 40
+        Command = command
+        Env = env
+        Term = "xterm-256color"
+        Dir = "/workspace"
+        Target = ""
+        ResumeID = "session-1"
+    }
+}
+
+test "open descriptors preserve channel parameters" {
+    const encoded = EncodeOpen($openFixture()) else { fail("open encode failed") }
+    const decoded = DecodeOpen(encoded) else { fail("open decode failed") }
+    var value = decoded
+    match value.Kind {
+        PTY: {}
+        _: fail("open kind changed")
+    }
+    expect(value.Cols == 120)
+    expect(value.Rows == 40)
+    expect(value.Term == "xterm-256color")
+    expect(value.Dir == "/workspace")
+    expect(value.ResumeID == "session-1")
+    expect(value.Command.Len() == 2)
+    expect(value.Env.Len() == 1)
+}
+
+test "open frame is the mandatory first JSON frame" {
+    const encoded = EncodeOpenFrame($openFixture()) else {
+        fail("open frame encode failed")
+    }
+    const decoded = DecodeOpenFrame(encoded) else {
+        fail("open frame decode failed")
+    }
+    match decoded.Kind {
+        PTY: {}
+        _: fail("open frame kind changed")
+    }
+    const wrong = EncodeFrame(.Data, bytes.FromText("{}")) else {
+        fail("wrong frame encode failed")
+    }
+    match DecodeOpenFrame(wrong) {
+        Ok(value): {
+            discard value
+            fail("data frame was accepted as open")
+        }
+        Err(error): match error {
+            InvalidFrame: {}
+            _: fail("wrong first frame error")
+        }
+    }
+}
+
+test "open decoding requires a known kind" {
+    match DecodeOpen(bytes.FromText("{}")) {
+        Ok(value): {
+            discard value
+            fail("missing kind was accepted")
+        }
+        Err(error): match error {
+            MissingKind: {}
+            _: fail("wrong missing kind error")
+        }
+    }
+    match DecodeOpen(bytes.FromText("{\"kind\":\"unknown\"}")) {
+        Ok(value): {
+            discard value
+            fail("unknown kind was accepted")
+        }
+        Err(error): match error {
+            InvalidKind: {}
+            _: fail("wrong unknown kind error")
+        }
+    }
+}
+
+test "terminal control messages round trip" {
+    const resize = EncodeResize(Resize { Cols = 200 Rows = 60 }) else {
+        fail("resize encode failed")
+    }
+    const decodedResize = DecodeResize(resize) else {
+        fail("resize decode failed")
+    }
+    expect(decodedResize.Cols == 200)
+    expect(decodedResize.Rows == 60)
+    const signal = EncodeSignal(Signal { Name = "INT" }) else {
+        fail("signal encode failed")
+    }
+    const decodedSignal = DecodeSignal(signal) else {
+        fail("signal decode failed")
+    }
+    expect(decodedSignal.Name == "INT")
+    const exited = EncodeExit(Exit { Code = 7 Error = "stopped" }) else {
+        fail("exit encode failed")
+    }
+    const decodedExit = DecodeExit(exited) else { fail("exit decode failed") }
+    expect(decodedExit.Code == 7)
+    expect(decodedExit.Error == "stopped")
+}
