@@ -1,0 +1,193 @@
+package remolo.tunnel
+
+import foundation.worker
+import remolo.mux
+import std.bytes
+import std.net
+
+task Splice(
+    $stream mux.Stream,
+    $connection own net.TcpConnection
+) Result<void, Error> {
+    const control = stream.Control()
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const split = connection.SplitControlled() else error {
+        discard error
+        discard Reader
+        discard Writer
+        discard control
+        return .Err(.Stream)
+    }
+    const net.ControlledStream {
+        Reader as tcpReader
+        Writer as tcpWriter
+        Controller as tcpController
+    } = split
+    const splicing = spawn spliceHalves(
+        $tcpReader,
+        $tcpWriter,
+        $Reader,
+        $Writer,
+        $tcpController,
+        $control
+    )
+    const result = $splicing.wait()
+    result
+}
+
+task spliceHalves(
+    $tcpReader own net.TcpReader,
+    $tcpWriter own net.TcpWriter,
+    $muxReader own mux.Reader,
+    $muxWriter own mux.Writer,
+    $tcpController own net.TcpController,
+    $control mux.StreamControl
+) Result<void, Error> {
+    var network = tcpController
+    var directions = worker.NewGroup<Result<void, Error>>(2)
+    directions.Add(spawn copyTcpToMux($tcpReader, $muxWriter)) else error {
+        discard error
+        discard network.Abort()
+        discard muxReader
+        discard tcpWriter
+        const closing = spawn mux.CloseStream($control)
+        const closed = $closing.wait()
+        discard closed
+        directions.Shutdown()
+        discard network
+        return .Err(.Stream)
+    }
+    directions.Add(spawn copyMuxToTcp($muxReader, $tcpWriter)) else error {
+        discard error
+        discard network.Abort()
+        const closing = spawn mux.CloseStream($control)
+        const closed = $closing.wait()
+        discard closed
+        directions.Shutdown()
+        discard network
+        return .Err(.Stream)
+    }
+    const waiting = $directions.Next()
+    const completed = $waiting.wait()
+    const worker.GroupNext { Group Value } = completed
+    const result = match Value {
+        Ok(value): value
+        Err(error): {
+            discard error
+            Result<void, Error>.Err(.Stream)
+        }
+    }
+    discard network.Abort()
+    const closing = spawn mux.CloseStream($control)
+    const closed = $closing.wait()
+    Group.Shutdown()
+    discard network
+    match result {
+        Err(error): {
+            discard closed
+            .Err(error)
+        }
+        Ok: match closed {
+            Ok: .Ok
+            Err(error): {
+                discard error
+                .Err(.Stream)
+            }
+        }
+    }
+}
+
+task copyTcpToMux(
+    $reader own net.TcpReader,
+    $writer own mux.Writer
+) Result<void, Error> {
+    var source = reader
+    var destination = writer
+    while true {
+        const reading = spawn net.ReadSomeBytes($source, 65536)
+        const outcome = $reading.wait()
+        const net.ReadSomeBytesOutcome { Reader Value } = outcome
+        source = Reader
+        const next = Value else error {
+            discard error
+            discard source
+            discard destination
+            return .Err(.Stream)
+        }
+        var eof = true
+        var chunk = bytes.FromText("")
+        match next {
+            None: {}
+            Some(value): {
+                eof = false
+                const empty = replace chunk with value
+                discard empty
+            }
+        }
+        if eof {
+            discard chunk
+            discard source
+            const closing = spawn mux.CloseWriter($destination)
+            const closed = $closing.wait()
+            return match closed {
+                Ok: .Ok
+                Err(error): {
+                    discard error
+                    .Err(.Stream)
+                }
+            }
+        }
+        const writing = spawn mux.WriteAll($destination, $chunk)
+        const written = $writing.wait()
+        const mux.WriteOutcome { Writer Value as result } = written
+        destination = Writer
+        result else error {
+            discard error
+            discard source
+            discard destination
+            return .Err(.Stream)
+        }
+    }
+    .Ok
+}
+
+task copyMuxToTcp(
+    $reader own mux.Reader,
+    $writer own net.TcpWriter
+) Result<void, Error> {
+    var source = reader
+    var destination = writer
+    while true {
+        const reading = spawn mux.Read($source)
+        const outcome = $reading.wait()
+        const mux.ReadOutcome { Reader Value } = outcome
+        source = Reader
+        const chunk = match Value {
+            Ok(value): value
+            Err(error): match error {
+                Closed: {
+                    discard source
+                    discard destination
+                    return .Ok
+                }
+                _: {
+                    discard source
+                    discard destination
+                    return .Err(.Stream)
+                }
+            }
+        }
+        const writing = spawn net.WriteAllBytes($destination, $chunk)
+        const written = $writing.wait()
+        const net.WriteOutcome { Writer Value as result } = written
+        destination = Writer
+        result else error {
+            discard error
+            discard source
+            discard destination
+            return .Err(.Stream)
+        }
+    }
+    .Ok
+}

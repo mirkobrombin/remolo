@@ -2,9 +2,11 @@ package remolo.session
 
 import remolo.dirsync
 import remolo.protocol
+import remolo.tunnel
 import std.bytes
 import std.collections
 import std.fs
+import std.net
 import std.text
 import std.time
 
@@ -678,6 +680,335 @@ fn dryRunOptions() own dirsync.Options {
 fn excludeOptions() own dirsync.Options {
     const excludes [2]String = ["*.tmp", "node_modules"]
     dirsync.NewOptions(excludes)
+}
+
+struct networkRead {
+    reader own net.TcpReader
+    value own bytes.Bytes
+}
+
+task echoOnce($listener own net.TcpListener, length u64) void {
+    const accepting = spawn net.Accept($listener)
+    const accepted = $accepting.wait()
+    const net.AcceptOutcome { Listener Value } = accepted
+    const connection = Value else error {
+        discard error
+        discard Listener
+        return
+    }
+    const split = connection.Split() else error {
+        discard error
+        discard Listener
+        return
+    }
+    const net.StreamPair { Reader Writer } = split
+    const reading = spawn net.ReadExactBytes($Reader, length)
+    const read = $reading.wait()
+    const net.ReadBytesOutcome { Reader as restored Value as payload } = read
+    const value = payload else error {
+        discard error
+        discard restored
+        discard Writer
+        discard Listener
+        return
+    }
+    const writing = spawn net.WriteAllBytes($Writer, $value)
+    const written = $writing.wait()
+    discard written
+    discard restored
+    discard Listener
+}
+
+task writeNetwork(
+    $writer own net.TcpWriter,
+    $value own bytes.Bytes
+) own net.TcpWriter {
+    const pending = spawn net.WriteAllBytes($writer, $value)
+    const outcome = $pending.wait()
+    const net.WriteOutcome { Writer Value } = outcome
+    Value else error {
+        discard error
+        discard Writer
+        fail("network write failed")
+    }
+    Writer
+}
+
+task readNetwork(
+    $reader own net.TcpReader,
+    length u64
+) networkRead {
+    const pending = spawn net.ReadExactBytes($reader, length)
+    const outcome = $pending.wait()
+    const net.ReadBytesOutcome { Reader Value } = outcome
+    const value = Value else error {
+        discard error
+        discard Reader
+        fail("network read failed")
+    }
+    networkRead { reader = Reader value = value }
+}
+
+test "local forwarding carries bytes through an authenticated channel" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const echoListener = net.Listen($"127.0.0.1", 0) else {
+        fail("echo listen failed")
+    }
+    const echoPort = echoListener.Port
+    const echoing = spawn echoOnce($echoListener, 13)
+    const endpointPort = u16.From(echoPort) else {
+        fail("echo port conversion failed")
+    }
+    const endpoint = net.Endpoint {
+        Host = "127.0.0.1"
+        Port = endpointPort
+    }
+    const target = endpoint.Address()
+    const forward = tunnel.ListenLocal(
+        $client.Handle(),
+        $"127.0.0.1",
+        0,
+        $target
+    ) else error {
+        discard error
+        fail("local forward listen failed")
+    }
+    const forwardPort = forward.Port()
+    const servingLocal = spawn tunnel.ServeLocal($forward)
+    const servingRemote = spawn tunnel.ServeForward($peer.Handle())
+    const localConnecting = spawn net.Connect($"127.0.0.1", forwardPort)
+    const local = $localConnecting.wait() else {
+        fail("local forward connection failed")
+    }
+    const localSplit = local.Split() else {
+        fail("local forward split failed")
+    }
+    const net.StreamPair { Reader Writer } = localSplit
+    const writing = spawn writeNetwork(
+        $Writer,
+        $bytes.FromText("local-forward")
+    )
+    const afterWrite = $writing.wait()
+    const reading = spawn readNetwork($Reader, 13)
+    const networkRead { reader value } = $reading.wait()
+    const payload = value.Text() else { fail("forwarded text failed") }
+    expect(payload == "local-forward")
+    discard reader
+    discard afterWrite
+    const remoteResult = $servingRemote.wait()
+    remoteResult else error {
+        discard error
+        fail("remote forward failed")
+    }
+    discard $echoing.wait()
+    discard servingLocal
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+}
+
+test "SOCKS5 forwards domain targets and rejects unsupported commands" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const echoListener = net.Listen($"127.0.0.1", 0) else {
+        fail("echo listen failed")
+    }
+    const echoPort = echoListener.Port
+    const echoing = spawn echoOnce($echoListener, 13)
+    const forward = tunnel.ListenSocks(
+        $client.Handle(),
+        $"127.0.0.1",
+        0
+    ) else error {
+        discard error
+        fail("SOCKS listen failed")
+    }
+    const socksPort = forward.Port()
+    const servingSocks = spawn tunnel.ServeSocks($forward)
+    const servingRemote = spawn tunnel.ServeForward($peer.Handle())
+    const socksConnecting = spawn net.Connect($"127.0.0.1", socksPort)
+    const socks = $socksConnecting.wait() else {
+        fail("SOCKS connection failed")
+    }
+    const socksSplit = socks.Split() else { fail("SOCKS split failed") }
+    const net.StreamPair { Reader Writer } = socksSplit
+    const greeting = socksGreeting()
+    const greetingWrite = spawn writeNetwork($Writer, $greeting)
+    const afterGreeting = $greetingWrite.wait()
+    const methodRead = spawn readNetwork($Reader, 2)
+    const networkRead {
+        reader as afterMethod
+        value as method
+    } = $methodRead.wait()
+    const methodVersion = method.At(0) else { fail("method version failed") }
+    const methodChoice = method.At(1) else { fail("method choice failed") }
+    expect(methodVersion == 5)
+    expect(methodChoice == 0)
+    const request = socksDomainRequest("127.0.0.1", echoPort, 1)
+    const requestWrite = spawn writeNetwork($afterGreeting, $request)
+    const afterRequest = $requestWrite.wait()
+    const replyRead = spawn readNetwork($afterMethod, 10)
+    const networkRead {
+        reader as afterReply
+        value as reply
+    } = $replyRead.wait()
+    const replyVersion = reply.At(0) else { fail("reply version failed") }
+    const replyStatus = reply.At(1) else { fail("reply status failed") }
+    expect(replyVersion == 5)
+    expect(replyStatus == 0)
+    const payloadWrite = spawn writeNetwork(
+        $afterRequest,
+        $bytes.FromText("socks-forward")
+    )
+    const finalWriter = $payloadWrite.wait()
+    const payloadRead = spawn readNetwork($afterReply, 13)
+    const networkRead { reader as finalReader value } = $payloadRead.wait()
+    const payload = value.Text() else { fail("SOCKS payload failed") }
+    expect(payload == "socks-forward")
+    discard finalReader
+    discard finalWriter
+    const remoteResult = $servingRemote.wait()
+    remoteResult else error {
+        discard error
+        fail("SOCKS remote forward failed")
+    }
+    discard $echoing.wait()
+
+    const rejectedConnecting = spawn net.Connect($"127.0.0.1", socksPort)
+    const rejected = $rejectedConnecting.wait() else {
+        fail("SOCKS rejection connection failed")
+    }
+    const rejectedSplit = rejected.Split() else {
+        fail("SOCKS rejection split failed")
+    }
+    const net.StreamPair {
+        Reader as rejectedReader
+        Writer as rejectedWriter
+    } = rejectedSplit
+    const rejectedGreeting = spawn writeNetwork(
+        $rejectedWriter,
+        $socksGreeting()
+    )
+    const afterRejectedGreeting = $rejectedGreeting.wait()
+    const rejectedMethodRead = spawn readNetwork($rejectedReader, 2)
+    const networkRead {
+        reader as afterRejectedMethod
+        value as rejectedMethod
+    } = $rejectedMethodRead.wait()
+    discard rejectedMethod
+    const rejectedRequest = socksDomainRequest("127.0.0.1", echoPort, 2)
+    const rejectedRequestWrite = spawn writeNetwork(
+        $afterRejectedGreeting,
+        $rejectedRequest
+    )
+    const rejectedFinalWriter = $rejectedRequestWrite.wait()
+    const rejectedReplyRead = spawn readNetwork($afterRejectedMethod, 10)
+    const networkRead {
+        reader as rejectedFinalReader
+        value as rejectedReply
+    } = $rejectedReplyRead.wait()
+    const rejectedStatus = rejectedReply.At(1) else {
+        fail("SOCKS rejection status failed")
+    }
+    expect(rejectedStatus == 7)
+    discard rejectedFinalReader
+    discard rejectedFinalWriter
+
+    const authConnecting = spawn net.Connect($"127.0.0.1", socksPort)
+    const authRejected = $authConnecting.wait() else {
+        fail("SOCKS auth connection failed")
+    }
+    const authSplit = authRejected.Split() else {
+        fail("SOCKS auth split failed")
+    }
+    const net.StreamPair {
+        Reader as authReader
+        Writer as authWriter
+    } = authSplit
+    const authGreeting = spawn writeNetwork(
+        $authWriter,
+        $socksGreetingFor(2)
+    )
+    const authFinalWriter = $authGreeting.wait()
+    const authReplyRead = spawn readNetwork($authReader, 2)
+    const networkRead {
+        reader as authFinalReader
+        value as authReply
+    } = $authReplyRead.wait()
+    const authStatus = authReply.At(1) else {
+        fail("SOCKS auth status failed")
+    }
+    expect(authStatus == 255)
+    discard authFinalReader
+    discard authFinalWriter
+    discard servingSocks
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+}
+
+fn socksGreeting() own bytes.Bytes {
+    socksGreetingFor(0)
+}
+
+fn socksGreetingFor(method u64) own bytes.Bytes {
+    const opened = bytes.NewBuilder(3) else { fail("greeting builder failed") }
+    var builder = opened
+    builder.WriteByte(5) else { fail("greeting version failed") }
+    builder.WriteByte(1) else { fail("greeting count failed") }
+    builder.WriteByte(method) else { fail("greeting method failed") }
+    const result = builder.Finish() else { fail("greeting finish failed") }
+    result
+}
+
+fn socksDomainRequest(host String, port u64, command u64) own bytes.Bytes {
+    const hostBytes = bytes.FromText(host)
+    const hostLength = hostBytes.Len() else { fail("host length failed") }
+    const opened = bytes.NewBuilder(hostLength + 7) else {
+        fail("request builder failed")
+    }
+    var builder = opened
+    builder.WriteByte(5) else { fail("request version failed") }
+    builder.WriteByte(command) else { fail("request command failed") }
+    builder.WriteByte(0) else { fail("request reserved byte failed") }
+    builder.WriteByte(3) else { fail("request address type failed") }
+    builder.WriteByte(hostLength) else { fail("request host length failed") }
+    builder.Write(hostBytes) else { fail("request host failed") }
+    builder.WriteByte((port >> 8) & 255) else {
+        fail("request port failed")
+    }
+    builder.WriteByte(port & 255) else { fail("request port failed") }
+    const result = builder.Finish() else { fail("request finish failed") }
+    result
 }
 
 fn fileTransferFailure(error Error) bool {

@@ -1,0 +1,7 @@
+package remolo.tunnel
+
+test "endpoint formatting preserves domains and brackets IPv6" {
+    expect(endpointAddress("example.com", 443) == "example.com:443")
+    expect(endpointAddress("2001:db8::1", 8443) == "[2001:db8::1]:8443")
+}
+

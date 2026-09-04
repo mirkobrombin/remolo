@@ -31,6 +31,17 @@ struct Stream {
     ID u64
     Reader own Reader
     Writer own Writer
+
+    // Returns independent control for closing both stream directions.
+    fn Control(self) StreamControl {
+        StreamControl { id = self.ID control = self.Writer.control.clone() }
+    }
+}
+
+@concurrent.Transferable()
+struct StreamControl {
+    id u64
+    control Sender<request>
 }
 
 struct ReadOutcome {
@@ -83,6 +94,7 @@ enum request {
     Write(value writeRequest)
     Consumed(value consumedRequest)
     Close(value closeRequest)
+    Abort(value closeRequest)
     Inbound(value packet)
     TransportFailed
     Shutdown(reply Sender<void>)
@@ -544,6 +556,23 @@ task CloseWriter($writer own Writer) Result<void, Error> {
     }
 }
 
+task CloseStream($stream StreamControl) Result<void, Error> {
+    const StreamControl { id control } = stream
+    const Channel { sender receiver } = channel<voidResponse>(1)
+    select {
+        control.send(.Abort(value = closeRequest { id = id reply = sender })): {}
+        else error: return .Err(channelError(error))
+    }
+    const received = receiver.receive()
+    match received {
+        Ok(value): match value {
+            Done: .Ok
+            Failed(error): .Err(error)
+        }
+        Err(error): .Err(channelError(error))
+    }
+}
+
 fn Close($session own Session) void {
     const Session { actor reader writer controller handle } = session
     const Handle { sender peer } = handle
@@ -623,6 +652,7 @@ task serve(
                     Write(value): applyWrite(&current, &effects, $value)
                     Consumed(value): applyConsumed(&current, &effects, value)
                     Close(value): applyClose(&current, &effects, $value)
+                    Abort(value): applyAbort(&current, &effects, $value)
                     Inbound(value): {
                         keepRunning = applyInbound(
                             &current,
@@ -841,6 +871,35 @@ fn applyClose(
             } else {
                 current.streams.PushFront($stream)
             }
+        }
+    }
+}
+
+fn applyAbort(
+    &current state,
+    &effects collections.List<effect>,
+    $value closeRequest
+) void {
+    const closeRequest { id reply } = value
+    const selected = takeStream(&current, id)
+    match selected {
+        None: {
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Done
+            }))
+        }
+        Some(stream): {
+            effects.PushFront(.Void(value = voidEffect {
+                reply = reply
+                value = .Done
+            }))
+            effects.PushFront(.Stream(value = streamEffect {
+                reply = stream.inbound.clone()
+                value = .Reset
+            }))
+            effects.PushFront(.Frame(value = windowPacket(id, 8, 0)))
+            discard stream
         }
     }
 }

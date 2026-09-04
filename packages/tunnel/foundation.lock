@@ -1,0 +1,11 @@
+format foundation.lock/v1
+root remolo.tunnel 1.0.0
+target linux
+package remolo.mux 1.0.0 sha256:1e4c7941c9b6cf65afc251c5328e5e9f925c57ff0939f4c362141bfba39b5fff path ../mux
+package remolo.protocol 1.0.0 sha256:74407c717e7e42480eaa46fa54f81ddeae0690473e744ef2998d5d424284e405 path ../protocol
+package remolo.transport 1.0.0 sha256:843cea853fca50bc664725dc1940e8935c8d73e8e24de6a286c402adcd963124 path ../transport
+edge remolo.mux remolo.protocol
+edge remolo.mux remolo.transport
+edge remolo.transport remolo.protocol
+edge remolo.tunnel remolo.mux
+edge remolo.tunnel remolo.protocol

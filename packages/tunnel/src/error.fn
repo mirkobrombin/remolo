@@ -1,0 +1,14 @@
+package remolo.tunnel
+
+enum Error {
+    InvalidAddress
+    Listen
+    Accept
+    Multiplex
+    Connect
+    Stream
+    UnsupportedAuthentication
+    UnsupportedCommand
+    UnsupportedAddress
+}
+
