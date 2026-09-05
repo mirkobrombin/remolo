@@ -111,3 +111,15 @@ test "terminal control messages round trip" {
     expect(decodedExit.Code == 7)
     expect(decodedExit.Error == "stopped")
 }
+
+test "control messages preserve their type" {
+    const encoded = EncodeControlMessage($ControlMessage {
+        Type = "agent-forward"
+    }) else {
+        fail("control message encode failed")
+    }
+    const decoded = DecodeControlMessage(encoded) else {
+        fail("control message decode failed")
+    }
+    expect(decoded.Type == "agent-forward")
+}

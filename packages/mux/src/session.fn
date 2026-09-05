@@ -13,7 +13,7 @@ enum streamEvent {
 }
 
 @concurrent.Transferable()
-struct Reader {
+struct yamuxReader {
     id u64
     inbox Receiver<streamEvent>
     control Sender<request>
@@ -21,41 +21,41 @@ struct Reader {
 }
 
 @concurrent.Transferable()
-struct Writer {
+struct yamuxWriter {
     id u64
     control Sender<request>
 }
 
 @concurrent.Transferable()
-struct Stream {
+struct yamuxStream {
     ID u64
-    Reader own Reader
-    Writer own Writer
+    Reader own yamuxReader
+    Writer own yamuxWriter
 
     // Returns independent control for closing both stream directions.
-    fn Control(self) StreamControl {
-        StreamControl { id = self.ID control = self.Writer.control.clone() }
+    fn Control(self) yamuxStreamControl {
+        yamuxStreamControl { id = self.ID control = self.Writer.control.clone() }
     }
 }
 
 @concurrent.Transferable()
-struct StreamControl {
+struct yamuxStreamControl {
     id u64
     control Sender<request>
 }
 
-struct ReadOutcome {
-    Reader own Reader
+struct yamuxReadOutcome {
+    Reader own yamuxReader
     Value Result<own bytes.Bytes, Error>
 }
 
-struct WriteOutcome {
-    Writer own Writer
+struct yamuxWriteOutcome {
+    Writer own yamuxWriter
     Value Result<void, Error>
 }
 
 enum streamResponse {
-    Opened(value Stream)
+    Opened(value yamuxStream)
     Failed(error Error)
 }
 
@@ -117,7 +117,7 @@ struct streamState {
 
 struct state {
     streams own collections.List<streamState>
-    accepted own collections.List<Stream>
+    accepted own collections.List<yamuxStream>
     acceptWaiters own collections.List<acceptRequest>
     nextStreamID u64
     remoteGoAway bool
@@ -146,35 +146,35 @@ enum effect {
     Stream(value streamEffect)
 }
 
-struct Handle {
+struct yamuxHandle {
     sender Sender<request>
     peer String
 
-    fn Clone(self) Handle {
-        Handle { sender = self.sender.clone() peer = text.Copy(self.peer) }
+    fn Clone(self) yamuxHandle {
+        yamuxHandle { sender = self.sender.clone() peer = text.Copy(self.peer) }
     }
 
     fn PeerAddress(self) String {
         text.Copy(self.peer)
     }
 
-    fn Open(self) Task<Result<Stream, Error>> {
+    fn Open(self) Task<Result<yamuxStream, Error>> {
         spawn open(self.sender.clone())
     }
 
-    fn Accept(self) Task<Result<Stream, Error>> {
+    fn Accept(self) Task<Result<yamuxStream, Error>> {
         spawn accept(self.sender.clone())
     }
 }
 
-struct Session {
+struct yamuxSession {
     actor Task<void>
     reader Task<void>
     writer Task<void>
     controller own transport.SecureController
-    handle Handle
+    handle yamuxHandle
 
-    fn Handle(self) Handle {
+    fn Handle(self) yamuxHandle {
         self.handle.Clone()
     }
 
@@ -183,18 +183,18 @@ struct Session {
     }
 }
 
-fn NewClient($stream transport.SecureStream) own Session {
-    newSession($stream, 1)
+fn newYamuxClient($stream transport.SecureStream) own yamuxSession {
+    newYamuxSession($stream, 1)
 }
 
-fn NewServer($stream transport.SecureStream) own Session {
-    newSession($stream, 2)
+fn newYamuxServer($stream transport.SecureStream) own yamuxSession {
+    newYamuxSession($stream, 2)
 }
 
-fn newSession(
+fn newYamuxSession(
     $stream transport.SecureStream,
     nextStreamID u64
-) own Session {
+) own yamuxSession {
     const transport.SecureStream { Reader Writer Controller Peer } = stream
     const Channel { sender receiver } = channel<request>(64)
     const Channel { sender as outgoing receiver as writes } = channel<packet>(64)
@@ -206,16 +206,16 @@ fn newSession(
     )
     const reader = spawn readTransport($Reader, sender.clone())
     const writer = spawn writeTransport($Writer, $writes, sender.clone())
-    own Session {
+    own yamuxSession {
         actor = actor
         reader = reader
         writer = writer
         controller = Controller
-        handle = Handle { sender = sender peer = Peer }
+        handle = yamuxHandle { sender = sender peer = Peer }
     }
 }
 
-task open($control Sender<request>) Result<Stream, Error> {
+task open($control Sender<request>) Result<yamuxStream, Error> {
     const Channel { sender receiver } = channel<streamResponse>(1)
     select {
         control.send(.Open(value = openRequest { reply = sender })): {}
@@ -231,7 +231,7 @@ task open($control Sender<request>) Result<Stream, Error> {
     }
 }
 
-task accept($control Sender<request>) Result<Stream, Error> {
+task accept($control Sender<request>) Result<yamuxStream, Error> {
     const Channel { sender receiver } = channel<streamResponse>(1)
     select {
         control.send(.Accept(value = acceptRequest { reply = sender })): {}
@@ -247,12 +247,12 @@ task accept($control Sender<request>) Result<Stream, Error> {
     }
 }
 
-task Read($reader own Reader) ReadOutcome {
-    const Reader { id inbox control pending } = reader
+task readYamux($reader own yamuxReader) yamuxReadOutcome {
+    const yamuxReader { id inbox control pending } = reader
     const pendingLength = pending.Len() else error {
         discard error
-        return ReadOutcome {
-            Reader = own Reader {
+        return yamuxReadOutcome {
+            Reader = own yamuxReader {
                 id = id
                 inbox = inbox
                 control = control
@@ -266,8 +266,8 @@ task Read($reader own Reader) ReadOutcome {
             id = id
             length = pendingLength
         }))
-        return ReadOutcome {
-            Reader = own Reader {
+        return yamuxReadOutcome {
+            Reader = own yamuxReader {
                 id = id
                 inbox = inbox
                 control = control
@@ -282,8 +282,8 @@ task Read($reader own Reader) ReadOutcome {
             Data(value): {
                 const length = value.Len() else error {
                     discard error
-                    return ReadOutcome {
-                        Reader = own Reader {
+                    return yamuxReadOutcome {
+                        Reader = own yamuxReader {
                             id = id
                             inbox = inbox
                             control = control
@@ -296,8 +296,8 @@ task Read($reader own Reader) ReadOutcome {
                     id = id
                     length = length
                 }))
-                ReadOutcome {
-                    Reader = own Reader {
+                yamuxReadOutcome {
+                    Reader = own yamuxReader {
                         id = id
                         inbox = inbox
                         control = control
@@ -306,8 +306,8 @@ task Read($reader own Reader) ReadOutcome {
                     Value = .Ok(value)
                 }
             }
-            Fin: ReadOutcome {
-                Reader = own Reader {
+            Fin: yamuxReadOutcome {
+                Reader = own yamuxReader {
                     id = id
                     inbox = inbox
                     control = control
@@ -315,8 +315,8 @@ task Read($reader own Reader) ReadOutcome {
                 }
                 Value = .Err(.Closed)
             }
-            Reset: ReadOutcome {
-                Reader = own Reader {
+            Reset: yamuxReadOutcome {
+                Reader = own yamuxReader {
                     id = id
                     inbox = inbox
                     control = control
@@ -325,8 +325,8 @@ task Read($reader own Reader) ReadOutcome {
                 Value = .Err(.Reset)
             }
         }
-        Err(error): ReadOutcome {
-            Reader = own Reader {
+        Err(error): yamuxReadOutcome {
+            Reader = own yamuxReader {
                 id = id
                 inbox = inbox
                 control = control
@@ -337,12 +337,12 @@ task Read($reader own Reader) ReadOutcome {
     }
 }
 
-task ReadExact($reader own Reader, length u64) ReadOutcome {
-    const Reader { id inbox control pending } = reader
+task readExactYamux($reader own yamuxReader, length u64) yamuxReadOutcome {
+    const yamuxReader { id inbox control pending } = reader
     const opened = bytes.NewBuilder(length) else error {
         discard error
-        return ReadOutcome {
-            Reader = own Reader {
+        return yamuxReadOutcome {
+            Reader = own yamuxReader {
                 id = id
                 inbox = inbox
                 control = control
@@ -357,8 +357,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
     while written < length {
         const available = buffered.Len() else error {
             discard error
-            return ReadOutcome {
-                Reader = own Reader {
+            return yamuxReadOutcome {
+                Reader = own yamuxReader {
                     id = id
                     inbox = inbox
                     control = control
@@ -373,8 +373,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
                 Ok(event): match event {
                     Data(value): value
                     Fin: {
-                        return ReadOutcome {
-                            Reader = own Reader {
+                        return yamuxReadOutcome {
+                            Reader = own yamuxReader {
                                 id = id
                                 inbox = inbox
                                 control = control
@@ -384,8 +384,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
                         }
                     }
                     Reset: {
-                        return ReadOutcome {
-                            Reader = own Reader {
+                        return yamuxReadOutcome {
+                            Reader = own yamuxReader {
                                 id = id
                                 inbox = inbox
                                 control = control
@@ -396,8 +396,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
                     }
                 }
                 Err(error): {
-                    return ReadOutcome {
-                        Reader = own Reader {
+                    return yamuxReadOutcome {
+                        Reader = own yamuxReader {
                             id = id
                             inbox = inbox
                             control = control
@@ -411,8 +411,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
         }
         const bufferedLength = buffered.Len() else error {
             discard error
-            return ReadOutcome {
-                Reader = own Reader {
+            return yamuxReadOutcome {
+                Reader = own yamuxReader {
                     id = id
                     inbox = inbox
                     control = control
@@ -425,8 +425,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
         if taken > bufferedLength { taken = bufferedLength }
         const part = buffered.Slice(0, taken) else error {
             discard error
-            return ReadOutcome {
-                Reader = own Reader {
+            return yamuxReadOutcome {
+                Reader = own yamuxReader {
                     id = id
                     inbox = inbox
                     control = control
@@ -437,8 +437,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
         }
         builder.Write(part) else error {
             discard error
-            return ReadOutcome {
-                Reader = own Reader {
+            return yamuxReadOutcome {
+                Reader = own yamuxReader {
                     id = id
                     inbox = inbox
                     control = control
@@ -460,8 +460,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
                 bufferedLength
             ) else error {
                 discard error
-                return ReadOutcome {
-                    Reader = own Reader {
+                return yamuxReadOutcome {
+                    Reader = own yamuxReader {
                         id = id
                         inbox = inbox
                         control = control
@@ -475,8 +475,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
     }
     const result = builder.Finish() else error {
         discard error
-        return ReadOutcome {
-            Reader = own Reader {
+        return yamuxReadOutcome {
+            Reader = own yamuxReader {
                 id = id
                 inbox = inbox
                 control = control
@@ -485,8 +485,8 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
             Value = .Err(.Transport)
         }
     }
-    ReadOutcome {
-        Reader = own Reader {
+    yamuxReadOutcome {
+        Reader = own yamuxReader {
             id = id
             inbox = inbox
             control = control
@@ -496,15 +496,15 @@ task ReadExact($reader own Reader, length u64) ReadOutcome {
     }
 }
 
-task WriteAll(
-    $writer own Writer,
+task writeAllYamux(
+    $writer own yamuxWriter,
     $value own bytes.Bytes
-) WriteOutcome {
-    const Writer { id control } = writer
+) yamuxWriteOutcome {
+    const yamuxWriter { id control } = writer
     const length = value.Len() else error {
         discard error
-        return WriteOutcome {
-            Writer = own Writer { id = id control = control }
+        return yamuxWriteOutcome {
+            Writer = own yamuxWriter { id = id control = control }
             Value = .Err(.Transport)
         }
     }
@@ -514,8 +514,8 @@ task WriteAll(
         if end > length { end = length }
         const chunk = value.Slice(offset, end) else error {
             discard error
-            return WriteOutcome {
-                Writer = own Writer { id = id control = control }
+            return yamuxWriteOutcome {
+                Writer = own yamuxWriter { id = id control = control }
                 Value = .Err(.Transport)
             }
         }
@@ -524,8 +524,8 @@ task WriteAll(
         match written {
             Ok: {}
             Err(error): {
-                return WriteOutcome {
-                    Writer = own Writer { id = id control = control }
+                return yamuxWriteOutcome {
+                    Writer = own yamuxWriter { id = id control = control }
                     Value = .Err(error)
                 }
             }
@@ -533,14 +533,14 @@ task WriteAll(
         offset = end
     }
     discard value
-    WriteOutcome {
-        Writer = own Writer { id = id control = control }
+    yamuxWriteOutcome {
+        Writer = own yamuxWriter { id = id control = control }
         Value = .Ok
     }
 }
 
-task CloseWriter($writer own Writer) Result<void, Error> {
-    const Writer { id control } = writer
+task closeYamuxWriter($writer own yamuxWriter) Result<void, Error> {
+    const yamuxWriter { id control } = writer
     const Channel { sender receiver } = channel<voidResponse>(1)
     select {
         control.send(.Close(value = closeRequest { id = id reply = sender })): {}
@@ -556,8 +556,8 @@ task CloseWriter($writer own Writer) Result<void, Error> {
     }
 }
 
-task CloseStream($stream StreamControl) Result<void, Error> {
-    const StreamControl { id control } = stream
+task closeYamuxStream($stream yamuxStreamControl) Result<void, Error> {
+    const yamuxStreamControl { id control } = stream
     const Channel { sender receiver } = channel<voidResponse>(1)
     select {
         control.send(.Abort(value = closeRequest { id = id reply = sender })): {}
@@ -573,9 +573,9 @@ task CloseStream($stream StreamControl) Result<void, Error> {
     }
 }
 
-fn Close($session own Session) void {
-    const Session { actor reader writer controller handle } = session
-    const Handle { sender peer } = handle
+fn closeYamux($session own yamuxSession) void {
+    const yamuxSession { actor reader writer controller handle } = session
+    const yamuxHandle { sender peer } = handle
     discard peer
     const Channel { sender as reply receiver } = channel<void>(1)
     const stopping = spawn stop($sender, $reply)
@@ -630,7 +630,7 @@ task serve(
     var inbox = receiver
     var current = own state {
         streams = collections.NewList<streamState>()
-        accepted = collections.NewList<Stream>()
+        accepted = collections.NewList<yamuxStream>()
         acceptWaiters = collections.NewList<acceptRequest>()
         nextStreamID = nextStreamID
         remoteGoAway = false
@@ -958,8 +958,8 @@ fn applyInbound(
             }
             None: {
                 const queued = replace current.accepted with
-                collections.NewList<Stream>()
-                current.accepted = appendList<Stream>($queued, $stream)
+                collections.NewList<yamuxStream>()
+                current.accepted = appendList<yamuxStream>($queued, $stream)
             }
         }
     }
@@ -1241,7 +1241,7 @@ task writeTransport(
 }
 
 struct createdStream {
-    stream Stream
+    stream yamuxStream
     state streamState
 }
 
@@ -1251,15 +1251,15 @@ fn createStream(
 ) createdStream {
     const Channel { sender receiver } = channel<streamEvent>(4)
     createdStream {
-        stream = Stream {
+        stream = yamuxStream {
             ID = id
-            Reader = own Reader {
+            Reader = own yamuxReader {
                 id = id
                 inbox = receiver
                 control = control.clone()
                 pending = bytes.FromText("")
             }
-            Writer = own Writer { id = id control = control }
+            Writer = own yamuxWriter { id = id control = control }
         }
         state = streamState {
             id = id

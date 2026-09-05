@@ -1,0 +1,27 @@
+package remolo.cli
+
+import remolo.config
+
+fn loadConfig() Result<own config.Config, failure> {
+    const loading = spawn config.Load($config.DefaultPath())
+    const loaded = $loading.wait()
+    match loaded {
+        Ok(value): .Ok(value)
+        Err(error): {
+            discard error
+            .Err(failed("could not load configuration"))
+        }
+    }
+}
+
+fn saveConfig($value own config.Config) Result<void, failure> {
+    const saving = spawn config.Save($value, $config.DefaultPath())
+    const saved = $saving.wait()
+    match saved {
+        Ok: .Ok
+        Err(error): {
+            discard error
+            .Err(failed("could not save configuration"))
+        }
+    }
+}

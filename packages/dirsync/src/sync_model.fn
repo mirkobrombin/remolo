@@ -6,6 +6,10 @@ struct Options {
     Delete bool
     DryRun bool
     Excludes own Excluder
+
+    fn AddExclude(&self, pattern String) void {
+        self.Excludes.Add(pattern)
+    }
 }
 
 struct Stats {

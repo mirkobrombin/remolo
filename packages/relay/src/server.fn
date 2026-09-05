@@ -88,7 +88,8 @@ task Serve($server own Server) Result<void, Error> {
         }
         handlers.Start(spawn announce($connection, requests.clone()))
     }
-    handlers.Cancel()
+    const stopping = handlers.CancelTask()
+    discard $stopping.wait()
     discard active
     discard requests
     $actor.wait()
@@ -174,7 +175,8 @@ task runBroker($receiver Receiver<relayRequest>) void {
             }
         }
     }
-    relays.Cancel()
+    const stopping = relays.CancelTask()
+    discard $stopping.wait()
     discard waiting
 }
 
@@ -326,7 +328,8 @@ task splice($left own peer, $right own peer) void {
     const second = $secondPending.wait()
     const worker.GroupNext { Group as completed Value as secondValue } = second
     discard secondValue
-    completed.Shutdown()
+    const stopping = completed.ShutdownTask()
+    discard $stopping.wait()
 }
 
 task copy(

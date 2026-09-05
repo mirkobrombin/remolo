@@ -2,10 +2,14 @@ package remolo.cli
 
 import remolo.protocol
 import remolo.session
+import remolo.token
 import std.bytes
 import std.env
+import std.io
+import std.net
 import std.terminal
 import std.text
+import std.time
 
 struct terminalForwardOutcome {
     Writer Option<own session.PTYWriter>
@@ -16,12 +20,98 @@ struct terminalForwardOutcome {
 fn runShell(args [String]) Result<i32, failure> {
     if len(args) < 2 return .Err(invalid("shell requires a token"))
     const parsed = parseConnectOptions(args) else error { return .Err(error) }
-    const connectOptions { connection commandStart } = parsed
-    const client = connectTokenWith(args[1], $connection) else error {
+    const connectOptions {
+        connection
+        commandStart
+        resume
+        record
+        jump
+        forwardAgent
+        sshAddress
+        sshUser
+        sshKey
+        sshKnownHosts
+        sshTarget
+    } = parsed
+    discard sshAddress
+    discard sshUser
+    discard sshKey
+    discard sshKnownHosts
+    discard sshTarget
+    if resume {
+        discard connection
+        discard jump
+        if !text.IsEmpty(record) {
+            return .Err(invalid("--record cannot be combined with --resume"))
+        }
+        discard record
+        return runRoamingShell(args, commandStart)
+    }
+    const connecting = if text.IsEmpty(jump) {
+        discard jump
+        if forwardAgent {
+            connectTokenDedicatedWith(args[1], $connection)
+        } else {
+            connectTokenWith(args[1], $connection)
+        }
+    } else {
+        discard connection
+        connectViaJump(args[1], jump)
+    }
+    const client = match connecting {
+        Ok(value): value
+        Err(error): {
+            discard error
+            const fallback = manualFallback(args, forwardAgent) else failureValue {
+                return .Err(failureValue)
+            }
+            fallback
+        }
+    }
+    const prepared = if forwardAgent {
+        enableAgentForward($client)
+    } else {
+        Result<own session.Client, failure>.Ok(client)
+    }
+    const activeClient = prepared else error { return .Err(error) }
+    const openedTerminal = terminal.Open() else error {
+        discard error
+        session.CloseClient($activeClient)
+        return .Err(failed("standard input is not an interactive terminal"))
+    }
+    const terminal.Terminal {
+        Size
+        Reader as localReader
+        Controller as localController
+    } = openedTerminal
+    const opening = spawn openCastRecorder($record, Size)
+    const recording = $opening.wait() else error {
+        discard localReader
+        discard localController
+        session.CloseClient($activeClient)
+        return .Err(error)
+    }
+    const descriptor = shellDescriptor(args, commandStart, Size)
+    runTerminalSession(
+        $activeClient,
+        $localReader,
+        $localController,
+        $descriptor,
+        $recording
+    )
+}
+
+fn runExecTerminal(
+    tokenValue String,
+    $descriptor protocol.Open
+) Result<i32, failure> {
+    const client = connectToken(tokenValue) else error {
+        discard descriptor
         return .Err(error)
     }
     const openedTerminal = terminal.Open() else error {
         discard error
+        discard descriptor
         session.CloseClient($client)
         return .Err(failed("standard input is not an interactive terminal"))
     }
@@ -30,12 +120,41 @@ fn runShell(args [String]) Result<i32, failure> {
         Reader as localReader
         Controller as localController
     } = openedTerminal
-    const descriptor = shellDescriptor(args, commandStart, Size)
+    var selected = descriptor
+    selected.Cols = Size.Columns
+    selected.Rows = Size.Rows
+    selected.Term = terminalName()
+    const recordingTask = spawn openCastRecorder($"", Size)
+    const recording = $recordingTask.wait() else error {
+        discard error
+        discard localReader
+        discard localController
+        discard selected
+        session.CloseClient($client)
+        return .Err(failed("could not initialize terminal output"))
+    }
+    runTerminalSession(
+        $client,
+        $localReader,
+        $localController,
+        $selected,
+        $recording
+    )
+}
+
+fn runTerminalSession(
+    $client own session.Client,
+    $localReader own terminal.Reader,
+    $localController own terminal.Controller,
+    $descriptor protocol.Open,
+    $recording own castRecorder
+) Result<i32, failure> {
     const opening = spawn session.OpenPTY(client.Handle(), $descriptor)
     const opened = $opening.wait() else error {
         discard localReader
         discard localController
         session.CloseClient($client)
+        discard recording
         discard error
         return .Err(failed("could not open the remote terminal"))
     }
@@ -46,7 +165,7 @@ fn runShell(args [String]) Result<i32, failure> {
     } = opened
     var terminalControl = localController
     const input = spawn forwardTerminalInput($localReader, $remoteWriter)
-    const output = spawn forwardTerminalOutput($remoteReader)
+    const output = spawn forwardTerminalOutput($remoteReader, $recording)
     const result = $output.wait()
     discard terminalControl.Close()
     discard terminalControl
@@ -59,6 +178,318 @@ fn runShell(args [String]) Result<i32, failure> {
     discard $closing.wait()
     session.CloseClient($client)
     result
+}
+
+fn manualFallback(
+    args [String],
+    dedicated bool
+) Result<own session.Client, failure> {
+    writeStdoutText("\nremolo: could not reach the host automatically.\n") else error {
+        return .Err(error)
+    }
+    var attempt u64 = 0
+    while attempt < 3 {
+        writeStdoutText(
+            "Enter the host's public IP[:port] (press enter to cancel): "
+        ) else error {
+            return .Err(error)
+        }
+        const reading = spawn io.ReadStdinLine()
+        const input = $reading.wait() else error {
+            discard error
+            return .Err(failed("could not read the fallback address"))
+        }
+        const value = match input {
+            Some(line): line
+            None: { return .Err(failed("no reachable host")) }
+        }
+        if text.IsEmpty(value) return .Err(failed("no reachable host"))
+        const candidate = manualCandidate(value, args[1]) else error {
+            discard error
+            writeError("remolo: invalid host address\n")
+            attempt += 1
+            continue
+        }
+        const parsed = parseConnectOptions(args) else error {
+            return .Err(error)
+        }
+        const connectOptions {
+            connection
+            commandStart
+            resume
+            record
+            jump
+            forwardAgent
+            sshAddress
+            sshUser
+            sshKey
+            sshKnownHosts
+            sshTarget
+        } = parsed
+        discard commandStart
+        discard resume
+        discard record
+        discard jump
+        discard sshAddress
+        discard sshUser
+        discard sshKey
+        discard sshKnownHosts
+        discard sshTarget
+        var selected = connection
+        selected.Preferred = .Some(candidate)
+        const client = if dedicated {
+            connectTokenDedicatedWith(args[1], $selected)
+        } else {
+            connectTokenWith(args[1], $selected)
+        }
+        match client {
+            Ok(connected): { return .Ok(connected) }
+            Err(error): {
+                discard error
+                writeError("remolo: host is still unreachable\n")
+            }
+        }
+        attempt += 1
+    }
+    .Err(failed("host remained unreachable after manual attempts"))
+}
+
+fn enableAgentForward(
+    $client own session.Client
+) Result<own session.Client, failure> {
+    const configured = env.Get("SSH_AUTH_SOCK") else error {
+        discard error
+        session.CloseClient($client)
+        return .Err(failed("could not read SSH_AUTH_SOCK"))
+    }
+    const socketPath = match configured {
+        Some(value): {
+            if !text.IsEmpty(value) return forwardAgentClient($client, $value)
+            value
+        }
+        None: ""
+    }
+    discard socketPath
+    session.CloseClient($client)
+    .Err(failed("no local SSH agent; SSH_AUTH_SOCK is unset"))
+}
+
+fn forwardAgentClient(
+    $client own session.Client,
+    $socketPath String
+) Result<own session.Client, failure> {
+    const forwarding = spawn session.ForwardAgent($client, $socketPath)
+    const forwarded = $forwarding.wait()
+    match forwarded {
+        Ok(value): .Ok(value)
+        Err(error): {
+            discard error
+            .Err(failed("the host declined SSH agent forwarding"))
+        }
+    }
+}
+
+fn manualCandidate(
+    value String,
+    encodedToken String
+) Result<token.Candidate, failure> {
+    const endpoint = net.ParseEndpoint(value)
+    match endpoint {
+        Ok(parsed): {
+            const net.Endpoint { Host Port } = parsed
+            return .Ok(token.Candidate { IP = Host Port = Port })
+        }
+        Err(error): { discard error }
+    }
+    const port = tokenDefaultPort(encodedToken) else error {
+        return .Err(error)
+    }
+    .Ok(token.Candidate { IP = text.Copy(value) Port = port })
+}
+
+fn tokenDefaultPort(value String) Result<u16, failure> {
+    const decoded = token.Decode(value) else error {
+        discard error
+        return .Err(invalid("fallback aliases require an explicit port"))
+    }
+    const token.Token {
+        Version
+        HostPublicKey
+        PSK
+        Candidates
+        SessionID
+        Expiry
+        Rendezvous
+    } = decoded
+    discard Version
+    discard HostPublicKey
+    discard PSK
+    discard SessionID
+    discard Expiry
+    discard Rendezvous
+    var pending = Candidates
+    const first = pending.PopFront()
+    discard pending
+    match first {
+        Some(candidate): {
+            const token.Candidate { IP Port } = candidate
+            discard IP
+            if Port != 0 return .Ok(Port)
+        }
+        None: {}
+    }
+    .Err(invalid("the token does not contain a default port"))
+}
+
+fn runRoamingShell(
+    args [String],
+    commandStart usize
+) Result<i32, failure> {
+    const random = bytes.Random(16) else error {
+        discard error
+        return .Err(failed("could not create a resume id"))
+    }
+    const resumeID = encodeHex($random) else error { return .Err(error) }
+    const started = time.MonotonicNow()
+    var reconnecting = true
+    while reconnecting {
+        const elapsed = time.MonotonicNow().Since(started) else error {
+            discard error
+            return .Err(failed("could not measure the reconnect timeout"))
+        }
+        if elapsed.Seconds() > 90 { reconnecting = false }
+        if !reconnecting { continue }
+        const parsed = parseConnectOptions(args) else error {
+            return .Err(error)
+        }
+        const connectOptions {
+            connection
+            commandStart as ignored
+            resume
+            record
+            jump
+            forwardAgent
+            sshAddress
+            sshUser
+            sshKey
+            sshKnownHosts
+            sshTarget
+        } = parsed
+        discard ignored
+        discard resume
+        discard record
+        discard jump
+        discard forwardAgent
+        discard sshAddress
+        discard sshUser
+        discard sshKey
+        discard sshKnownHosts
+        discard sshTarget
+        const connecting = if forwardAgent {
+            connectTokenDedicatedWith(args[1], $connection)
+        } else {
+            connectTokenWith(args[1], $connection)
+        }
+        const connected = connecting else error {
+            discard error
+            const waiting = spawn waitReconnect()
+            discard $waiting.wait()
+            continue
+        }
+        const prepared = if forwardAgent {
+            enableAgentForward($connected)
+        } else {
+            Result<own session.Client, failure>.Ok(connected)
+        }
+        const client = prepared else error {
+            discard error
+            const waiting = spawn waitReconnect()
+            discard $waiting.wait()
+            continue
+        }
+        const result = runTerminalCycle(
+            args,
+            commandStart,
+            resumeID,
+            $client
+        )
+        match result {
+            Ok(code): { return .Ok(code) }
+            Err(error): {
+                discard error
+                writeError("\r\n[remolo: connection lost, reconnecting...]\r\n")
+                const waiting = spawn waitReconnect()
+                discard $waiting.wait()
+            }
+        }
+    }
+    .Err(failed("host remained unreachable for 90 seconds"))
+}
+
+fn runTerminalCycle(
+    args [String],
+    commandStart usize,
+    resumeID String,
+    $client own session.Client
+) Result<i32, failure> {
+    const openedTerminal = terminal.Open() else error {
+        discard error
+        session.CloseClient($client)
+        return .Err(failed("standard input is not an interactive terminal"))
+    }
+    const terminal.Terminal {
+        Size
+        Reader as localReader
+        Controller as localController
+    } = openedTerminal
+    var descriptor = shellDescriptor(args, commandStart, Size)
+    descriptor.ResumeID = text.Copy(resumeID)
+    const recordingTask = spawn openCastRecorder($"", Size)
+    const recording = $recordingTask.wait() else error {
+        discard error
+        discard localReader
+        discard localController
+        discard descriptor
+        session.CloseClient($client)
+        return .Err(failed("could not initialize terminal output"))
+    }
+    const opening = spawn session.OpenPTY(client.Handle(), $descriptor)
+    const opened = $opening.wait() else error {
+        discard localReader
+        discard localController
+        session.CloseClient($client)
+        discard recording
+        discard error
+        return .Err(failed("could not reattach the remote terminal"))
+    }
+    const session.RemotePTY {
+        Reader as remoteReader
+        Writer as remoteWriter
+        Controller as remoteController
+    } = opened
+    var terminalControl = localController
+    const input = spawn forwardTerminalInput($localReader, $remoteWriter)
+    const output = spawn forwardTerminalOutput($remoteReader, $recording)
+    const result = $output.wait()
+    discard terminalControl.Close()
+    discard terminalControl
+    discard $input.wait()
+    const closing = spawn session.ClosePTYChannel($remoteController)
+    discard $closing.wait()
+    session.CloseClient($client)
+    result
+}
+
+task waitReconnect() void {
+    const Channel { sender receiver } = channel<void>(0)
+    var waiting = receiver
+    select {
+        waiting.receive(): {}
+        timeout 1.seconds: {}
+        else error: { discard error }
+    }
+    discard sender
+    discard waiting
 }
 
 task forwardTerminalInput(
@@ -180,10 +611,15 @@ task forwardTerminalEOF(
 }
 
 task forwardTerminalOutput(
-    $reader own session.PTYReader
+    $reader own session.PTYReader,
+    $recording own castRecorder
 ) Result<i32, failure> {
     var source = reader
-    while true {
+    var recorder = recording
+    var code i32 = 0
+    var remoteError = ""
+    var finished = false
+    while !finished {
         const reading = spawn session.ReadPTY($source)
         const outcome = $reading.wait()
         const session.PTYReadOutcome { Reader Value } = outcome
@@ -195,21 +631,54 @@ task forwardTerminalOutput(
         }
         match event {
             Data(value): {
-                writeStdoutBytes(value) else error {
+                const copy = value.Copy() else error {
+                    discard error
                     discard source
+                    discard recorder
+                    return .Err(failed("could not copy terminal output"))
+                }
+                writeStdoutBytes(value) else error {
+                    discard copy
+                    discard source
+                    discard recorder
                     return .Err(error)
+                }
+                const castRecorder { sender actor enabled } = recorder
+                var destination = sender
+                if enabled {
+                    const sent = destination.send(.Output(value = copy))
+                    sent else error {
+                        discard error
+                        discard source
+                        discard destination
+                        discard actor
+                        return .Err(failed("session recording channel closed"))
+                    }
+                } else {
+                    discard copy
+                }
+                recorder = own castRecorder {
+                    sender = destination
+                    actor = actor
+                    enabled = enabled
                 }
             }
             Exit(value): {
-                discard source
-                if !text.IsEmpty(value.Error) {
-                    return .Err(failed("remote terminal: " + value.Error))
-                }
-                return .Ok(value.Code)
+                const protocol.Exit { Code Error } = value
+                code = Code
+                remoteError = Error
+                finished = true
             }
         }
     }
-    .Ok(0)
+    discard source
+    const closing = spawn closeCastRecorder($recorder)
+    const closed = $closing.wait()
+    closed else error { return .Err(error) }
+    if !text.IsEmpty(remoteError) {
+        return .Err(failed("remote terminal: " + remoteError))
+    }
+    .Ok(code)
 }
 
 fn shellDescriptor(

@@ -1,0 +1,639 @@
+package remolo.config
+
+import std.collections
+import std.env
+import std.fs
+import std.json
+import std.path
+import std.text
+
+enum Error {
+    InvalidDocument
+    Storage
+}
+
+struct Alias {
+    Name String
+    Token String
+    Rendezvous String
+    Relay String
+    Note String
+    HostKey String
+    Candidates own collections.List<String>
+}
+
+struct Group {
+    Name String
+    Members own collections.List<String>
+}
+
+struct Defaults {
+    Rendezvous String
+    Relay String
+}
+
+struct Config {
+    Aliases own collections.List<own Alias>
+    Groups own collections.List<own Group>
+    DefaultValues Defaults
+
+    fn TakeAlias(&self, name String) Option<own Alias> {
+        var pending = replace self.Aliases with collections.NewList<own Alias>()
+        var remaining = collections.NewList<own Alias>()
+        var found Option<own Alias> = .None
+        var selected = false
+        while !pending.IsEmpty() {
+            const current = aliasValue(pending.PopFront())
+            if current.Name == name && !selected {
+                found = .Some(current)
+                selected = true
+            } else {
+                remaining.PushFront($current)
+            }
+        }
+        discard pending
+        self.Aliases = reverseAliases($remaining)
+        found
+    }
+
+    fn SetAlias(&self, $value own Alias) void {
+        const old = self.TakeAlias(value.Name)
+        discard old
+        self.Aliases.PushFront($value)
+    }
+
+    fn RemoveAlias(&self, name String) bool {
+        const selected = self.TakeAlias(name)
+        match selected {
+            None: false
+            Some(value): {
+                discard value
+                true
+            }
+        }
+    }
+
+    fn TakeGroup(&self, name String) Option<own Group> {
+        var pending = replace self.Groups with collections.NewList<own Group>()
+        var remaining = collections.NewList<own Group>()
+        var found Option<own Group> = .None
+        var selected = false
+        while !pending.IsEmpty() {
+            const current = groupValue(pending.PopFront())
+            if current.Name == name && !selected {
+                found = .Some(current)
+                selected = true
+            } else {
+                remaining.PushFront($current)
+            }
+        }
+        discard pending
+        self.Groups = reverseGroups($remaining)
+        found
+    }
+
+    fn SetGroup(&self, $value own Group) void {
+        const old = self.TakeGroup(value.Name)
+        discard old
+        self.Groups.PushFront($value)
+    }
+
+    fn RemoveGroup(&self, name String) bool {
+        const selected = self.TakeGroup(name)
+        match selected {
+            None: false
+            Some(value): {
+                discard value
+                true
+            }
+        }
+    }
+
+    fn TakeAliases(&self) own collections.List<own Alias> {
+        const values = replace self.Aliases with collections.NewList<own Alias>()
+        sortAliases($values)
+    }
+
+    fn TakeGroups(&self) own collections.List<own Group> {
+        const values = replace self.Groups with collections.NewList<own Group>()
+        sortGroups($values)
+    }
+}
+
+fn NewAlias(name String, token String) own Alias {
+    own Alias {
+        Name = text.Copy(name)
+        Token = text.Copy(token)
+        Rendezvous = ""
+        Relay = ""
+        Note = ""
+        HostKey = ""
+        Candidates = collections.NewList<String>()
+    }
+}
+
+fn NewGroup(name String, $members own collections.List<String>) own Group {
+    own Group { Name = text.Copy(name) Members = members }
+}
+
+fn Empty() own Config {
+    own Config {
+        Aliases = collections.NewList<own Alias>()
+        Groups = collections.NewList<own Group>()
+        DefaultValues = Defaults { Rendezvous = "" Relay = "" }
+    }
+}
+
+fn DefaultPath() String {
+    const configured = env.Get("XDG_CONFIG_HOME") else error {
+        discard error
+        return homeConfigPath()
+    }
+    match configured {
+        Some(root): path.Join(path.Join(root, "remolo"), "config.json")
+        None: homeConfigPath()
+    }
+}
+
+fn homeConfigPath() String {
+    const home = env.Home() else error {
+        discard error
+        return path.Join(path.Join(".config", "remolo"), "config.json")
+    }
+    match home {
+        Some(root): path.Join(path.Join(path.Join(root, ".config"), "remolo"), "config.json")
+        None: path.Join(path.Join(".config", "remolo"), "config.json")
+    }
+}
+
+task Load($source String) Result<own Config, Error> {
+    const reading = spawn fs.ReadPrivateTextLimited($source, 1048576)
+    const result = $reading.wait()
+    match result {
+        Ok(document): Decode(document)
+        Err(error): loadFailure(error)
+    }
+}
+
+task Save(
+    $config own Config,
+    $destination String
+) Result<void, Error> {
+    const encoded = Encode($config) else error {
+        return .Err(error)
+    }
+    const directory = path.Parent(destination)
+    const creating = spawn fs.CreatePrivateDirectory($directory)
+    const created = $creating.wait()
+    match created {
+        Ok: {}
+        Err(error): {
+            discard error
+            return .Err(.Storage)
+        }
+    }
+    const writing = spawn fs.WritePrivateTextAtomic(
+        $destination,
+        $(encoded + "\n"),
+        1048576
+    )
+    const written = $writing.wait()
+    match written {
+        Ok: .Ok
+        Err(error): {
+            discard error
+            .Err(.Storage)
+        }
+    }
+}
+
+fn Decode(source String) Result<own Config, Error> {
+    const parsed = json.Parse(source) else error {
+        discard error
+        return .Err(.InvalidDocument)
+    }
+    const root = match parsed {
+        Object(value): value
+        _: { return .Err(.InvalidDocument) }
+    }
+    var object = root
+    var result = Empty()
+    const aliases = object.Take("aliases")
+    match aliases {
+        Some(value): {
+            decodeAliases(&result, $value) else error { return .Err(error) }
+        }
+        None: {}
+    }
+    const groups = object.Take("groups")
+    match groups {
+        Some(value): {
+            decodeGroups(&result, $value) else error { return .Err(error) }
+        }
+        None: {}
+    }
+    const defaults = object.Take("defaults")
+    match defaults {
+        Some(value): {
+            decodeDefaults(&result, $value) else error { return .Err(error) }
+        }
+        None: {}
+    }
+    .Ok(result)
+}
+
+fn Encode($config own Config) Result<String, Error> {
+    const Config { Aliases Groups DefaultValues } = config
+    var root = json.NewObject()
+    const aliasObject = encodeAliases($Aliases) else error {
+        return .Err(error)
+    }
+    set(&root, "aliases", $ .Object(aliasObject)) else error {
+        return .Err(error)
+    }
+    const defaults = encodeDefaults(DefaultValues) else error {
+        return .Err(error)
+    }
+    set(&root, "defaults", $ .Object(defaults)) else error {
+        return .Err(error)
+    }
+    const groups = encodeGroups($Groups) else error {
+        return .Err(error)
+    }
+    if groups.Len() > 0 {
+        set(&root, "groups", $ .Object(groups)) else error {
+            return .Err(error)
+        }
+    }
+    const result = json.Stringify(.Object(root)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn decodeAliases(
+    &config Config,
+    $value json.Value
+) Result<void, Error> {
+    const aliases = match value {
+        Object(found): found
+        _: { return .Err(.InvalidDocument) }
+    }
+    var pending = aliases
+    while pending.Len() > 0 {
+        const name = firstKey(&pending) else error { return .Err(error) }
+        const selected = pending.Take(name)
+        const encoded = requiredValue($selected) else error {
+            return .Err(error)
+        }
+        const alias = decodeAlias(name, $encoded) else error {
+            return .Err(error)
+        }
+        config.SetAlias($alias)
+    }
+    .Ok
+}
+
+fn decodeAlias(name String, $value json.Value) Result<own Alias, Error> {
+    const fields = match value {
+        Object(found): found
+        _: { return .Err(.InvalidDocument) }
+    }
+    var object = fields
+    var result = NewAlias(name, "")
+    const token = takeText(&object, "token") else error { return .Err(error) }
+    result.Token = token
+    const rendezvous = takeText(&object, "rendezvous") else error {
+        return .Err(error)
+    }
+    result.Rendezvous = rendezvous
+    const relay = takeText(&object, "relay") else error { return .Err(error) }
+    result.Relay = relay
+    const note = takeText(&object, "note") else error { return .Err(error) }
+    result.Note = note
+    const hostKey = takeText(&object, "host_key") else error {
+        return .Err(error)
+    }
+    result.HostKey = hostKey
+    const candidates = object.Take("candidates")
+    match candidates {
+        Some(value): {
+            const decoded = decodeStrings($value) else error {
+                return .Err(error)
+            }
+            result.Candidates = decoded
+        }
+        None: {}
+    }
+    .Ok(result)
+}
+
+fn decodeGroups(
+    &config Config,
+    $value json.Value
+) Result<void, Error> {
+    const groups = match value {
+        Object(found): found
+        _: { return .Err(.InvalidDocument) }
+    }
+    var pending = groups
+    while pending.Len() > 0 {
+        const name = firstKey(&pending) else error { return .Err(error) }
+        const selected = pending.Take(name)
+        const encoded = requiredValue($selected) else error {
+            return .Err(error)
+        }
+        const members = decodeStrings($encoded) else error {
+            return .Err(error)
+        }
+        config.SetGroup($NewGroup(name, $members))
+    }
+    .Ok
+}
+
+fn decodeDefaults(
+    &config Config,
+    $value json.Value
+) Result<void, Error> {
+    const fields = match value {
+        Object(found): found
+        _: { return .Err(.InvalidDocument) }
+    }
+    var object = fields
+    const rendezvous = takeText(&object, "rendezvous") else error {
+        return .Err(error)
+    }
+    config.DefaultValues.Rendezvous = rendezvous
+    const relay = takeText(&object, "relay") else error {
+        return .Err(error)
+    }
+    config.DefaultValues.Relay = relay
+    .Ok
+}
+
+fn encodeAliases(
+    $values own collections.List<own Alias>
+) Result<own json.Object, Error> {
+    var pending = sortAliases($values)
+    var object = json.NewObject()
+    while !pending.IsEmpty() {
+        const alias = aliasValue(pending.PopFront())
+        const name = text.Copy(alias.Name)
+        const encoded = encodeAlias($alias) else error { return .Err(error) }
+        object.Set($name, $ .Object(encoded)) else error {
+            discard error
+            return .Err(.Storage)
+        }
+    }
+    .Ok(object)
+}
+
+fn encodeAlias($value own Alias) Result<own json.Object, Error> {
+    const Alias {
+        Name
+        Token
+        Rendezvous
+        Relay
+        Note
+        HostKey
+        Candidates
+    } = value
+    discard Name
+    var object = json.NewObject()
+    setOptionalText(&object, "token", Token) else error { return .Err(error) }
+    setOptionalText(&object, "rendezvous", Rendezvous) else error {
+        return .Err(error)
+    }
+    setOptionalText(&object, "relay", Relay) else error { return .Err(error) }
+    setOptionalText(&object, "note", Note) else error { return .Err(error) }
+    setOptionalText(&object, "host_key", HostKey) else error { return .Err(error) }
+    if !Candidates.IsEmpty() {
+        const array = encodeStrings($Candidates)
+        set(&object, "candidates", $ .Array(array)) else error {
+            return .Err(error)
+        }
+    } else {
+        discard Candidates
+    }
+    .Ok(object)
+}
+
+fn encodeGroups(
+    $values own collections.List<own Group>
+) Result<own json.Object, Error> {
+    var pending = sortGroups($values)
+    var object = json.NewObject()
+    while !pending.IsEmpty() {
+        const group = groupValue(pending.PopFront())
+        const Group { Name Members } = group
+        object.Set($Name, $ .Array(encodeStrings($Members))) else error {
+            discard error
+            return .Err(.Storage)
+        }
+    }
+    .Ok(object)
+}
+
+fn encodeDefaults(value Defaults) Result<own json.Object, Error> {
+    var object = json.NewObject()
+    setOptionalText(&object, "rendezvous", value.Rendezvous) else error {
+        return .Err(error)
+    }
+    setOptionalText(&object, "relay", value.Relay) else error {
+        return .Err(error)
+    }
+    .Ok(object)
+}
+
+fn decodeStrings(
+    $value json.Value
+) Result<own collections.List<String>, Error> {
+    const array = match value {
+        Array(found): found
+        _: { return .Err(.InvalidDocument) }
+    }
+    var pending = array
+    var reversed = collections.NewList<String>()
+    while pending.Len() > 0 {
+        const selected = requiredValue($pending.PopFront()) else error {
+            return .Err(error)
+        }
+        match selected {
+            Text(value): reversed.PushFront($value)
+            _: { return .Err(.InvalidDocument) }
+        }
+    }
+    .Ok(reverseStrings($reversed))
+}
+
+fn encodeStrings($values own collections.List<String>) own json.Array {
+    var pending = values
+    var array = json.NewArray()
+    while !pending.IsEmpty() {
+        array.Add(.Text(stringValue(pending.PopFront())))
+    }
+    array
+}
+
+fn set(
+    &object json.Object,
+    key String,
+    $value json.Value
+) Result<void, Error> {
+    object.Set($text.Copy(key), $value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setOptionalText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, Error> {
+    if text.IsEmpty(value) return .Ok
+    set(&object, key, $ .Text(text.Copy(value)))
+}
+
+fn takeText(&object json.Object, key String) Result<String, Error> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Ok("")
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.InvalidDocument)
+        }
+    }
+}
+
+fn firstKey(&object json.Object) Result<String, Error> {
+    match object.FirstKey() {
+        Some(value): .Ok(value)
+        None: .Err(.InvalidDocument)
+    }
+}
+
+fn requiredValue($value Option<json.Value>) Result<json.Value, Error> {
+    match value {
+        Some(found): .Ok(found)
+        None: .Err(.InvalidDocument)
+    }
+}
+
+fn loadFailure(error fs.Error) Result<own Config, Error> {
+    match error {
+        NotFound: .Ok(Empty())
+        Permission: .Err(.Storage)
+        InvalidPath: .Err(.Storage)
+        InvalidUtf8: .Err(.InvalidDocument)
+        LineTooLong: .Err(.InvalidDocument)
+        TooLarge: .Err(.InvalidDocument)
+        InvalidInterval: .Err(.Storage)
+        ResourceLimit: .Err(.Storage)
+        Cancelled: .Err(.Storage)
+        Closed: .Err(.Storage)
+        Io: .Err(.Storage)
+    }
+}
+
+fn aliasValue($value Option<own Alias>) own Alias {
+    match value {
+        Some(found): found
+        None: { panic("config alias invariant failed") }
+    }
+}
+
+fn sortAliases(
+    $values own collections.List<own Alias>
+) own collections.List<own Alias> {
+    var pending = values
+    var selected = collections.NewList<own Alias>()
+    while !pending.IsEmpty() {
+        var best = aliasValue(pending.PopFront())
+        var remaining = collections.NewList<own Alias>()
+        while !pending.IsEmpty() {
+            const candidate = aliasValue(pending.PopFront())
+            if text.Compare(candidate.Name, best.Name) < 0 {
+                remaining.PushFront($best)
+                best = candidate
+            } else {
+                remaining.PushFront($candidate)
+            }
+        }
+        selected.PushFront($best)
+        pending = reverseAliases($remaining)
+    }
+    reverseAliases($selected)
+}
+
+fn sortGroups(
+    $values own collections.List<own Group>
+) own collections.List<own Group> {
+    var pending = values
+    var selected = collections.NewList<own Group>()
+    while !pending.IsEmpty() {
+        var best = groupValue(pending.PopFront())
+        var remaining = collections.NewList<own Group>()
+        while !pending.IsEmpty() {
+            const candidate = groupValue(pending.PopFront())
+            if text.Compare(candidate.Name, best.Name) < 0 {
+                remaining.PushFront($best)
+                best = candidate
+            } else {
+                remaining.PushFront($candidate)
+            }
+        }
+        selected.PushFront($best)
+        pending = reverseGroups($remaining)
+    }
+    reverseGroups($selected)
+}
+
+fn groupValue($value Option<own Group>) own Group {
+    match value {
+        Some(found): found
+        None: { panic("config group invariant failed") }
+    }
+}
+
+fn stringValue($value Option<String>) String {
+    match value {
+        Some(found): found
+        None: { panic("config string invariant failed") }
+    }
+}
+
+fn reverseAliases(
+    $values own collections.List<own Alias>
+) own collections.List<own Alias> {
+    var pending = values
+    var result = collections.NewList<own Alias>()
+    while !pending.IsEmpty() {
+        result.PushFront($aliasValue(pending.PopFront()))
+    }
+    result
+}
+
+fn reverseGroups(
+    $values own collections.List<own Group>
+) own collections.List<own Group> {
+    var pending = values
+    var result = collections.NewList<own Group>()
+    while !pending.IsEmpty() {
+        result.PushFront($groupValue(pending.PopFront()))
+    }
+    result
+}
+
+fn reverseStrings(
+    $values own collections.List<String>
+) own collections.List<String> {
+    var pending = values
+    var result = collections.NewList<String>()
+    while !pending.IsEmpty() {
+        result.PushFront($stringValue(pending.PopFront()))
+    }
+    result
+}

@@ -147,6 +147,26 @@ struct ControlMessage {
     Type String
 }
 
+fn EncodeControlMessage(
+    $value ControlMessage
+) Result<own bytes.Bytes, MessageError> {
+    const ControlMessage { Type } = value
+    var object = json.NewObject()
+    setText(&object, "type", Type) else error { return .Err(error) }
+    encodeJSON($object)
+}
+
+fn DecodeControlMessage(
+    source bytes.Bytes
+) Result<ControlMessage, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const kind = requiredText(&object, "type") else error {
+        return .Err(error)
+    }
+    .Ok(ControlMessage { Type = kind })
+}
+
 fn NewOpen(kind Kind) Open {
     Open {
         Kind = kind

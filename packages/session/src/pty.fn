@@ -229,7 +229,6 @@ task pumpPTYInput(
     var source = reader
     var destination = writer
     var active = controller
-    var eof = false
     while true {
         const pending = spawn mux.ReadFrame($source)
         const outcome = $pending.wait()
@@ -237,7 +236,7 @@ task pumpPTYInput(
         source = Reader
         const frame = Value else error {
             discard error
-            if !eof { discard active.Abort() }
+            discard active.Abort()
             discard source
             discard destination
             discard active
@@ -250,8 +249,10 @@ task pumpPTYInput(
         }
         if eofFrame(Type) {
             discard Payload
-            eof = true
-            continue
+            discard source
+            discard destination
+            discard active
+            return
         }
         if !dataFrame(Type) {
             discard Payload

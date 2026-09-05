@@ -46,6 +46,16 @@ task serveNative(
         return .Err(error)
     }
     const desktopExchange { Reader Writer Selection } = exchange
+    if webRTCMode(Selection.Mode) {
+        const serving = spawn serveWebRTCNative(
+            $Reader,
+            $Writer,
+            $capturer,
+            Selection.FPS
+        )
+        const served = $serving.wait()
+        return served
+    }
     const input = startInput($Reader)
     var active = capturer
     var destination = Writer
@@ -102,6 +112,16 @@ task serveSynthetic(
         return .Err(error)
     }
     const desktopExchange { Reader Writer Selection } = exchange
+    if webRTCMode(Selection.Mode) {
+        const serving = spawn serveWebRTCSynthetic(
+            $Reader,
+            $Writer,
+            $capturer,
+            Selection.FPS
+        )
+        const served = $serving.wait()
+        return served
+    }
     const input = startInput($Reader)
     var active = capturer
     var destination = Writer
@@ -175,11 +195,6 @@ task desktopNegotiate(
         discard destination
         return .Err(error)
     }
-    if webRTCMode(selection.Mode) {
-        discard Reader
-        discard destination
-        return .Err(.InvalidMode)
-    }
     .Ok(desktopExchange {
         Reader = Reader
         Writer = destination
@@ -191,5 +206,6 @@ fn desktopHello(width u64, height u64) own Hello {
     var modes = collections.NewList<Mode>()
     modes.PushFront(.Diff)
     modes.PushFront(.Screenshot)
+    modes.PushFront(.WebRTC)
     own Hello { Modes = modes Width = width Height = height }
 }

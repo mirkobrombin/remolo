@@ -1,6 +1,7 @@
 package remolo.rpc
 
 import remolo.mux
+import std.bytes
 import std.collections
 import std.json
 
@@ -13,6 +14,13 @@ enum Error {
     File
     Execution
     System
+    Authentication
+    NotFound
+    AlreadyExists
+    Permission
+    NotEmpty
+    NotDirectory
+    IsDirectory
 }
 
 struct SysInfo {
@@ -42,6 +50,11 @@ struct ExecResult {
     Stdout String
     Stderr String
     Code i32
+}
+
+struct ReadResult {
+    Data own bytes.Bytes
+    EOF bool
 }
 
 struct Client {

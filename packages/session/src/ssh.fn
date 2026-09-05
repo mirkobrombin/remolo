@@ -1,0 +1,291 @@
+package remolo.session
+
+import foundation.worker
+import remolo.transport
+import std.bytes
+import std.format
+import std.net
+import std.process
+import std.text
+
+task connectSSH(
+    $rung own SSHRung,
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes
+) Result<own Client, Error> {
+    const SSHRung { Address User KeyPath KnownHosts Target } = rung
+    const endpoint = net.ParseEndpoint(Address) else error {
+        discard error
+        discard User
+        discard KeyPath
+        discard Target
+        discard hostPublicKey
+        discard psk
+        return .Err(.Transport)
+    }
+    const net.Endpoint { Host Port } = endpoint
+    const target = if text.IsEmpty(Target) {
+        text.Copy(Address)
+    } else {
+        discard Address
+        Target
+    }
+    const listener = net.Listen($"127.0.0.1", 0) else error {
+        discard error
+        discard Host
+        discard User
+        discard KeyPath
+        discard target
+        discard hostPublicKey
+        discard psk
+        return .Err(.Transport)
+    }
+    const localPort = listener.Port
+    var reservation = listener
+    discard reservation.Close()
+    discard reservation
+
+    const command = openSSHCommand(
+        Host,
+        Port,
+        User,
+        KeyPath,
+        KnownHosts,
+        target,
+        localPort
+    ) else error {
+        discard error
+        discard hostPublicKey
+        discard psk
+        return .Err(.Transport)
+    }
+    const prepared = process.PreparePTY($command, 80, 24) else error {
+        discard error
+        discard hostPublicKey
+        discard psk
+        return .Err(.Transport)
+    }
+    const starting = spawn process.StartPTY($prepared)
+    const startResult = $starting.wait()
+    const started = startResult else error {
+        discard error
+        discard hostPublicKey
+        discard psk
+        return .Err(.Transport)
+    }
+    const process.PTY {
+        Reader
+        Writer
+        Controller
+        Waiter
+    } = started
+    var controller = Controller
+    const connectionResult = connectSSHTarget(
+        localPort,
+        $hostPublicKey,
+        $psk,
+        0
+    )
+    const client = connectionResult else error {
+        discard error
+        discard controller.Abort()
+        discard Reader
+        discard Writer
+        const waiting = spawn process.WaitPTY($Waiter)
+        const waited = $waiting.wait()
+        discard waited
+        return .Err(.Transport)
+    }
+    const Channel { sender receiver } = channel<void>(1)
+    const supervisor = worker.NewSupervisor()
+    supervisor.Start(spawn holdSSHProcess(
+            $Reader,
+            $Writer,
+            $Waiter,
+            $receiver
+        ))
+    const owner = own RouteOwner {
+        supervisor = supervisor
+        stop = sender
+        controller = .None
+        processController = .Some(controller)
+    }
+    var connected = client
+    connected.route = .Some(owner)
+    .Ok(connected)
+}
+
+fn openSSHCommand(
+    host String,
+    port u16,
+    user String,
+    keyPath String,
+    knownHosts String,
+    target String,
+    localPort u64
+) Result<own process.Command, process.Error> {
+    const opened = process.Open("ssh", $process.DefaultOptions()) else error {
+        return .Err(error)
+    }
+    var command = opened
+    addSSHPolicy(&command, knownHosts) else error { return .Err(error) }
+    addSSHForward(&command, target, localPort) else error {
+        return .Err(error)
+    }
+    addSSHDestination(&command, host, port, user, keyPath) else error {
+        return .Err(error)
+    }
+    .Ok(command)
+}
+
+fn addSSHPolicy(
+    &command process.Command,
+    knownHosts String
+) Result<void, process.Error> {
+    command.AddArgument("-N") else error { return .Err(error) }
+    command.AddArgument("-o") else error { return .Err(error) }
+    command.AddArgument("ExitOnForwardFailure=yes") else error {
+        return .Err(error)
+    }
+    command.AddArgument("-o") else error { return .Err(error) }
+    command.AddArgument("BatchMode=yes") else error { return .Err(error) }
+    if !text.IsEmpty(knownHosts) {
+        command.AddArgument("-o") else error { return .Err(error) }
+        command.AddArgument("UserKnownHostsFile=" + knownHosts) else error {
+            return .Err(error)
+        }
+    } else {
+        discard knownHosts
+    }
+    .Ok
+}
+
+fn addSSHForward(
+    &command process.Command,
+    target String,
+    localPort u64
+) Result<void, process.Error> {
+    command.AddArgument("-L") else error { return .Err(error) }
+    command.AddArgument(
+        "127.0.0.1:" + format.U64(localPort) + ":" + target
+    ) else error {
+        return .Err(error)
+    }
+    .Ok
+}
+
+fn addSSHDestination(
+    &command process.Command,
+    host String,
+    port u16,
+    user String,
+    keyPath String
+) Result<void, process.Error> {
+    command.AddArgument("-p") else error { return .Err(error) }
+    command.AddArgument(format.U64(u64.From(port))) else error {
+        return .Err(error)
+    }
+    if !text.IsEmpty(keyPath) {
+        command.AddArgument("-i") else error { return .Err(error) }
+        command.AddArgument(keyPath) else error { return .Err(error) }
+    } else {
+        discard keyPath
+    }
+    const destination = if text.IsEmpty(user) {
+        text.Copy(host)
+    } else {
+        user + "@" + host
+    }
+    command.AddArgument(destination) else error { return .Err(error) }
+    .Ok
+}
+
+fn connectSSHTarget(
+    port u64,
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes,
+    attempt u64
+) Result<own Client, Error> {
+    const key = hostPublicKey.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const dialing = spawn transport.DialSecure(
+        $"127.0.0.1",
+        port,
+        $key
+    )
+    const dialed = $dialing.wait()
+    const secured = dialed else error {
+        discard error
+        if attempt >= 19 {
+            discard hostPublicKey
+            discard psk
+            return .Err(.Transport)
+        }
+        const waiting = spawn sshRetryDelay()
+        $waiting.wait()
+        return connectSSHTarget(
+            port,
+            $hostPublicKey,
+            $psk,
+            attempt + 1
+        )
+    }
+    const authPSK = psk.Copy() else error {
+        discard error
+        discard secured
+        return .Err(.Storage)
+    }
+    const authKey = hostPublicKey.Copy() else error {
+        discard error
+        discard secured
+        discard authPSK
+        return .Err(.Storage)
+    }
+    const authenticating = spawn connectSecured(
+        $secured,
+        $authPSK,
+        $authKey
+    )
+    const result = $authenticating.wait()
+    discard hostPublicKey
+    discard psk
+    result
+}
+
+task sshRetryDelay() void {
+    const Channel { sender receiver } = channel<void>(0)
+    var pending = receiver
+    select {
+        pending.receive(): {
+            discard sender
+            discard pending
+        }
+        timeout 100.milliseconds: {
+            discard sender
+            discard pending
+        }
+        else error: {
+            discard error
+            discard sender
+            discard pending
+        }
+    }
+}
+
+task holdSSHProcess(
+    $reader own process.PTYReader,
+    $writer own process.PTYWriter,
+    $waiter own process.PTYWaiter,
+    $stop Receiver<void>
+) void {
+    var stopping = stop
+    discard stopping.receive()
+    discard stopping
+    discard reader
+    discard writer
+    const waiting = spawn process.WaitPTY($waiter)
+    const waited = $waiting.wait()
+    discard waited
+}

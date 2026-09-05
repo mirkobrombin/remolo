@@ -1,0 +1,174 @@
+package remolo.cli
+
+import remolo.config
+import remolo.identity
+import remolo.rpc
+import remolo.session
+import remolo.token
+import std.bytes
+import std.collections
+import std.text
+
+fn runEnroll(args [String]) Result<i32, failure> {
+    if len(args) != 2 && len(args) != 4 {
+        return .Err(invalid("enroll requires TOKEN [--as NAME]"))
+    }
+    if len(args) == 4 && argument(args, 2) != "--as" {
+        return .Err(invalid("unknown enroll option: " + argument(args, 2)))
+    }
+    const source = argument(args, 1)
+    const descriptor = token.Decode(source) else error {
+        discard error
+        return .Err(invalid("invalid session token"))
+    }
+    const token.Token {
+        Version
+        HostPublicKey
+        PSK
+        Candidates
+        SessionID
+        Expiry
+        Rendezvous
+    } = descriptor
+    discard Version
+    discard PSK
+    discard SessionID
+    discard Expiry
+    const client = connectRawToken(
+        source,
+        $session.DefaultConnectOptions(),
+        false
+    ) else error {
+        discard HostPublicKey
+        discard Candidates
+        discard Rendezvous
+        return .Err(error)
+    }
+    const loading = spawn identity.LoadOrCreate($identity.DefaultClientKeyPath())
+    const loaded = $loading.wait()
+    const clientIdentity = loaded else error {
+        discard error
+        session.CloseClient($client)
+        discard HostPublicKey
+        discard Candidates
+        discard Rendezvous
+        return .Err(failed("could not load the client identity"))
+    }
+    const enrollmentKey = clientIdentity.RawPublicKey.Copy() else error {
+        discard error
+        discard clientIdentity
+        session.CloseClient($client)
+        discard HostPublicKey
+        discard Candidates
+        discard Rendezvous
+        return .Err(failed("could not prepare the client identity"))
+    }
+    const enrolling = spawn rpc.Enroll(
+        client.Handle(),
+        $enrollmentKey,
+        $"remolo client"
+    )
+    const enrolled = $enrolling.wait()
+    const accepted = enrolled else error {
+        discard error
+        discard clientIdentity
+        session.CloseClient($client)
+        discard HostPublicKey
+        discard Candidates
+        discard Rendezvous
+        return .Err(failed("host enrollment failed"))
+    }
+    discard accepted
+    const capabilities = client.Capabilities()
+    const hostname = text.Copy(capabilities.Hostname)
+    discard capabilities
+    session.CloseClient($client)
+    const fingerprint = identity.Fingerprint(clientIdentity.RawPublicKey) else error {
+        discard clientIdentity
+        discard HostPublicKey
+        discard Candidates
+        discard Rendezvous
+        discard error
+        return .Err(failed("could not fingerprint the client identity"))
+    }
+    discard clientIdentity
+    const hostKey = bytes.EncodeBase64(HostPublicKey) else error {
+        discard error
+        discard Candidates
+        discard Rendezvous
+        return .Err(failed("could not encode the host identity"))
+    }
+    const endpoints = candidateStrings($Candidates)
+    var name = "enrolled"
+    if len(args) == 4 {
+        name = argument(args, 3)
+    } else {
+        if !text.IsEmpty(hostname) {
+            name = hostname
+        }
+    }
+    var value = config.NewAlias(name, "")
+    value.HostKey = hostKey
+    value.Candidates = endpoints
+    value.Rendezvous = Rendezvous
+    const configLoaded = loadConfig() else error {
+        discard value
+        return .Err(error)
+    }
+    var stored = configLoaded
+    stored.SetAlias($value)
+    saveConfig($stored) else error { return .Err(error) }
+    writeStdoutText(
+        "remolo: enrolled. Connect anytime with: remolo connect " + name +
+        "\nremolo: client key fingerprint " + fingerprint + "\n"
+    ) else error {
+        return .Err(error)
+    }
+    .Ok(0)
+}
+
+fn runRevoke(args [String]) Result<i32, failure> {
+    if len(args) != 2 return .Err(invalid("revoke requires FINGERPRINT"))
+    const removing = spawn identity.RemoveAuthorized(
+        $identity.DefaultAuthorizedPath(),
+        $argument(args, 1)
+    )
+    const result = $removing.wait()
+    const fingerprint = result else error {
+        return revokeFailure(error)
+    }
+    writeStdoutText("remolo: revoked client " + fingerprint + "\n") else error {
+        return .Err(error)
+    }
+    .Ok(0)
+}
+
+fn revokeFailure(error identity.IdentityError) Result<i32, failure> {
+    match error {
+        NotFound: .Err(failed("no enrolled client matches the fingerprint"))
+        _: .Err(failed("could not update authorized clients"))
+    }
+}
+
+fn candidateStrings(
+    $values own collections.List<token.Candidate>
+) own collections.List<String> {
+    var pending = values
+    var reversed = collections.NewList<String>()
+    while !pending.IsEmpty() {
+        const value = tokenCandidateValue(pending.PopFront())
+        reversed.PushFront($value.Addr())
+    }
+    reverseCLIStrings($reversed)
+}
+
+fn reverseCLIStrings(
+    $values own collections.List<String>
+) own collections.List<String> {
+    var pending = values
+    var result = collections.NewList<String>()
+    while !pending.IsEmpty() {
+        result.PushFront($stringValue(pending.PopFront()))
+    }
+    result
+}

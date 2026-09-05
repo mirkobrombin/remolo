@@ -1,0 +1,323 @@
+package remolo.desktop
+
+import remolo.mux
+import std.bytes
+import std.concurrent
+
+@concurrent.Transferable()
+struct rtcClientControl {
+    Channel own rtcController
+    SignalReader own mux.Reader
+    SignalWriter own mux.Writer
+    Stream mux.StreamControl
+}
+
+struct rtcClientOpen {
+    Reader own rtcReader
+    Writer own rtcWriter
+    Control own rtcClientControl
+}
+
+struct rtcFrameOutcome {
+    Reader own rtcReader
+    Decoder own Decoder
+    Value Result<Event, Error>
+}
+
+task openRTCClient(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $control mux.StreamControl
+) Result<rtcClientOpen, Error> {
+    const peer = openRTCPeer() else error {
+        discard reader
+        discard writer
+        discard control
+        return .Err(desktopRTCError(error))
+    }
+    const reading = spawn readRTCSignal($reader)
+    const offerResult = $reading.wait()
+    const offer = offerResult else error {
+        discard peer
+        discard writer
+        discard control
+        return .Err(error)
+    }
+    const rtcSignalRead { Reader Signal } = offer
+    const rtcSignal { Kind Type SDP } = Signal
+    if Kind != "offer" {
+        discard Kind
+        discard Type
+        discard SDP
+        discard peer
+        discard Reader
+        discard writer
+        discard control
+        return .Err(.Protocol)
+    }
+    discard Kind
+    setRTCRemote(peer, SDP, Type) else error {
+        discard peer
+        discard Reader
+        discard writer
+        discard control
+        return .Err(desktopRTCError(error))
+    }
+    discard Type
+    discard SDP
+    const accepting = spawn acceptRTCChannel(peer.Reference())
+    const describing = spawn localRTCDescription(peer.Reference(), $"answer")
+    const descriptionResult = $describing.wait()
+    const description = descriptionResult else error {
+        discard accepting
+        discard peer
+        discard Reader
+        discard writer
+        discard control
+        return .Err(desktopRTCError(error))
+    }
+    const signaling = spawn sendRTCSignal(
+        $writer,
+        $"answer",
+        $"answer",
+        $description
+    )
+    const signaled = $signaling.wait()
+    const destination = signaled else error {
+        discard accepting
+        discard peer
+        discard Reader
+        discard control
+        return .Err(error)
+    }
+    const acceptedResult = $accepting.wait()
+    const channel = acceptedResult else error {
+        discard peer
+        discard Reader
+        discard destination
+        discard control
+        return .Err(desktopRTCError(error))
+    }
+    const waiting = spawn waitRTCChannel($channel)
+    const readyResult = $waiting.wait()
+    const ready = readyResult else error {
+        discard peer
+        discard Reader
+        discard destination
+        discard control
+        return .Err(desktopRTCError(error))
+    }
+    discard peer
+    const split = ready.Split() else error {
+        discard Reader
+        discard destination
+        discard control
+        return .Err(desktopRTCError(error))
+    }
+    const rtcStream { Reader as source Writer Controller } = split
+    .Ok(rtcClientOpen {
+        Reader = source
+        Writer = Writer
+        Control = own rtcClientControl {
+            Channel = Controller
+            SignalReader = Reader
+            SignalWriter = destination
+            Stream = control
+        }
+    })
+}
+
+task readRTCFrame(
+    $reader own rtcReader,
+    $decoder own Decoder
+) rtcFrameOutcome {
+    var source = reader
+    var active = decoder
+    const firstPending = spawn readRTC($source)
+    const firstRead = $firstPending.wait()
+    const rtcReadOutcome { Reader Value } = firstRead
+    source = Reader
+    const first = Value else error {
+        discard error
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(.Closed)
+        }
+    }
+    const firstLength = frameLength(first)
+    if firstLength < 13 || frameByte(first, 0) != 1 {
+        discard first
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(.Protocol)
+        }
+    }
+    const sequence = frameU32(first, 1)
+    const total = frameU32(first, 5)
+    const firstOffset = frameU32(first, 9)
+    if firstOffset != 0 || total == 0 || total > 16777216 ||
+        firstLength - 13 > total {
+        discard first
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(.InvalidFrame)
+        }
+    }
+    const opened = bytes.NewBuilder(total) else error {
+        discard error
+        discard first
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(.Storage)
+        }
+    }
+    var frame = opened
+    const firstBody = first.Slice(13, firstLength) else error {
+        discard error
+        discard first
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(.Storage)
+        }
+    }
+    discard first
+    frame.Write(firstBody) else error {
+        discard error
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(.Storage)
+        }
+    }
+    var received = firstLength - 13
+    while received < total {
+        const pending = spawn readRTC($source)
+        const read = $pending.wait()
+        const rtcReadOutcome { Reader Value } = read
+        source = Reader
+        const message = Value else error {
+            discard error
+            return rtcFrameOutcome {
+                Reader = source
+                Decoder = active
+                Value = .Err(.Closed)
+            }
+        }
+        const length = frameLength(message)
+        if length < 13 || frameByte(message, 0) != 1 ||
+            frameU32(message, 1) != sequence ||
+            frameU32(message, 5) != total ||
+            frameU32(message, 9) != received ||
+            length - 13 > total - received {
+            discard message
+            return rtcFrameOutcome {
+                Reader = source
+                Decoder = active
+                Value = .Err(.InvalidFrame)
+            }
+        }
+        const body = message.Slice(13, length) else error {
+            discard error
+            discard message
+            return rtcFrameOutcome {
+                Reader = source
+                Decoder = active
+                Value = .Err(.Storage)
+            }
+        }
+        discard message
+        frame.Write(body) else error {
+            discard error
+            return rtcFrameOutcome {
+                Reader = source
+                Decoder = active
+                Value = .Err(.Storage)
+            }
+        }
+        received += length - 13
+    }
+    const encoded = frame.Finish() else error {
+        discard error
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(.Storage)
+        }
+    }
+    const decoded = DecodeFrame(&active, $encoded) else error {
+        return rtcFrameOutcome {
+            Reader = source
+            Decoder = active
+            Value = .Err(error)
+        }
+    }
+    rtcFrameOutcome {
+        Reader = source
+        Decoder = active
+        Value = .Ok(.Frame(value = $decoded))
+    }
+}
+
+task writeRTCInput(
+    $writer own rtcWriter,
+    $payload own bytes.Bytes
+) Result<own rtcWriter, Error> {
+    const length = frameLength(payload)
+    const opened = bytes.NewBuilder(length + 1) else error {
+        discard error
+        discard writer
+        discard payload
+        return .Err(.Storage)
+    }
+    var message = opened
+    frameWrite(&message, 2) else error { return .Err(error) }
+    message.Write(payload) else error {
+        discard error
+        discard writer
+        discard payload
+        return .Err(.Storage)
+    }
+    discard payload
+    const value = message.Finish() else error {
+        discard error
+        discard writer
+        return .Err(.Storage)
+    }
+    const sending = spawn writeRTC($writer, $value)
+    const outcome = $sending.wait()
+    const rtcWriteOutcome { Writer Value } = outcome
+    Value else error {
+        discard error
+        discard Writer
+        return .Err(.Closed)
+    }
+    .Ok(Writer)
+}
+
+task closeRTCClient(
+    $control own rtcClientControl
+) Result<void, Error> {
+    const rtcClientControl {
+        Channel
+        SignalReader
+        SignalWriter
+        Stream
+    } = control
+    var channel = Channel
+    discard channel.Close()
+    discard channel
+    discard SignalReader
+    discard SignalWriter
+    const closing = spawn mux.CloseStream($Stream)
+    const result = $closing.wait()
+    result else error {
+        discard error
+        return .Err(.Closed)
+    }
+    .Ok
+}

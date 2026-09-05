@@ -1,5 +1,6 @@
 package remolo.session
 
+import foundation.tls
 import remolo.crypto
 import remolo.mux
 import remolo.protocol
@@ -11,7 +12,37 @@ task connectSecured(
     $psk own bytes.Bytes,
     $hostPublicKey own bytes.Bytes
 ) Result<own Client, Error> {
-    var session = mux.NewClient($secured)
+    const pending = spawn connectMux(
+        $mux.NewClient($secured),
+        $psk,
+        $hostPublicKey
+    )
+    const result = $pending.wait()
+    result
+}
+
+task connectQUIC(
+    $connection own tls.OpenSSLQUICConnection,
+    $psk own bytes.Bytes,
+    $hostPublicKey own bytes.Bytes
+) Result<own Client, Error> {
+    const session = mux.NewQUICClient($connection) else error {
+        discard psk
+        discard hostPublicKey
+        discard error
+        return .Err(.Multiplex)
+    }
+    const pending = spawn connectMux($session, $psk, $hostPublicKey)
+    const result = $pending.wait()
+    result
+}
+
+task connectMux(
+    $opened own mux.Session,
+    $psk own bytes.Bytes,
+    $hostPublicKey own bytes.Bytes
+) Result<own Client, Error> {
+    var session = opened
     const handle = session.Handle()
     const opening = spawn mux.OpenChannel(
         $handle.Clone(),
@@ -48,6 +79,9 @@ task connectSecured(
         controlWriter = writer
         sessionKey = key
         capabilities = capabilities
+        daemon = .None
+        route = .None
+        agent = .None
     })
 }
 

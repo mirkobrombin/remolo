@@ -3,11 +3,13 @@ package remolo.rpc
 import remolo.mux
 import remolo.protocol
 import std.bytes
+import std.text
 import std.time
 
 task Serve(
     $channel mux.AcceptedChannel,
     $rootPath String,
+    $authorizedPath String,
     allowExec bool,
     startedAt time.MonotonicInstant
 ) Result<void, Error> {
@@ -16,12 +18,20 @@ task Serve(
         discard Open
         discard Stream
         discard rootPath
+        discard authorizedPath
         return .Err(.Protocol)
     }
     discard Open
     const mux.Stream { ID Reader Writer } = Stream
     discard ID
-    const serving = spawn serveRequests($Reader, $Writer, $rootPath, allowExec, startedAt)
+    const serving = spawn serveRequests(
+        $Reader,
+        $Writer,
+        $rootPath,
+        $authorizedPath,
+        allowExec,
+        startedAt
+    )
     const result = $serving.wait()
     result
 }
@@ -30,6 +40,7 @@ task serveRequests(
     $reader own mux.Reader,
     $writer own mux.Writer,
     $rootPath String,
+    $authorizedPath String,
     allowExec bool,
     startedAt time.MonotonicInstant
 ) Result<void, Error> {
@@ -58,6 +69,7 @@ task serveRequests(
             const next = result else error {
                 discard source
                 discard rootPath
+                discard authorizedPath
                 return .Err(error)
             }
             destination = next
@@ -65,7 +77,17 @@ task serveRequests(
         }
         const decoded = decodeRequest(requestText)
         const reply = match decoded {
-            Ok(value): dispatch($value, rootPath, allowExec, startedAt)
+            Ok(value): {
+                const dispatching = spawn dispatch(
+                    $value,
+                    $text.Copy(rootPath),
+                    $text.Copy(authorizedPath),
+                    allowExec,
+                    startedAt
+                )
+                const result = $dispatching.wait()
+                result
+            }
             Err(error): {
                 discard error
                 response { id = 0 result = .None error = "rpc: bad request" }
@@ -76,6 +98,7 @@ task serveRequests(
         const next = result else error {
             discard source
             discard rootPath
+            discard authorizedPath
             return .Err(error)
         }
         destination = next
@@ -83,6 +106,7 @@ task serveRequests(
     discard source
     discard destination
     discard rootPath
+    discard authorizedPath
     .Ok
 }
 

@@ -1,0 +1,413 @@
+package remolo.mux
+
+import foundation.tls
+import remolo.transport
+import std.bytes
+import std.concurrent
+import std.text
+
+enum readerBackend {
+    Yamux(value own yamuxReader)
+    QUIC(value own tls.OpenSSLQUICReader)
+}
+
+enum writerBackend {
+    Yamux(value own yamuxWriter)
+    QUIC(value own tls.OpenSSLQUICWriter)
+}
+
+enum controlBackend {
+    Yamux(value yamuxStreamControl)
+    QUIC(value own tls.OpenSSLQUICController)
+}
+
+enum handleBackend {
+    Yamux(value yamuxHandle)
+    QUIC(value own tls.OpenSSLQUICConnectionRef)
+}
+
+enum sessionBackend {
+    Yamux(value own yamuxSession)
+    QUIC(value own tls.OpenSSLQUICConnection)
+}
+
+@concurrent.Transferable()
+struct Reader {
+    inner readerBackend
+}
+
+@concurrent.Transferable()
+struct Writer {
+    inner writerBackend
+}
+
+@concurrent.Transferable()
+struct StreamControl {
+    inner controlBackend
+}
+
+@concurrent.Transferable()
+struct Stream {
+    ID u64
+    Reader own Reader
+    Writer own Writer
+
+    fn Control(self) StreamControl {
+        streamControlFor(self.Writer.inner)
+    }
+}
+
+struct ReadOutcome {
+    Reader own Reader
+    Value Result<own bytes.Bytes, Error>
+}
+
+struct WriteOutcome {
+    Writer own Writer
+    Value Result<void, Error>
+}
+
+struct Handle {
+    inner handleBackend
+    peer String
+
+    fn Clone(self) Handle {
+        cloneHandle(self.inner, self.peer)
+    }
+
+    fn PeerAddress(self) String {
+        text.Copy(self.peer)
+    }
+
+    fn Open(self) Task<Result<Stream, Error>> {
+        openHandle(self.inner)
+    }
+
+    fn Accept(self) Task<Result<Stream, Error>> {
+        acceptHandle(self.inner)
+    }
+}
+
+struct Session {
+    inner sessionBackend
+    handle Handle
+
+    fn Handle(self) Handle {
+        self.handle.Clone()
+    }
+
+    fn PeerAddress(self) String {
+        self.handle.PeerAddress()
+    }
+}
+
+fn NewClient($stream transport.SecureStream) own Session {
+    wrapYamux($newYamuxClient($stream))
+}
+
+fn NewServer($stream transport.SecureStream) own Session {
+    wrapYamux($newYamuxServer($stream))
+}
+
+fn NewQUICClient(
+    $connection own tls.OpenSSLQUICConnection
+) Result<own Session, Error> {
+    wrapQUIC($connection)
+}
+
+fn NewQUICServer(
+    $connection own tls.OpenSSLQUICConnection
+) Result<own Session, Error> {
+    wrapQUIC($connection)
+}
+
+task Read($reader own Reader) ReadOutcome {
+    const Reader { inner } = reader
+    match inner {
+        Yamux(value): {
+            const pending = spawn readYamux($value)
+            const outcome = $pending.wait()
+            const yamuxReadOutcome { Reader Value } = outcome
+            ReadOutcome {
+                Reader = own Reader { inner = .Yamux(value = Reader) }
+                Value = Value
+            }
+        }
+        QUIC(value): {
+            const pending = spawn tls.OpenSSLQUICRead($value, 65536)
+            const outcome = $pending.wait()
+            const tls.OpenSSLQUICReadOutcome { Reader Value } = outcome
+            ReadOutcome {
+                Reader = own Reader { inner = .QUIC(value = Reader) }
+                Value = quicReadResult($Value)
+            }
+        }
+    }
+}
+
+task ReadExact($reader own Reader, length u64) ReadOutcome {
+    const Reader { inner } = reader
+    match inner {
+        Yamux(value): {
+            const pending = spawn readExactYamux($value, length)
+            const outcome = $pending.wait()
+            const yamuxReadOutcome { Reader Value } = outcome
+            ReadOutcome {
+                Reader = own Reader { inner = .Yamux(value = Reader) }
+                Value = Value
+            }
+        }
+        QUIC(value): {
+            const pending = spawn tls.OpenSSLQUICReadExact($value, length)
+            const outcome = $pending.wait()
+            const tls.OpenSSLQUICReadOutcome { Reader Value } = outcome
+            ReadOutcome {
+                Reader = own Reader { inner = .QUIC(value = Reader) }
+                Value = quicReadResult($Value)
+            }
+        }
+    }
+}
+
+task WriteAll(
+    $writer own Writer,
+    $value own bytes.Bytes
+) WriteOutcome {
+    const Writer { inner } = writer
+    match inner {
+        Yamux(destination): {
+            const pending = spawn writeAllYamux($destination, $value)
+            const outcome = $pending.wait()
+            const yamuxWriteOutcome { Writer Value } = outcome
+            WriteOutcome {
+                Writer = own Writer { inner = .Yamux(value = Writer) }
+                Value = Value
+            }
+        }
+        QUIC(destination): {
+            const pending = spawn tls.OpenSSLQUICWriteAll($destination, $value)
+            const outcome = $pending.wait()
+            const tls.OpenSSLQUICWriteOutcome { Writer Value } = outcome
+            WriteOutcome {
+                Writer = own Writer { inner = .QUIC(value = Writer) }
+                Value = quicWriteResult(Value)
+            }
+        }
+    }
+}
+
+task CloseWriter($writer own Writer) Result<void, Error> {
+    const Writer { inner } = writer
+    match inner {
+        Yamux(value): {
+            const pending = spawn closeYamuxWriter($value)
+            const result = $pending.wait()
+            result
+        }
+        QUIC(value): {
+            const pending = spawn tls.OpenSSLQUICFinish($value)
+            const result = $pending.wait()
+            match result {
+                Ok: .Ok
+                Err(error): .Err(quicError(error))
+            }
+        }
+    }
+}
+
+task CloseStream($stream StreamControl) Result<void, Error> {
+    const StreamControl { inner } = stream
+    match inner {
+        Yamux(value): {
+            const pending = spawn closeYamuxStream($value)
+            const result = $pending.wait()
+            result
+        }
+        QUIC(value): {
+            var controller = value
+            const aborted = controller.Abort()
+            discard controller
+            if aborted return .Ok
+            .Err(.Closed)
+        }
+    }
+}
+
+fn Close($session own Session) void {
+    const Session { inner handle } = session
+    discard handle
+    match inner {
+        Yamux(value): closeYamux($value)
+        QUIC(value): {
+            var connection = value
+            discard connection.Close()
+            discard connection
+        }
+    }
+}
+
+fn wrapYamux($session own yamuxSession) own Session {
+    const handle = session.Handle()
+    const peer = handle.PeerAddress()
+    own Session {
+        inner = .Yamux(value = session)
+        handle = Handle { inner = .Yamux(value = handle) peer = peer }
+    }
+}
+
+fn wrapQUIC(
+    $connection own tls.OpenSSLQUICConnection
+) Result<own Session, Error> {
+    const peer = connection.PeerAddress() else error {
+        return .Err(quicError(error))
+    }
+    const reference = connection.Reference()
+    if !reference.Active() return .Err(.Closed)
+    .Ok(own Session {
+        inner = .QUIC(value = connection)
+        handle = Handle { inner = .QUIC(value = reference) peer = peer }
+    })
+}
+
+task openYamuxFacade($handle yamuxHandle) Result<Stream, Error> {
+    const opened = handle.Open()
+    const result = $opened.wait()
+    match result {
+        Ok(value): .Ok(wrapYamuxStream($value))
+        Err(error): .Err(error)
+    }
+}
+
+task acceptYamuxFacade($handle yamuxHandle) Result<Stream, Error> {
+    const accepted = handle.Accept()
+    const result = $accepted.wait()
+    match result {
+        Ok(value): .Ok(wrapYamuxStream($value))
+        Err(error): .Err(error)
+    }
+}
+
+task openQUIC(
+    $connection own tls.OpenSSLQUICConnectionRef
+) Result<Stream, Error> {
+    const pending = spawn tls.OpenSSLQUICOpenStream($connection)
+    const result = $pending.wait()
+    match result {
+        Ok(value): wrapQUICStream($value)
+        Err(error): .Err(quicError(error))
+    }
+}
+
+task acceptQUIC(
+    $connection own tls.OpenSSLQUICConnectionRef
+) Result<Stream, Error> {
+    const pending = spawn tls.OpenSSLQUICAcceptStream($connection)
+    const result = $pending.wait()
+    match result {
+        Ok(value): wrapQUICStream($value)
+        Err(error): .Err(quicError(error))
+    }
+}
+
+fn wrapYamuxStream($stream yamuxStream) Stream {
+    const yamuxStream { ID Reader Writer } = stream
+    Stream {
+        ID = ID
+        Reader = own Reader { inner = .Yamux(value = Reader) }
+        Writer = own Writer { inner = .Yamux(value = Writer) }
+    }
+}
+
+fn wrapQUICStream(
+    $stream own tls.OpenSSLQUICStream
+) Result<Stream, Error> {
+    const id = stream.ID()
+    const split = stream.SplitControlled() else error {
+        return .Err(quicError(error))
+    }
+    const tls.OpenSSLQUICControlledStream { Reader Writer Controller } = split
+    discard Controller
+    .Ok(Stream {
+        ID = id
+        Reader = own Reader { inner = .QUIC(value = Reader) }
+        Writer = own Writer { inner = .QUIC(value = Writer) }
+    })
+}
+
+fn quicControl(
+    writer tls.OpenSSLQUICWriter
+) own tls.OpenSSLQUICController {
+    const controller = writer.Control() else error {
+        discard error
+        panic("QUIC stream control unavailable")
+    }
+    controller
+}
+
+fn streamControlFor(inner writerBackend) StreamControl {
+    match inner {
+        Yamux(value): StreamControl {
+            inner = .Yamux(value = yamuxStreamControl {
+                id = value.id
+                control = value.control.clone()
+            })
+        }
+        QUIC(value): StreamControl {
+            inner = .QUIC(value = quicControl(value))
+        }
+    }
+}
+
+fn cloneHandle(inner handleBackend, peer String) Handle {
+    match inner {
+        Yamux(value): Handle {
+            inner = .Yamux(value = value.Clone())
+            peer = text.Copy(peer)
+        }
+        QUIC(value): Handle {
+            inner = .QUIC(value = value.Clone())
+            peer = text.Copy(peer)
+        }
+    }
+}
+
+fn openHandle(inner handleBackend) Task<Result<Stream, Error>> {
+    match inner {
+        Yamux(value): spawn openYamuxFacade(value.Clone())
+        QUIC(value): spawn openQUIC(value.Clone())
+    }
+}
+
+fn acceptHandle(inner handleBackend) Task<Result<Stream, Error>> {
+    match inner {
+        Yamux(value): spawn acceptYamuxFacade(value.Clone())
+        QUIC(value): spawn acceptQUIC(value.Clone())
+    }
+}
+
+fn quicReadResult(
+    $result Result<own bytes.Bytes, tls.Error>
+) Result<own bytes.Bytes, Error> {
+    match result {
+        Ok(value): .Ok(value)
+        Err(error): .Err(quicError(error))
+    }
+}
+
+fn quicWriteResult(
+    result Result<void, tls.Error>
+) Result<void, Error> {
+    match result {
+        Ok: .Ok
+        Err(error): .Err(quicError(error))
+    }
+}
+
+fn quicError(error tls.Error) Error {
+    match error {
+        Closed: .Closed
+        Reset: .Reset
+        InvalidProtocol: .Protocol
+        _: .Transport
+    }
+}

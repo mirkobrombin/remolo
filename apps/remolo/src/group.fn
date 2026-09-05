@@ -1,0 +1,133 @@
+package remolo.cli
+
+import remolo.config
+import std.collections
+import std.text
+
+enum groupCommand {
+    Set
+    List
+    Remove
+}
+
+fn runGroup(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("group requires set, ls, or rm"))
+    const selected = groupCommandFor(argument(args, 1))
+    match selected {
+        Some(command): match command {
+            Set: setGroup(args)
+            List: listGroups(args)
+            Remove: removeGroup(args)
+        }
+        None: .Err(invalid("unknown group command: " + argument(args, 1)))
+    }
+}
+
+fn groupCommandFor(value String) Option<groupCommand> {
+    if value == "set" return .Some(.Set)
+    if value == "ls" return .Some(.List)
+    if value == "rm" return .Some(.Remove)
+    .None
+}
+
+fn setGroup(args [String]) Result<i32, failure> {
+    if len(args) < 4 return .Err(invalid("group set requires NAME ALIAS..."))
+    const name = argument(args, 2)
+    var reversed = collections.NewList<String>()
+    var display = ""
+    var index usize = 3
+    while index < len(args) {
+        const member = argument(args, index)
+        if !text.IsEmpty(display) { display = display + ", " }
+        display = display + member
+        reversed.PushFront($member)
+        index += 1
+    }
+    const members = reverseStrings($reversed)
+    const loaded = loadConfig() else error { return .Err(error) }
+    var stored = loaded
+    stored.SetGroup($config.NewGroup(name, $members))
+    saveConfig($stored) else error { return .Err(error) }
+    writeStdoutText(
+        "remolo: group \"" + name + "\" = " + display + "\n"
+    ) else error {
+        return .Err(error)
+    }
+    .Ok(0)
+}
+
+fn listGroups(args [String]) Result<i32, failure> {
+    if len(args) != 2 return .Err(invalid("group ls accepts no arguments"))
+    const loaded = loadConfig() else error { return .Err(error) }
+    var stored = loaded
+    var values = stored.TakeGroups()
+    if values.IsEmpty() {
+        writeStdoutText(
+            "No groups. Define one with: remolo group set <name> <alias>...\n"
+        ) else error {
+            return .Err(error)
+        }
+        return .Ok(0)
+    }
+    while !values.IsEmpty() {
+        const value = groupValue(values.PopFront())
+        const config.Group { Name Members } = value
+        const line = Name + "\t" + joinOwnedStrings($Members) + "\n"
+        writeStdoutText(line) else error { return .Err(error) }
+    }
+    .Ok(0)
+}
+
+fn removeGroup(args [String]) Result<i32, failure> {
+    if len(args) != 3 return .Err(invalid("group rm requires NAME"))
+    const name = argument(args, 2)
+    const loaded = loadConfig() else error { return .Err(error) }
+    var stored = loaded
+    if !stored.RemoveGroup(name) {
+        return .Err(failed("no group named \"" + name + "\""))
+    }
+    saveConfig($stored) else error { return .Err(error) }
+    writeStdoutText("remolo: removed group \"" + name + "\"\n") else error {
+        return .Err(error)
+    }
+    .Ok(0)
+}
+
+fn joinOwnedStrings($values own collections.List<String>) String {
+    var pending = values
+    var result = ""
+    while !pending.IsEmpty() {
+        const value = stringValue(pending.PopFront())
+        if result == "" {
+            result = value
+        } else {
+            result = result + ", " + value
+        }
+    }
+    result
+}
+
+fn groupValue($value Option<own config.Group>) own config.Group {
+    match value {
+        Some(found): found
+        None: { panic("group list invariant failed") }
+    }
+}
+
+fn stringValue($value Option<String>) String {
+    match value {
+        Some(found): found
+        None: { panic("group member invariant failed") }
+    }
+}
+
+fn reverseStrings(
+    $values own collections.List<String>
+) own collections.List<String> {
+    var pending = values
+    var result = collections.NewList<String>()
+    while !pending.IsEmpty() {
+        result.PushFront($stringValue(pending.PopFront()))
+    }
+    result
+}

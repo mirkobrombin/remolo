@@ -1,5 +1,6 @@
 package remolo.rpc
 
+import std.bytes
 import std.collections
 import std.format
 import std.json
@@ -181,6 +182,55 @@ fn pathParams(value String) Result<json.Value, Error> {
     .Ok(.Object(object))
 }
 
+fn rangeParams(
+    path String,
+    offset u64,
+    length u64
+) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setText(&object, "path", path) else error { return .Err(error) }
+    setNumber(&object, "offset", offset) else error { return .Err(error) }
+    setNumber(&object, "length", length) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn writeParams(
+    path String,
+    offset u64,
+    value bytes.Bytes
+) Result<json.Value, Error> {
+    const encoded = bytes.EncodeBase64(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var object = json.NewObject()
+    setText(&object, "path", path) else error { return .Err(error) }
+    setNumber(&object, "offset", offset) else error { return .Err(error) }
+    setText(&object, "data", encoded) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn sizeParams(path String, size u64) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setText(&object, "path", path) else error { return .Err(error) }
+    setNumber(&object, "size", size) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn modeParams(path String, mode u32) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setText(&object, "path", path) else error { return .Err(error) }
+    setNumber(&object, "mode", u64.From(mode)) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn renameParams(source String, destination String) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setText(&object, "path", source) else error { return .Err(error) }
+    setText(&object, "new", destination) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
 fn commandParams(values [String]) Result<json.Value, Error> {
     var array = json.NewArray()
     var index usize = 0
@@ -211,6 +261,20 @@ fn commandListParams(
     setValue(&object, "cmd", $ .Array(array)) else error {
         return .Err(error)
     }
+    .Ok(.Object(object))
+}
+
+fn enrollmentParams(
+    publicKey bytes.Bytes,
+    label String
+) Result<json.Value, Error> {
+    const encoded = bytes.EncodeBase64(publicKey) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var object = json.NewObject()
+    setText(&object, "pubkey", encoded) else error { return .Err(error) }
+    setText(&object, "label", label) else error { return .Err(error) }
     .Ok(.Object(object))
 }
 

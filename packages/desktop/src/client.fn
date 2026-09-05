@@ -4,20 +4,35 @@ import remolo.mux
 import remolo.protocol
 import std.concurrent
 
+enum readerBackend {
+    Mux(value own mux.Reader)
+    RTC(value own rtcReader)
+}
+
+enum writerBackend {
+    Mux(value own mux.Writer)
+    RTC(value own rtcWriter)
+}
+
+enum controllerBackend {
+    Mux(value mux.StreamControl)
+    RTC(value own rtcClientControl)
+}
+
 @concurrent.Transferable()
 struct Reader {
-    source own mux.Reader
+    source readerBackend
     decoder own Decoder
 }
 
 @concurrent.Transferable()
 struct Writer {
-    destination own mux.Writer
+    destination writerBackend
 }
 
 @concurrent.Transferable()
 struct Controller {
-    control mux.StreamControl
+    inner controllerBackend
 }
 
 @concurrent.Transferable()
@@ -104,47 +119,103 @@ task OpenMode(
         discard control
         return .Err(error)
     }
+    if webRTCMode(mode) {
+        const connecting = spawn openRTCClient(
+            $restored,
+            $destination,
+            $control
+        )
+        const result = $connecting.wait()
+        const openedRTC = result else error {
+            discard hello
+            return .Err(error)
+        }
+        const rtcClientOpen {
+            Reader
+            Writer
+            Control
+        } = openedRTC
+        return .Ok(own RemoteDesktop {
+            Reader = own Reader {
+                source = .RTC(value = Reader)
+                decoder = NewDecoder()
+            }
+            Writer = own Writer { destination = .RTC(value = Writer) }
+            Controller = own Controller {
+                inner = .RTC(value = Control)
+            }
+            Hello = hello
+        })
+    }
     .Ok(own RemoteDesktop {
-        Reader = own Reader { source = restored decoder = NewDecoder() }
-        Writer = own Writer { destination = destination }
-        Controller = own Controller { control = control }
+        Reader = own Reader {
+            source = .Mux(value = restored)
+            decoder = NewDecoder()
+        }
+        Writer = own Writer { destination = .Mux(value = destination) }
+        Controller = own Controller { inner = .Mux(value = control) }
         Hello = hello
     })
 }
 
 task Read($reader own Reader) ReadOutcome {
     const Reader { source decoder } = reader
-    var active = decoder
-    const reading = spawn mux.ReadFrame($source)
-    const outcome = $reading.wait()
-    const mux.FrameReadOutcome { Reader Value } = outcome
-    var restored = own Reader { source = Reader decoder = active }
-    const frame = Value else error {
-        discard error
-        return ReadOutcome { Reader = restored Value = .Err(.Closed) }
-    }
-    const protocol.Frame { Type Payload } = frame
-    match Type {
-        Data: {
-            const decoded = DecodeFrame(&restored.decoder, $Payload) else error {
-                return ReadOutcome { Reader = restored Value = .Err(error) }
+    match source {
+        Mux(value): {
+            var active = decoder
+            const reading = spawn mux.ReadFrame($value)
+            const outcome = $reading.wait()
+            const mux.FrameReadOutcome { Reader Value } = outcome
+            var restored = own Reader {
+                source = .Mux(value = Reader)
+                decoder = active
             }
+            const frame = Value else error {
+                discard error
+                return ReadOutcome { Reader = restored Value = .Err(.Closed) }
+            }
+            const protocol.Frame { Type Payload } = frame
+            match Type {
+                Data: {
+                    const decoded = DecodeFrame(
+                        &restored.decoder,
+                        $Payload
+                    ) else error {
+                        return ReadOutcome {
+                            Reader = restored
+                            Value = .Err(error)
+                        }
+                    }
+                    ReadOutcome {
+                        Reader = restored
+                        Value = .Ok(.Frame(value = $decoded))
+                    }
+                }
+                Exit: {
+                    discard Payload
+                    ReadOutcome { Reader = restored Value = .Ok(.Exit) }
+                }
+                EOF: {
+                    discard Payload
+                    ReadOutcome { Reader = restored Value = .Ok(.Exit) }
+                }
+                _: {
+                    discard Payload
+                    ReadOutcome { Reader = restored Value = .Err(.Protocol) }
+                }
+            }
+        }
+        RTC(value): {
+            const reading = spawn readRTCFrame($value, $decoder)
+            const outcome = $reading.wait()
+            const rtcFrameOutcome { Reader Decoder Value } = outcome
             ReadOutcome {
-                Reader = restored
-                Value = .Ok(.Frame(value = $decoded))
+                Reader = own Reader {
+                    source = .RTC(value = Reader)
+                    decoder = Decoder
+                }
+                Value = Value
             }
-        }
-        Exit: {
-            discard Payload
-            ReadOutcome { Reader = restored Value = .Ok(.Exit) }
-        }
-        EOF: {
-            discard Payload
-            ReadOutcome { Reader = restored Value = .Ok(.Exit) }
-        }
-        _: {
-            discard Payload
-            ReadOutcome { Reader = restored Value = .Err(.Protocol) }
         }
     }
 }
@@ -155,19 +226,38 @@ task WriteInput(
 ) Result<own Writer, Error> {
     const payload = EncodeInput(event) else error { return .Err(error) }
     const Writer { destination } = writer
-    const sending = spawn desktopSend($destination, .JSON, $payload)
-    const sent = $sending.wait()
-    const restored = sent else error { return .Err(error) }
-    .Ok(own Writer { destination = restored })
+    match destination {
+        Mux(value): {
+            const sending = spawn desktopSend($value, .JSON, $payload)
+            const sent = $sending.wait()
+            const restored = sent else error { return .Err(error) }
+            .Ok(own Writer { destination = .Mux(value = restored) })
+        }
+        RTC(value): {
+            const sending = spawn writeRTCInput($value, $payload)
+            const sent = $sending.wait()
+            const restored = sent else error { return .Err(error) }
+            .Ok(own Writer { destination = .RTC(value = restored) })
+        }
+    }
 }
 
 task Close($controller own Controller) Result<void, Error> {
-    const Controller { control } = controller
-    const closing = spawn mux.CloseStream($control)
-    const result = $closing.wait()
-    result else error {
-        discard error
-        return .Err(.Closed)
+    const Controller { inner } = controller
+    match inner {
+        Mux(value): {
+            const closing = spawn mux.CloseStream($value)
+            const result = $closing.wait()
+            result else error {
+                discard error
+                return .Err(.Closed)
+            }
+            .Ok
+        }
+        RTC(value): {
+            const closing = spawn closeRTCClient($value)
+            const result = $closing.wait()
+            result
+        }
     }
-    .Ok
 }

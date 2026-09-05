@@ -98,10 +98,12 @@ task ServeLocal($forward own LocalForward) Result<void, Error> {
                 discard handle
                 discard target
                 if stopped {
-                    clients.Shutdown()
+                    const stopping = clients.ShutdownTask()
+                    discard $stopping.wait()
                     return .Ok
                 }
-                clients.Cancel()
+                const stopping = clients.CancelTask()
+                discard $stopping.wait()
                 return .Err(.Accept)
             }
         }
@@ -128,10 +130,12 @@ task ServeSocks($forward own SocksForward) Result<void, Error> {
                 discard active
                 discard handle
                 if stopped {
-                    clients.Shutdown()
+                    const stopping = clients.ShutdownTask()
+                    discard $stopping.wait()
                     return .Ok
                 }
-                clients.Cancel()
+                const stopping = clients.CancelTask()
+                discard $stopping.wait()
                 return .Err(.Accept)
             }
         }

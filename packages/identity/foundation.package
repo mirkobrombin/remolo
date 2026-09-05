@@ -1,7 +1,7 @@
 format foundation.package/v1
 name remolo.identity
 version 1.0.0
-sdk ^0.1.0
+language 1
 fcs standard
 source src
 test_source tests

@@ -57,8 +57,11 @@ fn runHost(args [String]) Result<i32, failure> {
         mdns
         stun
         relay
+        capabilities
+        commands
         readOnly
         once
+        approve
     } = options
     const now = time.Now().Unix()
     if ttl > 18446744073709551615 - now {
@@ -90,12 +93,23 @@ fn runHost(args [String]) Result<i32, failure> {
     const session.ListeningHost { Host Token } = active
     var host = Host
     const Relay = host.TakeRelay()
+    const policy = session.NewPolicy(
+        capabilities,
+        commands,
+        !readOnly,
+        approve
+    )
     const relayServing Option<Task<Result<void, session.Error>>> = match Relay {
         None: .None
-        Some(relayHost): .Some(spawn session.ServeRelayHost(
+        Some(relayHost): .Some(spawn session.ServeRelayHostWithPolicy(
                 $relayHost,
                 $text.Copy(fileRoot),
-                !readOnly
+                session.NewPolicy(
+                    policy.AllowedKinds,
+                    policy.AllowedCommands,
+                    policy.AllowWrite,
+                    policy.Approve
+                )
             ))
     }
     const port = host.Port()
@@ -116,10 +130,10 @@ fn runHost(args [String]) Result<i32, failure> {
         discard relayServing
         return .Err(error)
     }
-    const serving = spawn session.ServeHost(
+    const serving = spawn session.ServeHostWithPolicy(
         $host,
         $fileRoot,
-        !readOnly,
+        $policy,
         once
     )
     const result = $serving.wait()

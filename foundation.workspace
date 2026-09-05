@@ -2,3 +2,5 @@ format foundation.workspace/v1
 member remolo apps/remolo
 member remolo-rendezvous apps/remolo-rendezvous
 member remolo-relay apps/remolo-relay
+member config packages/config
+member fusefs packages/fusefs

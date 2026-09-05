@@ -113,7 +113,8 @@ fn runForward(args [String]) Result<i32, failure> {
     }
     const awaiting = spawn awaitForward($receiver, $client)
     const result = $awaiting.wait()
-    forwards.Cancel()
+    const stopping = forwards.CancelTask()
+    discard $stopping.wait()
     result
 }
 

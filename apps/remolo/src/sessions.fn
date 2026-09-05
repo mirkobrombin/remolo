@@ -1,0 +1,118 @@
+package remolo.cli
+
+import remolo.session
+import std.collections
+import std.format
+import std.text
+import std.time
+
+fn runSessions(args [String]) Result<i32, failure> {
+    if len(args) > 2 || (len(args) == 2 && args[1] != "--json") {
+        return .Err(invalid("sessions accepts only --json"))
+    }
+    const listing = spawn session.ListSessions()
+    const listed = $listing.wait()
+    const sessions = listed else error {
+        discard error
+        return .Err(failed("could not list shared connections"))
+    }
+    if len(args) == 2 {
+        const encoded = session.EncodeSessions($sessions) else error {
+            discard error
+            return .Err(failed("could not encode shared connections"))
+        }
+        writeStdoutText(encoded + "\n") else error { return .Err(error) }
+        return .Ok(0)
+    }
+    printSessions($sessions)
+}
+
+fn runMux(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("mux requires ls or close"))
+    if args[1] == "ls" {
+        if len(args) != 2 return .Err(invalid("mux ls accepts no arguments"))
+        const listing = spawn session.ListSessions()
+        const listed = $listing.wait()
+        const sessions = listed else error {
+            discard error
+            return .Err(failed("could not list shared connections"))
+        }
+        return printSessions($sessions)
+    }
+    if args[1] == "close" {
+        if len(args) != 3 return .Err(invalid("mux close requires a session id"))
+        return closeMux(args[2])
+    }
+    .Err(invalid("mux requires ls or close"))
+}
+
+fn closeMux(prefix String) Result<i32, failure> {
+    const closing = spawn session.CloseDaemon($text.Copy(prefix))
+    const closed = $closing.wait()
+    const info = closed else error {
+        return .Err(daemonFailure(error))
+    }
+    const host = sessionHost(info)
+    const output = "remolo: closed mux for " + info.SessionID + " (" + host +
+        "), pid " + format.U64(info.PID) + "\n"
+    writeStdoutText(output) else error { return .Err(error) }
+    .Ok(0)
+}
+
+fn printSessions(
+    $sessions own collections.List<own session.SessionInfo>
+) Result<i32, failure> {
+    var pending = sessions
+    if pending.IsEmpty() {
+        writeStdoutText("No active sessions.\n") else error {
+            return .Err(error)
+        }
+        return .Ok(0)
+    }
+    writeStdoutText("SESSION\tHOST\tROUTE\tPID\tUPTIME\n") else error {
+        discard pending
+        return .Err(error)
+    }
+    while !pending.IsEmpty() {
+        const info = sessionInfo(pending.PopFront())
+        const age = sessionAge(info.Started)
+        const line = info.SessionID + "\t" + sessionHost(info) + "\t" +
+            info.Route + "\t" + format.U64(info.PID) + "\t" +
+            format.U64(age) + "s\n"
+        writeStdoutText(line) else error {
+            discard pending
+            return .Err(error)
+        }
+    }
+    .Ok(0)
+}
+
+fn sessionHost(value session.SessionInfo) String {
+    if text.IsEmpty(value.Hostname) return text.Copy(value.OS)
+    value.Hostname + " (" + value.OS + ")"
+}
+
+fn sessionAge(started u64) u64 {
+    const now = time.Now().Unix()
+    if now < started return 0
+    now - started
+}
+
+fn sessionInfo(
+    $value Option<own session.SessionInfo>
+) own session.SessionInfo {
+    match value {
+        Some(info): info
+        None: panic("session output invariant failed")
+    }
+}
+
+fn daemonFailure(error session.DaemonError) failure {
+    match error {
+        NotFound: failed("no active session matches that id")
+        Ambiguous: failed("session id prefix is ambiguous")
+        InvalidState: failed("shared session metadata is invalid")
+        Storage: failed("could not read shared session metadata")
+        Transport: failed("could not contact the shared session")
+    }
+}

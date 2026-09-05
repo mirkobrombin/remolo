@@ -26,15 +26,19 @@ struct Excluder {
         self.patterns = restored
         matched
     }
+
+    fn Add(&self, pattern String) void {
+        const cleaned = cleanPattern(pattern)
+        if !text.IsEmpty(cleaned) {
+            self.patterns.PushFront($cleaned)
+        }
+    }
 }
 
 fn NewExcluder(patterns [String]) own Excluder {
     var result = own Excluder { patterns = collections.NewList<String>() }
     for pattern in patterns {
-        const cleaned = cleanPattern(pattern)
-        if !text.IsEmpty(cleaned) {
-            result.patterns.PushFront($cleaned)
-        }
+        result.Add(pattern)
     }
     result
 }

@@ -76,19 +76,19 @@ task Put(
         discard Reader
         return .Err(error)
     }
+    const closing = spawn mux.CloseWriter($eofWriter)
+    const closed = $closing.wait()
+    closed else error {
+        discard error
+        discard Reader
+        return .Err(.Protocol)
+    }
     const reading = spawn readAck($Reader)
     const ack = $reading.wait()
     const ackOutcome { Reader as restored Value as ackValue } = ack
     discard restored
     const remoteChecksum = ackValue else error {
-        discard eofWriter
         return .Err(error)
-    }
-    const closing = spawn mux.CloseWriter($eofWriter)
-    const closed = $closing.wait()
-    closed else error {
-        discard error
-        return .Err(.Protocol)
     }
     if remoteChecksum != checksum return .Err(.Integrity)
     .Ok
@@ -153,6 +153,15 @@ task Get(
         discard localPath
         return .Err(error)
     }
+    const closing = spawn mux.CloseWriter($requestWriter)
+    const closed = $closing.wait()
+    closed else error {
+        discard error
+        discard Reader
+        discard File
+        discard localPath
+        return .Err(.Protocol)
+    }
     const receiving = spawn receiveFile($Reader, $File)
     const received = $receiving.wait()
     const receiveOutcome {
@@ -163,7 +172,6 @@ task Get(
     const written = receiveValue else error {
         discard dataReader
         discard writtenFile
-        discard requestWriter
         discard localPath
         return .Err(error)
     }
@@ -174,7 +182,6 @@ task Get(
         discard error
         discard syncedFile
         discard dataReader
-        discard requestWriter
         discard localPath
         return .Err(.Filesystem)
     }
@@ -186,16 +193,8 @@ task Get(
     const ackOutcome { Reader as restored Value as ackValue } = ack
     discard restored
     const expected = ackValue else error {
-        discard requestWriter
         discard localPath
         return .Err(error)
-    }
-    const closing = spawn mux.CloseWriter($requestWriter)
-    const closed = $closing.wait()
-    closed else error {
-        discard error
-        discard localPath
-        return .Err(.Protocol)
     }
     const hashing = spawn hashFile($localPath)
     const hashed = $hashing.wait()
@@ -222,4 +221,3 @@ fn existingSize(filePath String) Result<u64, Error> {
         _: .Err(.Filesystem)
     }
 }
-

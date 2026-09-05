@@ -7,22 +7,53 @@ import std.bytes
 import std.concurrent
 import std.net
 
+enum secureReader {
+    TLS(value own tls.OpenSSLReader)
+    Local(value own net.TcpReader)
+}
+
+enum secureWriter {
+    TLS(value own tls.OpenSSLWriter)
+    Local(value own net.TcpWriter)
+}
+
+enum secureController {
+    TLS(value own tls.OpenSSLController)
+    Local(value own net.TcpController)
+    None
+}
+
 @concurrent.Transferable()
 struct SecureReader {
-    inner own tls.OpenSSLReader
+    inner secureReader
 }
 
 @concurrent.Transferable()
 struct SecureWriter {
-    inner own tls.OpenSSLWriter
+    inner secureWriter
 }
 
 @concurrent.Transferable()
 struct SecureController {
-    inner own tls.OpenSSLController
+    inner secureController
 
     fn Abort(&self) bool {
-        self.inner.Abort()
+        const selected = replace self.inner with .None
+        match selected {
+            TLS(value): {
+                var controller = value
+                const aborted = controller.Abort()
+                discard controller
+                aborted
+            }
+            Local(value): {
+                var controller = value
+                const aborted = controller.Abort()
+                discard controller
+                aborted
+            }
+            None: false
+        }
     }
 }
 
@@ -53,6 +84,26 @@ struct SecureListener {
 
     fn Port(self) u64 {
         self.inner.Port
+    }
+
+    fn Control(self) Result<own SecureListenerController, Error> {
+        const controller = self.inner.Control() else error {
+            return .Err(secureError(error))
+        }
+        .Ok(own SecureListenerController { inner = controller })
+    }
+
+    fn Close(&self) bool {
+        self.inner.Close()
+    }
+}
+
+@concurrent.Transferable()
+struct SecureListenerController {
+    inner own tls.OpenSSLListenerController
+
+    fn Clone(self) own SecureListenerController {
+        own SecureListenerController { inner = self.inner.Clone() }
     }
 
     fn Close(&self) bool {
@@ -176,40 +227,39 @@ task AcceptSecure($listener own SecureListener) SecureAcceptOutcome {
 }
 
 task ReadSecureFrame($reader own SecureReader) SecureReadOutcome {
-    const SecureReader { inner } = reader
-    const headerPending = spawn tls.OpenSSLReadExactBytes($inner, 5)
+    const headerPending = spawn ReadSecureExact($reader, 5)
     const headerRead = $headerPending.wait()
-    const tls.OpenSSLReadOutcome { Reader as afterHeader Value } = headerRead
+    const SecureBytesOutcome { Reader as afterHeader Value } = headerRead
     const header = match Value {
         Ok(value): value
         Err(error): {
             return SecureReadOutcome {
-                Reader = own SecureReader { inner = afterHeader }
-                Value = .Err(secureError(error))
+                Reader = afterHeader
+                Value = .Err(error)
             }
         }
     }
     const length = frameLength(header)
     if length > protocol.MaxFramePayload() {
         return SecureReadOutcome {
-            Reader = own SecureReader { inner = afterHeader }
+            Reader = afterHeader
             Value = .Err(.PayloadTooLarge)
         }
     }
-    const bodyPending = spawn tls.OpenSSLReadExactBytes($afterHeader, length)
+    const bodyPending = spawn ReadSecureExact($afterHeader, length)
     const bodyRead = $bodyPending.wait()
-    const tls.OpenSSLReadOutcome { Reader as restored Value as bodyValue } = bodyRead
+    const SecureBytesOutcome { Reader as restored Value as bodyValue } = bodyRead
     const body = match bodyValue {
         Ok(value): value
         Err(error): {
             return SecureReadOutcome {
-                Reader = own SecureReader { inner = restored }
-                Value = .Err(secureError(error))
+                Reader = restored
+                Value = .Err(error)
             }
         }
     }
     SecureReadOutcome {
-        Reader = own SecureReader { inner = restored }
+        Reader = restored
         Value = decodeParts(header, body)
     }
 }
@@ -228,20 +278,9 @@ task WriteSecureFrame(
             return SecureWriteOutcome { Writer = writer Value = .Err(.InvalidFrame) }
         }
     }
-    const SecureWriter { inner } = writer
-    const pending = spawn tls.OpenSSLWriteAllBytes($inner, $frame)
+    const pending = spawn WriteSecureRaw($writer, $frame)
     const written = $pending.wait()
-    const tls.OpenSSLWriteOutcome { Writer as restored Value } = written
-    match Value {
-        Ok: SecureWriteOutcome {
-            Writer = own SecureWriter { inner = restored }
-            Value = .Ok
-        }
-        Err(error): SecureWriteOutcome {
-            Writer = own SecureWriter { inner = restored }
-            Value = .Err(secureError(error))
-        }
-    }
+    written
 }
 
 task ReadSecureExact(
@@ -249,19 +288,9 @@ task ReadSecureExact(
     length u64
 ) SecureBytesOutcome {
     const SecureReader { inner } = reader
-    const pending = spawn tls.OpenSSLReadExactBytes($inner, length)
+    const pending = secureReadTask($inner, length)
     const read = $pending.wait()
-    const tls.OpenSSLReadOutcome { Reader Value } = read
-    match Value {
-        Ok(value): SecureBytesOutcome {
-            Reader = own SecureReader { inner = Reader }
-            Value = .Ok(value)
-        }
-        Err(error): SecureBytesOutcome {
-            Reader = own SecureReader { inner = Reader }
-            Value = .Err(secureError(error))
-        }
-    }
+    read
 }
 
 task WriteSecureRaw(
@@ -269,19 +298,9 @@ task WriteSecureRaw(
     $value own bytes.Bytes
 ) SecureWriteOutcome {
     const SecureWriter { inner } = writer
-    const pending = spawn tls.OpenSSLWriteAllBytes($inner, $value)
+    const pending = secureWriteTask($inner, $value)
     const written = $pending.wait()
-    const tls.OpenSSLWriteOutcome { Writer Value } = written
-    match Value {
-        Ok: SecureWriteOutcome {
-            Writer = own SecureWriter { inner = Writer }
-            Value = .Ok
-        }
-        Err(error): SecureWriteOutcome {
-            Writer = own SecureWriter { inner = Writer }
-            Value = .Err(secureError(error))
-        }
-    }
+    written
 }
 
 fn openSecureStream(
@@ -295,11 +314,141 @@ fn openSecureStream(
     }
     const tls.OpenSSLControlledStream { Reader Writer Controller } = split
     .Ok(SecureStream {
-        Reader = own SecureReader { inner = Reader }
-        Writer = own SecureWriter { inner = Writer }
-        Controller = own SecureController { inner = Controller }
+        Reader = own SecureReader { inner = .TLS(Reader) }
+        Writer = own SecureWriter { inner = .TLS(Writer) }
+        Controller = own SecureController { inner = .TLS(Controller) }
         Peer = peer
     })
+}
+
+fn LocalStream(
+    $connection own net.TcpConnection,
+    $peer String
+) Result<SecureStream, Error> {
+    const split = connection.SplitControlled() else error {
+        discard error
+        discard peer
+        return .Err(.Io)
+    }
+    const net.ControlledStream { Reader Writer Controller } = split
+    .Ok(SecureStream {
+        Reader = own SecureReader { inner = .Local(Reader) }
+        Writer = own SecureWriter { inner = .Local(Writer) }
+        Controller = own SecureController { inner = .Local(Controller) }
+        Peer = peer
+    })
+}
+
+fn secureReadTask(
+    $reader secureReader,
+    length u64
+) Task<SecureBytesOutcome> {
+    match reader {
+        TLS(value): spawn readTLSExact($value, length)
+        Local(value): spawn readLocalExact($value, length)
+    }
+}
+
+task readTLSExact(
+    $reader own tls.OpenSSLReader,
+    length u64
+) SecureBytesOutcome {
+    const pending = spawn tls.OpenSSLReadExactBytes($reader, length)
+    const read = $pending.wait()
+    const tls.OpenSSLReadOutcome { Reader Value } = read
+    match Value {
+        Ok(value): SecureBytesOutcome {
+            Reader = own SecureReader { inner = .TLS(Reader) }
+            Value = .Ok(value)
+        }
+        Err(error): SecureBytesOutcome {
+            Reader = own SecureReader { inner = .TLS(Reader) }
+            Value = .Err(secureError(error))
+        }
+    }
+}
+
+task readLocalExact(
+    $reader own net.TcpReader,
+    length u64
+) SecureBytesOutcome {
+    const pending = spawn net.ReadExactBytes($reader, length)
+    const read = $pending.wait()
+    const net.ReadBytesOutcome { Reader Value } = read
+    match Value {
+        Ok(value): SecureBytesOutcome {
+            Reader = own SecureReader { inner = .Local(Reader) }
+            Value = .Ok(value)
+        }
+        Err(error): SecureBytesOutcome {
+            Reader = own SecureReader { inner = .Local(Reader) }
+            Value = .Err(netError(error))
+        }
+    }
+}
+
+fn secureWriteTask(
+    $writer secureWriter,
+    $value own bytes.Bytes
+) Task<SecureWriteOutcome> {
+    match writer {
+        TLS(selected): spawn writeTLS($selected, $value)
+        Local(selected): spawn writeLocal($selected, $value)
+    }
+}
+
+task writeTLS(
+    $writer own tls.OpenSSLWriter,
+    $value own bytes.Bytes
+) SecureWriteOutcome {
+    const pending = spawn tls.OpenSSLWriteAllBytes($writer, $value)
+    const written = $pending.wait()
+    const tls.OpenSSLWriteOutcome { Writer Value } = written
+    match Value {
+        Ok: SecureWriteOutcome {
+            Writer = own SecureWriter { inner = .TLS(Writer) }
+            Value = .Ok
+        }
+        Err(error): SecureWriteOutcome {
+            Writer = own SecureWriter { inner = .TLS(Writer) }
+            Value = .Err(secureError(error))
+        }
+    }
+}
+
+task writeLocal(
+    $writer own net.TcpWriter,
+    $value own bytes.Bytes
+) SecureWriteOutcome {
+    const pending = spawn net.WriteAllBytes($writer, $value)
+    const written = $pending.wait()
+    const net.WriteOutcome { Writer Value } = written
+    match Value {
+        Ok: SecureWriteOutcome {
+            Writer = own SecureWriter { inner = .Local(Writer) }
+            Value = .Ok
+        }
+        Err(error): SecureWriteOutcome {
+            Writer = own SecureWriter { inner = .Local(Writer) }
+            Value = .Err(netError(error))
+        }
+    }
+}
+
+fn netError(error net.Error) Error {
+    match error {
+        InvalidAddress: .InvalidAddress
+        ResolveFailed: .InvalidAddress
+        Refused: .Refused
+        Closed: .Closed
+        Cancelled: .Cancelled
+        InvalidUtf8: .InvalidFrame
+        LineTooLong: .PayloadTooLarge
+        AddressInUse: .Io
+        Timeout: .Timeout
+        InvalidLimit: .PayloadTooLarge
+        Io: .Io
+    }
 }
 
 fn secureError(error tls.Error) Error {
@@ -313,6 +462,7 @@ fn secureError(error tls.Error) Error {
         Cancelled: .Cancelled
         Unavailable: .Io
         Closed: .Closed
+        Reset: .Closed
         Io: .Io
     }
 }

@@ -1,0 +1,160 @@
+package remolo.cli
+
+import remolo.config
+import std.text
+
+enum aliasCommand {
+    Add
+    Remove
+    List
+}
+
+enum aliasOption {
+    Relay
+    Rendezvous
+    Note
+}
+
+fn runAlias(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("alias requires add, rm, or ls"))
+    const selected = aliasCommandFor(argument(args, 1))
+    match selected {
+        Some(command): match command {
+            Add: addAlias(args)
+            Remove: removeAlias(args)
+            List: listAliases(args)
+        }
+        None: .Err(invalid("unknown alias command: " + argument(args, 1)))
+    }
+}
+
+fn aliasCommandFor(value String) Option<aliasCommand> {
+    if value == "add" return .Some(.Add)
+    if value == "rm" return .Some(.Remove)
+    if value == "ls" return .Some(.List)
+    .None
+}
+
+fn aliasOptionFor(value String) Option<aliasOption> {
+    if value == "--relay" return .Some(.Relay)
+    if value == "--rendezvous" return .Some(.Rendezvous)
+    if value == "--note" return .Some(.Note)
+    .None
+}
+
+fn addAlias(args [String]) Result<i32, failure> {
+    if len(args) < 4 return .Err(invalid("alias add requires NAME TOKEN"))
+    var value = config.NewAlias(argument(args, 2), argument(args, 3))
+    var index usize = 4
+    while index < len(args) {
+        const name = argument(args, index)
+        const selected = aliasOptionFor(name)
+        const option = match selected {
+            Some(found): found
+            None: { return .Err(invalid("unknown alias option: " + name)) }
+        }
+        const content = optionValue(args, index, name) else error {
+            return .Err(error)
+        }
+        applyAliasOption(&value, option, content)
+        index += 2
+    }
+    const loaded = loadConfig() else error { return .Err(error) }
+    var stored = loaded
+    const displayName = text.Copy(value.Name)
+    stored.SetAlias($value)
+    saveConfig($stored) else error { return .Err(error) }
+    writeStdoutText(
+        "remolo: saved alias \"" + displayName + "\" (" +
+        config.DefaultPath() + ")\n"
+    ) else error {
+        return .Err(error)
+    }
+    .Ok(0)
+}
+
+fn applyAliasOption(
+    &value config.Alias,
+    selected aliasOption,
+    content String
+) void {
+    match selected {
+        Relay: { value.Relay = text.Copy(content) }
+        Rendezvous: { value.Rendezvous = text.Copy(content) }
+        Note: { value.Note = text.Copy(content) }
+    }
+}
+
+fn removeAlias(args [String]) Result<i32, failure> {
+    if len(args) != 3 return .Err(invalid("alias rm requires NAME"))
+    const name = argument(args, 2)
+    const loaded = loadConfig() else error { return .Err(error) }
+    var stored = loaded
+    if !stored.RemoveAlias(name) {
+        return .Err(failed("no alias named \"" + name + "\""))
+    }
+    saveConfig($stored) else error { return .Err(error) }
+    writeStdoutText("remolo: removed alias \"" + name + "\"\n") else error {
+        return .Err(error)
+    }
+    .Ok(0)
+}
+
+fn listAliases(args [String]) Result<i32, failure> {
+    if len(args) != 2 return .Err(invalid("alias ls accepts no arguments"))
+    const loaded = loadConfig() else error { return .Err(error) }
+    var stored = loaded
+    var values = stored.TakeAliases()
+    if values.IsEmpty() {
+        writeStdoutText(
+            "No saved aliases. Add one with: remolo alias add <name> <token>\n"
+        ) else error {
+            return .Err(error)
+        }
+        return .Ok(0)
+    }
+    while !values.IsEmpty() {
+        const value = aliasValue(values.PopFront())
+        const line = aliasLine($value)
+        writeStdoutText(line) else error { return .Err(error) }
+    }
+    .Ok(0)
+}
+
+fn aliasLine($value own config.Alias) String {
+    const config.Alias {
+        Name
+        Token
+        Rendezvous
+        Relay
+        Note
+        HostKey
+        Candidates
+    } = value
+    discard HostKey
+    discard Candidates
+    var line = Name + "\t" + firstBytes(Token, 20) + "..."
+    if !text.IsEmpty(Relay) { line = line + " relay=" + Relay }
+    if !text.IsEmpty(Rendezvous) {
+        line = line + " rendezvous=" + Rendezvous
+    }
+    if !text.IsEmpty(Note) { line = line + " (" + Note + ")" }
+    line + "\n"
+}
+
+fn firstBytes(value String, limit u64) String {
+    const length = text.ByteLen(value)
+    if length <= limit return text.Copy(value)
+    const result = text.Slice(value, 0, limit) else error {
+        discard error
+        return text.Copy(value)
+    }
+    result
+}
+
+fn aliasValue($value Option<own config.Alias>) own config.Alias {
+    match value {
+        Some(found): found
+        None: { panic("alias list invariant failed") }
+    }
+}

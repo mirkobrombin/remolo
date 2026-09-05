@@ -1,10 +1,12 @@
 package remolo.cli
 
+import remolo.protocol
 import remolo.session
+import std.collections
 import std.env
 import std.net
-import std.parse
 import std.text
+import std.time
 
 struct hostOptions {
     bindAddress String
@@ -18,14 +20,18 @@ struct hostOptions {
     mdns bool
     stun String
     relay String
+    capabilities String
+    commands String
     readOnly bool
     once bool
+    approve bool
 }
 
 struct syncOptions {
     pull bool
     delete bool
     dryRun bool
+    excludes own collections.List<String>
 }
 
 enum hostSwitch {
@@ -33,6 +39,7 @@ enum hostSwitch {
     Once
     Loopback
     MDNS
+    Approve
 }
 
 enum hostValue {
@@ -44,6 +51,19 @@ enum hostValue {
     Rendezvous
     STUN
     Relay
+    Capability
+    Command
+}
+
+enum connectValue {
+    Rendezvous
+    Relay
+    Jump
+    SSHAddress
+    SSHUser
+    SSHKey
+    SSHKnownHosts
+    SSHTarget
 }
 
 fn argument(args [String], index usize) String {
@@ -64,11 +84,12 @@ fn hostSwitchFor(name String) Option<hostSwitch> {
     if name == "--once" return .Some(.Once)
     if name == "--loopback" return .Some(.Loopback)
     if name == "--mdns" return .Some(.MDNS)
+    if name == "--approve" return .Some(.Approve)
     .None
 }
 
 fn hostValueFor(name String) Option<hostValue> {
-    if name == "--bind" return .Some(.Bind)
+    if name == "--bind" || name == "-b" return .Some(.Bind)
     if name == "--advertise" return .Some(.Advertise)
     if name == "--ttl" return .Some(.TTL)
     if name == "--identity" return .Some(.Identity)
@@ -76,6 +97,20 @@ fn hostValueFor(name String) Option<hostValue> {
     if name == "--rendezvous" return .Some(.Rendezvous)
     if name == "--stun" return .Some(.STUN)
     if name == "--relay" return .Some(.Relay)
+    if name == "--cap" return .Some(.Capability)
+    if name == "--cmd" return .Some(.Command)
+    .None
+}
+
+fn connectValueFor(name String) Option<connectValue> {
+    if name == "--rendezvous" return .Some(.Rendezvous)
+    if name == "--relay" return .Some(.Relay)
+    if name == "--jump" || name == "-J" return .Some(.Jump)
+    if name == "--ssh-addr" return .Some(.SSHAddress)
+    if name == "--ssh-user" return .Some(.SSHUser)
+    if name == "--ssh-key" return .Some(.SSHKey)
+    if name == "--ssh-known-hosts" return .Some(.SSHKnownHosts)
+    if name == "--ssh-target" return .Some(.SSHTarget)
     .None
 }
 
@@ -85,6 +120,7 @@ fn applyHostSwitch(&options hostOptions, value hostSwitch) void {
         Once: { options.once = true }
         Loopback: { options.includeLoopback = true }
         MDNS: { options.mdns = true }
+        Approve: { options.approve = true }
     }
 }
 
@@ -120,6 +156,13 @@ fn applyHostValue(
             options.relay = text.Copy(value)
             .Ok
         }
+        Capability: {
+            if !validCapability(value) {
+                return .Err(invalid("unknown capability: " + value))
+            }
+            appendPolicyValue(&options.capabilities, value)
+        }
+        Command: appendPolicyValue(&options.commands, value)
     }
 }
 
@@ -135,11 +178,19 @@ fn applyBindValue(&options hostOptions, value String) Result<void, failure> {
 }
 
 fn applyTTLValue(&options hostOptions, value String) Result<void, failure> {
-    const ttl = parse.U64(value) else error {
+    const duration = time.Duration.Parse(value) else error {
         discard error
-        return .Err(invalid("--ttl requires seconds"))
+        return .Err(invalid("--ttl requires a duration"))
     }
-    if ttl == 0 return .Err(invalid("--ttl must be positive"))
+    const seconds = duration.Seconds()
+    if seconds <= 0 {
+        options.ttl = 86400
+        return .Ok
+    }
+    const ttl = u64.From(seconds) else error {
+        discard error
+        return .Err(invalid("--ttl is outside the supported range"))
+    }
     options.ttl = ttl
     .Ok
 }
@@ -196,13 +247,47 @@ fn defaultHostOptions() own hostOptions {
         mdns = false
         stun = ""
         relay = ""
+        capabilities = ""
+        commands = ""
         readOnly = false
         once = false
+        approve = false
     }
+}
+
+fn appendPolicyValue(&encoded String, value String) Result<void, failure> {
+    if text.IsEmpty(value) || text.Contains(value, "|") {
+        return .Err(invalid("policy values cannot be empty or contain |"))
+    }
+    encoded = text.Copy(encoded) + "|" + value + "|"
+    .Ok
+}
+
+fn validCapability(value String) bool {
+    value == "pty" || value == "exec" || value == "file" ||
+        value == "sync" || value == "rpc" || value == "desktop" ||
+        value == "forward"
 }
 
 struct connectOptions {
     connection own session.ConnectOptions
+    commandStart usize
+    resume bool
+    record String
+    jump String
+    forwardAgent bool
+    sshAddress String
+    sshUser String
+    sshKey String
+    sshKnownHosts String
+    sshTarget String
+}
+
+struct execOptions {
+    directory String
+    environment own collections.List<protocol.Environment>
+    terminal bool
+    quiet bool
     commandStart usize
 }
 
@@ -212,6 +297,15 @@ fn parseConnectOptions(
     var connection = session.DefaultConnectOptions()
     var index usize = 2
     var commandStart = len(args)
+    var resume = false
+    var record = ""
+    var jump = ""
+    var forwardAgent = false
+    var sshAddress = ""
+    var sshUser = ""
+    var sshKey = ""
+    var sshKnownHosts = ""
+    var sshTarget = ""
     var parsing = true
     while index < len(args) && parsing {
         const name = argument(args, index)
@@ -225,25 +319,220 @@ fn parseConnectOptions(
             index += 1
             continue
         }
-        if name == "--rendezvous" || name == "--relay" {
+        if name == "--resume" {
+            resume = true
+            index += 1
+            continue
+        }
+        if name == "-A" || name == "--forward-agent" {
+            forwardAgent = true
+            index += 1
+            continue
+        }
+        if name == "--record" {
             const value = optionValue(args, index, name) else error {
                 return .Err(error)
             }
-            if name == "--rendezvous" {
-                connection.Rendezvous = value
-            } else {
-                connection.Relay = value
-            }
+            record = value
             index += 2
             continue
+        }
+        const selected = connectValueFor(name)
+        match selected {
+            Some(kind): {
+                const value = optionValue(args, index, name) else error {
+                    return .Err(error)
+                }
+                match kind {
+                    Rendezvous: { connection.Rendezvous = value }
+                    Relay: { connection.Relay = value }
+                    Jump: { jump = value }
+                    SSHAddress: { sshAddress = value }
+                    SSHUser: { sshUser = value }
+                    SSHKey: { sshKey = value }
+                    SSHKnownHosts: { sshKnownHosts = value }
+                    SSHTarget: { sshTarget = value }
+                }
+                index += 2
+                continue
+            }
+            None: {}
         }
         commandStart = index
         parsing = false
     }
+    if !text.IsEmpty(sshAddress) {
+        connection.SSH = .Some(own session.SSHRung {
+            Address = text.Copy(sshAddress)
+            User = text.Copy(sshUser)
+            KeyPath = text.Copy(sshKey)
+            KnownHosts = text.Copy(sshKnownHosts)
+            Target = text.Copy(sshTarget)
+        })
+    }
     .Ok(own connectOptions {
         connection = connection
         commandStart = commandStart
+        resume = resume
+        record = record
+        jump = jump
+        forwardAgent = forwardAgent
+        sshAddress = sshAddress
+        sshUser = sshUser
+        sshKey = sshKey
+        sshKnownHosts = sshKnownHosts
+        sshTarget = sshTarget
     })
+}
+
+fn parseExecOptions(args [String]) Result<own execOptions, failure> {
+    var options = own execOptions {
+        directory = ""
+        environment = collections.NewList<protocol.Environment>()
+        terminal = false
+        quiet = false
+        commandStart = len(args)
+    }
+    var index usize = 2
+    var parsing = true
+    while index < len(args) && parsing {
+        const name = argument(args, index)
+        if name == "--" {
+            options.commandStart = index + 1
+            parsing = false
+            continue
+        }
+        if name == "-t" || name == "--tty" {
+            options.terminal = true
+            index += 1
+            continue
+        }
+        if name == "-T" || name == "--no-tty" {
+            options.terminal = false
+            index += 1
+            continue
+        }
+        if name == "-q" || name == "--quiet" {
+            options.quiet = true
+            index += 1
+            continue
+        }
+        if name == "--cwd" || name == "--env" || name == "--env-pass" {
+            const value = optionValue(args, index, name) else error {
+                return .Err(error)
+            }
+            applyExecValue(&options, name, value) else error {
+                return .Err(error)
+            }
+            index += 2
+            continue
+        }
+        const inline = applyInlineExecValue(&options, name) else error {
+            return .Err(error)
+        }
+        if inline {
+            index += 1
+        } else {
+            options.commandStart = index
+            parsing = false
+        }
+    }
+    if options.commandStart >= len(args) {
+        return .Err(invalid("exec requires a command"))
+    }
+    .Ok(options)
+}
+
+fn applyInlineExecValue(
+    &options execOptions,
+    name String
+) Result<bool, failure> {
+    if text.StartsWith(name, "--cwd=") {
+        const value = inlineOptionValue(name, 6) else error {
+            return .Err(error)
+        }
+        options.directory = value
+        return .Ok(true)
+    }
+    if text.StartsWith(name, "--env=") {
+        const value = inlineOptionValue(name, 6) else error {
+            return .Err(error)
+        }
+        addExecEnvironment(&options, value) else error {
+            return .Err(error)
+        }
+        return .Ok(true)
+    }
+    if text.StartsWith(name, "--env-pass=") {
+        const value = inlineOptionValue(name, 11) else error {
+            return .Err(error)
+        }
+        addPassedEnvironment(&options, value)
+        return .Ok(true)
+    }
+    .Ok(false)
+}
+
+fn inlineOptionValue(value String, start u64) Result<String, failure> {
+    const result = text.Slice(value, start, text.ByteLen(value)) else error {
+        discard error
+        return .Err(invalid("invalid inline option"))
+    }
+    if text.IsEmpty(result) return .Err(invalid("option value cannot be empty"))
+    .Ok(result)
+}
+
+fn applyExecValue(
+    &options execOptions,
+    name String,
+    value String
+) Result<void, failure> {
+    if name == "--cwd" {
+        options.directory = text.Copy(value)
+        return .Ok
+    }
+    if name == "--env" return addExecEnvironment(&options, value)
+    addPassedEnvironment(&options, value)
+    .Ok
+}
+
+fn addExecEnvironment(
+    &options execOptions,
+    value String
+) Result<void, failure> {
+    const separator = text.Find(value, "=")
+    const offset = match separator {
+        Some(found): found
+        None: { return .Err(invalid("--env requires KEY=VALUE")) }
+    }
+    if offset == 0 return .Err(invalid("--env requires KEY=VALUE"))
+    const name = text.Slice(value, 0, offset) else error {
+        discard error
+        return .Err(invalid("--env requires KEY=VALUE"))
+    }
+    const selected = text.Slice(value, offset + 1, text.ByteLen(value)) else error {
+        discard error
+        return .Err(invalid("--env requires KEY=VALUE"))
+    }
+    options.environment.PushFront(protocol.Environment {
+        Name = name
+        Value = selected
+    })
+    .Ok
+}
+
+fn addPassedEnvironment(&options execOptions, name String) void {
+    const selected = env.Get(name) else error {
+        discard error
+        return
+    }
+    match selected {
+        Some(value): options.environment.PushFront(protocol.Environment {
+            Name = text.Copy(name)
+            Value = value
+        })
+        None: {}
+    }
 }
 
 fn parseHostOptions(args [String]) Result<own hostOptions, failure> {
@@ -258,8 +547,16 @@ fn parseHostOptions(args [String]) Result<own hostOptions, failure> {
     .Ok(options)
 }
 
-fn parseSyncOptions(args [String], start usize) Result<syncOptions, failure> {
-    var options = syncOptions { pull = false delete = false dryRun = false }
+fn parseSyncOptions(
+    args [String],
+    start usize
+) Result<own syncOptions, failure> {
+    var options = own syncOptions {
+        pull = false
+        delete = false
+        dryRun = false
+        excludes = collections.NewList<String>()
+    }
     var index = start
     while index < len(args) {
         const name = argument(args, index)
@@ -275,6 +572,22 @@ fn parseSyncOptions(args [String], start usize) Result<syncOptions, failure> {
         }
         if name == "--dry-run" {
             options.dryRun = true
+            index += 1
+            continue
+        }
+        if name == "--exclude" {
+            const value = optionValue(args, index, name) else error {
+                return .Err(error)
+            }
+            options.excludes.PushFront($value)
+            index += 2
+            continue
+        }
+        if text.StartsWith(name, "--exclude=") {
+            const value = inlineOptionValue(name, 10) else error {
+                return .Err(error)
+            }
+            options.excludes.PushFront($value)
             index += 1
             continue
         }

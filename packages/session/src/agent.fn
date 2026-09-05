@@ -1,0 +1,471 @@
+package remolo.session
+
+import foundation.worker
+import remolo.mux
+import remolo.protocol
+import remolo.tunnel
+import std.bytes
+import std.concurrent
+import std.env
+import std.fs
+import std.net
+import std.path
+import std.text
+
+struct AgentForwardOwner {
+    supervisor own worker.Supervisor
+
+    fn Stop(&self) void {
+        const active = replace self.supervisor with worker.NewSupervisor()
+        active.Cancel()
+    }
+
+    fn drop(&self) void {
+        self.Stop()
+    }
+}
+
+struct agentControlOutcome {
+    Reader own mux.Reader
+    Writer own mux.Writer
+    Value Result<void, Error>
+}
+
+struct agentListening {
+    Listener own net.LocalListener
+    Controller own net.TcpListenerController
+    Directory String
+    Path String
+}
+
+@concurrent.Transferable()
+struct agentStateHandle {
+    requests Sender<agentStateRequest>
+
+    fn Clone(self) agentStateHandle {
+        agentStateHandle { requests = self.requests.clone() }
+    }
+}
+
+enum agentStateRequest {
+    Set(value String)
+    Get(reply Sender<String>)
+}
+
+task ForwardAgent(
+    $client own Client,
+    $socketPath String
+) Result<own Client, Error> {
+    const Client {
+        session
+        handle
+        controlReader
+        controlWriter
+        sessionKey
+        capabilities
+        daemon
+        route
+        agent
+    } = client
+    discard agent
+    const requesting = spawn requestAgentForward(
+        $controlReader,
+        $controlWriter
+    )
+    const requested = $requesting.wait()
+    const agentControlOutcome { Reader Writer Value } = requested
+    Value else error {
+        discard Reader
+        discard Writer
+        discard handle
+        discard sessionKey
+        discard capabilities
+        discard daemon
+        discard route
+        discard socketPath
+        mux.Close($session)
+        return .Err(error)
+    }
+    const supervisor = worker.NewSupervisor()
+    supervisor.Start(spawn acceptClientAgentChannels(
+            handle.Clone(),
+            $socketPath
+        ))
+    .Ok(own Client {
+        session = session
+        handle = handle
+        controlReader = Reader
+        controlWriter = Writer
+        sessionKey = sessionKey
+        capabilities = capabilities
+        daemon = daemon
+        route = route
+        agent = .Some(own AgentForwardOwner { supervisor = supervisor })
+    })
+}
+
+task requestAgentForward(
+    $reader own mux.Reader,
+    $writer own mux.Writer
+) agentControlOutcome {
+    const payload = protocol.EncodeControlMessage($protocol.ControlMessage {
+        Type = "agent-forward"
+    }) else error {
+        discard error
+        return agentControlOutcome {
+            Reader = reader
+            Writer = writer
+            Value = .Err(.Protocol)
+        }
+    }
+    const writing = spawn mux.WriteFrame($writer, .JSON, $payload)
+    const written = $writing.wait()
+    const mux.WriteOutcome { Writer Value as writeValue } = written
+    writeValue else error {
+        discard error
+        return agentControlOutcome {
+            Reader = reader
+            Writer = Writer
+            Value = .Err(.Transport)
+        }
+    }
+    const reading = spawn mux.ReadFrame($reader)
+    const read = $reading.wait()
+    const mux.FrameReadOutcome { Reader Value as readValue } = read
+    const frame = readValue else error {
+        discard error
+        return agentControlOutcome {
+            Reader = Reader
+            Writer = Writer
+            Value = .Err(.Transport)
+        }
+    }
+    const protocol.Frame { Type Payload } = frame
+    const reply = match Type {
+        JSON: protocol.DecodeControlMessage(Payload)
+        _: .Err(.InvalidFrame)
+    } else error {
+        discard error
+        return agentControlOutcome {
+            Reader = Reader
+            Writer = Writer
+            Value = .Err(.Protocol)
+        }
+    }
+    const result = if reply.Type == "agent-forward-ok" {
+        Result<void, Error>.Ok
+    } else {
+        Result<void, Error>.Err(.Transport)
+    }
+    agentControlOutcome { Reader = Reader Writer = Writer Value = result }
+}
+
+task acceptClientAgentChannels(
+    $handle mux.Handle,
+    $socketPath String
+) void {
+    const workers = worker.NewSupervisor()
+    while true {
+        const accepting = spawn mux.AcceptChannel($handle.Clone())
+        const accepted = $accepting.wait()
+        const channel = accepted else error {
+            discard error
+            discard handle
+            discard socketPath
+            const stopping = workers.CancelTask()
+            discard $stopping.wait()
+            return
+        }
+        if !agentKind(channel.Open.Kind) {
+            workers.Start(spawn rejectChannel($channel))
+            continue
+        }
+        const mux.AcceptedChannel { Open Stream } = channel
+        discard Open
+        const connection = net.DialLocal(socketPath) else error {
+            discard error
+            discard Stream
+            continue
+        }
+        workers.Start(spawn spliceAgent($Stream, $connection))
+    }
+}
+
+task spliceAgent(
+    $stream mux.Stream,
+    $connection own net.TcpConnection
+) void {
+    const splicing = spawn tunnel.Splice($stream, $connection)
+    const result = $splicing.wait()
+    discard result
+}
+
+fn newAgentState() Channel<agentStateRequest> {
+    channel<agentStateRequest>(16)
+}
+
+task serveAgentState($receiver Receiver<agentStateRequest>) void {
+    var inbox = receiver
+    var socketPath = ""
+    while true {
+        select {
+            const request = inbox.receive(): {
+                match request {
+                    Set(value): { socketPath = value }
+                    Get(reply): {
+                        discard reply.send($text.Copy(socketPath))
+                    }
+                }
+            }
+            else error: {
+                discard error
+                return
+            }
+        }
+    }
+}
+
+task agentSocket($handle agentStateHandle) String {
+    const agentStateHandle { requests } = handle
+    const Channel { sender receiver } = channel<String>(1)
+    var destination = requests
+    select {
+        destination.send(.Get(reply = sender)): {
+            const received = receiver.receive()
+            return match received {
+                Ok(value): value
+                Err(error): {
+                    discard error
+                    ""
+                }
+            }
+        }
+        else error: {
+            discard error
+            return ""
+        }
+    }
+    ""
+}
+
+task setAgentSocket(
+    $handle agentStateHandle,
+    $socketPath String
+) void {
+    const agentStateHandle { requests } = handle
+    discard requests.send(.Set(value = socketPath))
+}
+
+task servePeerControl(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $handle mux.Handle,
+    $state agentStateHandle
+) void {
+    var source = reader
+    var destination = writer
+    var socketPath = ""
+    var directory = ""
+    var controller Option<own net.TcpListenerController> = .None
+    const workers = worker.NewSupervisor()
+    var active = true
+    while active {
+        const reading = spawn mux.ReadFrame($source)
+        const read = $reading.wait()
+        const mux.FrameReadOutcome { Reader Value } = read
+        source = Reader
+        const frame = Value else error {
+            discard error
+            active = false
+            continue
+        }
+        const protocol.Frame { Type Payload } = frame
+        var ping = false
+        var json = false
+        match Type {
+            Ping: { ping = true }
+            JSON: { json = true }
+            _: {
+                discard Payload
+                continue
+            }
+        }
+        if ping {
+            discard Payload
+            const replying = spawn mux.WriteFrame(
+                $destination,
+                .Pong,
+                $bytes.FromText("")
+            )
+            const replied = $replying.wait()
+            const mux.WriteOutcome {
+                Writer
+                Value as replyValue
+            } = replied
+            destination = Writer
+            match replyValue {
+                Ok: {}
+                Err(error): {
+                    discard error
+                    active = false
+                }
+            }
+            continue
+        }
+        if !json {
+            discard Payload
+            continue
+        }
+        const message = protocol.DecodeControlMessage(Payload) else error {
+            discard error
+            continue
+        }
+        if message.Type != "agent-forward" continue
+        var response = "agent-forward-ok"
+        if text.IsEmpty(socketPath) {
+            const listening = listenAgent()
+            match listening {
+                Ok(value): {
+                    const agentListening {
+                        Listener
+                        Controller
+                        Directory
+                        Path
+                    } = value
+                    socketPath = text.Copy(Path)
+                    directory = Directory
+                    controller = .Some(Controller)
+                    workers.Start(spawn acceptHostAgentChannels(
+                            $Listener,
+                            handle.Clone()
+                        ))
+                    const updating = spawn setAgentSocket(
+                        state.Clone(),
+                        $Path
+                    )
+                    discard $updating.wait()
+                }
+                Err(error): {
+                    discard error
+                    response = "agent-forward-fail"
+                }
+            }
+        }
+        const payload = protocol.EncodeControlMessage($protocol.ControlMessage {
+            Type = response
+        }) else error {
+            discard error
+            active = false
+            continue
+        }
+        const replying = spawn mux.WriteFrame($destination, .JSON, $payload)
+        const replied = $replying.wait()
+        const mux.WriteOutcome { Writer Value as replyValue } = replied
+        destination = Writer
+        match replyValue {
+            Ok: {}
+            Err(error): {
+                discard error
+                active = false
+            }
+        }
+    }
+    match controller {
+        Some(value): {
+            var selected = value
+            discard selected.Close()
+            discard selected
+        }
+        None: {}
+    }
+    const stopping = workers.CancelTask()
+    discard $stopping.wait()
+    if !text.IsEmpty(directory) {
+        discard fs.RemoveTree(directory, 4, 2)
+    }
+    discard socketPath
+    discard source
+    discard destination
+    discard handle
+    discard state
+}
+
+fn agentKind(value protocol.Kind) bool {
+    match value {
+        Agent: true
+        _: false
+    }
+}
+
+fn listenAgent() Result<agentListening, Error> {
+    const parent = agentTempDirectory()
+    const directory = fs.CreateTempDirectory(parent, "remolo-agent-") else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const socketPath = path.Join(directory, "agent.sock")
+    const listener = net.ListenLocal($text.Copy(socketPath)) else error {
+        discard error
+        discard fs.RemoveTree(directory, 2, 2)
+        return .Err(.Transport)
+    }
+    const controller = listener.Control() else error {
+        discard error
+        discard listener
+        discard fs.RemoveTree(directory, 2, 2)
+        return .Err(.Transport)
+    }
+    .Ok(agentListening {
+        Listener = listener
+        Controller = controller
+        Directory = directory
+        Path = socketPath
+    })
+}
+
+fn agentTempDirectory() String {
+    const configured = env.Get("TMPDIR") else error {
+        discard error
+        return "/tmp"
+    }
+    match configured {
+        Some(value): {
+            if !text.IsEmpty(value) return value
+        }
+        None: {}
+    }
+    "/tmp"
+}
+
+task acceptHostAgentChannels(
+    $listener own net.LocalListener,
+    $handle mux.Handle
+) void {
+    var active = listener
+    const workers = worker.NewSupervisor()
+    while true {
+        const accepting = spawn net.AcceptLocal($active)
+        const accepted = $accepting.wait()
+        const net.LocalAcceptOutcome { Listener Value } = accepted
+        active = Listener
+        const connection = Value else error {
+            discard error
+            discard active
+            discard handle
+            const stopping = workers.CancelTask()
+            discard $stopping.wait()
+            return
+        }
+        const opening = spawn mux.OpenChannel(
+            handle.Clone(),
+            $protocol.NewOpen(.Agent)
+        )
+        const opened = $opening.wait()
+        const stream = opened else error {
+            discard error
+            discard connection
+            continue
+        }
+        workers.Start(spawn spliceAgent($stream, $connection))
+    }
+}

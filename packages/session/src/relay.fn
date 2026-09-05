@@ -16,6 +16,7 @@ struct RelayHost {
     sessionID own bytes.Bytes
     capabilities protocol.Capabilities
     expiry u64
+    resume ResumeHandle
 }
 
 struct RelayHostAcceptOutcome {
@@ -30,7 +31,8 @@ fn relayHostFor(
     privateKey bytes.Bytes,
     sessionID bytes.Bytes,
     capabilities protocol.Capabilities,
-    expiry u64
+    expiry u64,
+    resume ResumeHandle
 ) Result<Option<own RelayHost>, Error> {
     if text.IsEmpty(address) {
         discard address
@@ -70,6 +72,7 @@ fn relayHostFor(
         sessionID = relaySessionID
         capabilities = protocol.CopyCapabilities(capabilities)
         expiry = expiry
+        resume = resume.Clone()
     }))
 }
 
@@ -231,6 +234,18 @@ task AcceptRelay(
             Value = .Err(.Transport)
         }
     }
+    const authPrivateKey = privateKey.Copy() else error {
+        discard error
+        discard privateKey
+        discard psk
+        discard publicKey
+        discard encodedCaps
+        discard connected
+        return HostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
     const securing = spawn transport.SecureServerOver(
         $connected,
         $privateKey
@@ -240,6 +255,7 @@ task AcceptRelay(
         discard error
         discard psk
         discard publicKey
+        discard authPrivateKey
         discard encodedCaps
         return HostAcceptOutcome {
             Host = restored
@@ -250,6 +266,10 @@ task AcceptRelay(
         $secured,
         $psk,
         $publicKey,
+        $authPrivateKey,
+        "",
+        restored.expiry,
+        restored.resume.Handle(),
         $encodedCaps
     )
     const peer = $authenticating.wait()
@@ -329,6 +349,18 @@ task AcceptRelayHost(
             Value = .Err(.Transport)
         }
     }
+    const authPrivateKey = privateKey.Copy() else error {
+        discard error
+        discard privateKey
+        discard psk
+        discard publicKey
+        discard encodedCaps
+        discard connected
+        return RelayHostAcceptOutcome {
+            Host = restored
+            Value = .Err(.Storage)
+        }
+    }
     const securing = spawn transport.SecureServerOver(
         $connected,
         $privateKey
@@ -338,6 +370,7 @@ task AcceptRelayHost(
         discard error
         discard psk
         discard publicKey
+        discard authPrivateKey
         discard encodedCaps
         return RelayHostAcceptOutcome {
             Host = restored
@@ -348,6 +381,10 @@ task AcceptRelayHost(
         $secured,
         $psk,
         $publicKey,
+        $authPrivateKey,
+        "",
+        restored.expiry,
+        cloneResumeHandle(restored.resume),
         $encodedCaps
     )
     const peer = $authenticating.wait()

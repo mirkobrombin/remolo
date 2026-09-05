@@ -143,3 +143,82 @@ test "synthetic capture advances the frame" {
     const second = capturer.Capture() else { fail("second capture failed") }
     expect(frameByte(first.Pixels, 0) != frameByte(second.Pixels, 0))
 }
+
+test "WebRTC data channel exchanges binary messages" {
+    const offerPeer = openRTCPeer() else { fail("offer peer open failed") }
+    const offerChannel = openRTCChannel(offerPeer, $"data") else {
+        fail("offer channel open failed")
+    }
+    const describingOffer = spawn localRTCDescription(
+        offerPeer.Reference(),
+        $"offer"
+    )
+    const offer = $describingOffer.wait() else {
+        fail("offer description failed")
+    }
+    const answerPeer = openRTCPeer() else { fail("answer peer open failed") }
+    setRTCRemote(answerPeer, offer, "offer") else {
+        fail("remote offer failed")
+    }
+    const accepting = spawn acceptRTCChannel(answerPeer.Reference())
+    const describingAnswer = spawn localRTCDescription(
+        answerPeer.Reference(),
+        $"answer"
+    )
+    const answer = $describingAnswer.wait() else {
+        fail("answer description failed")
+    }
+    setRTCRemote(offerPeer, answer, "answer") else {
+        fail("remote answer failed")
+    }
+    const answerChannel = $accepting.wait() else {
+        fail("answer channel accept failed")
+    }
+    const waitingOffer = spawn waitRTCChannel($offerChannel)
+    const waitingAnswer = spawn waitRTCChannel($answerChannel)
+    const readyOffer = $waitingOffer.wait() else {
+        fail("offer channel did not open")
+    }
+    const readyAnswer = $waitingAnswer.wait() else {
+        fail("answer channel did not open")
+    }
+    const offerStream = readyOffer.Split() else {
+        fail("offer channel split failed")
+    }
+    const answerStream = readyAnswer.Split() else {
+        fail("answer channel split failed")
+    }
+    const rtcStream {
+        Reader as offerReader
+        Writer as offerWriter
+        Controller as offerController
+    } = offerStream
+    const rtcStream {
+        Reader as answerReader
+        Writer as answerWriter
+        Controller as answerController
+    } = answerStream
+    const receiving = spawn readRTC($answerReader)
+    const sending = spawn writeRTC(
+        $offerWriter,
+        $bytes.FromText("foundation-webrtc")
+    )
+    const rtcWriteOutcome { Writer Value as sent } = $sending.wait()
+    sent else { fail("WebRTC message send failed") }
+    const rtcReadOutcome { Reader Value as received } = $receiving.wait()
+    const message = received else { fail("WebRTC message receive failed") }
+    const content = message.Text() else { fail("WebRTC message text failed") }
+    expect(content == "foundation-webrtc")
+    discard Writer
+    discard Reader
+    discard offerReader
+    discard answerWriter
+    var closingOffer = offerController
+    var closingAnswer = answerController
+    expect(closingOffer.Close())
+    expect(closingAnswer.Close())
+    discard closingOffer
+    discard closingAnswer
+    discard offerPeer
+    discard answerPeer
+}

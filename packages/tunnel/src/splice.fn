@@ -54,7 +54,8 @@ task spliceHalves(
         const closing = spawn mux.CloseStream($control)
         const closed = $closing.wait()
         discard closed
-        directions.Shutdown()
+        const stopping = directions.CancelTask()
+        discard $stopping.wait()
         discard network
         return .Err(.Stream)
     }
@@ -64,37 +65,53 @@ task spliceHalves(
         const closing = spawn mux.CloseStream($control)
         const closed = $closing.wait()
         discard closed
-        directions.Shutdown()
+        const stopping = directions.CancelTask()
+        discard $stopping.wait()
         discard network
         return .Err(.Stream)
     }
     const waiting = $directions.Next()
     const completed = $waiting.wait()
     const worker.GroupNext { Group Value } = completed
-    const result = match Value {
+    const first = match Value {
         Ok(value): value
         Err(error): {
             discard error
             Result<void, Error>.Err(.Stream)
         }
     }
-    discard network.Abort()
-    const closing = spawn mux.CloseStream($control)
-    const closed = $closing.wait()
-    Group.Shutdown()
+    first else error {
+        discard network.Abort()
+        const closing = spawn mux.CloseStream($control)
+        const closed = $closing.wait()
+        discard closed
+        const stopping = Group.CancelTask()
+        discard $stopping.wait()
+        discard network
+        return .Err(error)
+    }
+    const finishing = $Group.Next()
+    const finished = $finishing.wait()
+    const worker.GroupNext {
+        Group as completedGroup
+        Value as finalValue
+    } = finished
+    const result = match finalValue {
+        Ok(value): value
+        Err(error): {
+            discard error
+            Result<void, Error>.Err(.Stream)
+        }
+    }
+    const stopping = completedGroup.ShutdownTask()
+    discard $stopping.wait()
     discard network
+    discard control
     match result {
         Err(error): {
-            discard closed
             .Err(error)
         }
-        Ok: match closed {
-            Ok: .Ok
-            Err(error): {
-                discard error
-                .Err(.Stream)
-            }
-        }
+        Ok: .Ok
     }
 }
 

@@ -15,7 +15,16 @@ enum cliCommand {
     Put
     Get
     Sync
+    Alias
+    Group
+    Enroll
+    Revoke
+    Sessions
+    Mux
+    Mount
+    Service
     Help
+    Version
 }
 
 struct commandName {
@@ -26,11 +35,16 @@ struct commandName {
 fn usage() String {
     "usage:\n" +
         "  remolo host [--bind HOST:PORT] [--advertise IP] [--loopback] " +
-        "[--mdns] [--stun HOST:PORT] [--ttl SECONDS] [--identity PATH] " +
+        "[--mdns] [--stun HOST:PORT] [--ttl DURATION] [--identity PATH] " +
         "[--file-root PATH] " +
-        "[--rendezvous URL] [--relay HOST:PORT] [--ro] [--once]\n" +
+        "[--rendezvous URL] [--relay HOST:PORT] [--cap KIND] " +
+        "[--cmd NAME] [--approve] [--ro] [--once]\n" +
         "  remolo connect TOKEN [--mdns] [--rendezvous URL] " +
-        "[--relay HOST:PORT] [-- COMMAND [ARG...]]\n" +
+        "[--relay HOST:PORT] [--ssh-addr HOST:PORT] [--ssh-user USER] " +
+        "[--ssh-key PATH] [--ssh-known-hosts PATH] " +
+        "[--ssh-target HOST:PORT] [-J TOKEN] [-A] " +
+        "[--record FILE] [--resume] " +
+        "[-- COMMAND [ARG...]]\n" +
         "  remolo webterm TOKEN [--addr HOST:PORT] [--no-open]\n" +
         "  remolo desktop TOKEN [--addr HOST:PORT] [--fps RATE] [--no-open]\n" +
         "  remolo info TOKEN [--json]\n" +
@@ -40,14 +54,31 @@ fn usage() String {
         "  remolo rest TOKEN [--addr HOST:PORT]\n" +
         "  remolo fs TOKEN\n" +
         "  remolo snapshot TOKEN [--num COUNT] [--out PATH] [--diff]\n" +
-        "  remolo exec TOKEN COMMAND [ARG...]\n" +
+        "  remolo exec TOKEN [--cwd DIR] [--env KEY=VALUE] " +
+        "[--env-pass KEY] [-t|-T] [-q] [--] COMMAND [ARG...]\n" +
         "  remolo put TOKEN LOCAL REMOTE\n" +
         "  remolo get TOKEN REMOTE LOCAL\n" +
-        "  remolo sync TOKEN LOCAL REMOTE [--pull] [--delete] [--dry-run]\n"
+        "  remolo sync TOKEN LOCAL REMOTE [--pull] [--delete] [--dry-run] " +
+        "[--exclude GLOB]\n" +
+        "  remolo alias add NAME TOKEN [--relay ADDRESS] " +
+        "[--rendezvous URL] [--note TEXT]\n" +
+        "  remolo alias rm NAME\n" +
+        "  remolo alias ls\n" +
+        "  remolo group set NAME ALIAS...\n" +
+        "  remolo group ls\n" +
+        "  remolo group rm NAME\n" +
+        "  remolo enroll TOKEN [--as NAME]\n" +
+        "  remolo revoke FINGERPRINT\n" +
+        "  remolo sessions [--json]\n" +
+        "  remolo mux ls\n" +
+        "  remolo mux close SESSION\n" +
+        "  remolo mount TOKEN MOUNTPOINT [--read-only]\n" +
+        "  remolo service install [--identity PATH] [--args FLAGS]\n" +
+        "  remolo service uninstall\n"
 }
 
 fn commandFor(value String) Option<cliCommand> {
-    const names [17]commandName = [
+    const names [26]commandName = [
         commandName { value = "host" command = .Host },
         commandName { value = "connect" command = .Connect },
         commandName { value = "webterm" command = .Webterm },
@@ -62,9 +93,18 @@ fn commandFor(value String) Option<cliCommand> {
         commandName { value = "put" command = .Put },
         commandName { value = "get" command = .Get },
         commandName { value = "sync" command = .Sync },
+        commandName { value = "alias" command = .Alias },
+        commandName { value = "group" command = .Group },
+        commandName { value = "enroll" command = .Enroll },
+        commandName { value = "revoke" command = .Revoke },
+        commandName { value = "sessions" command = .Sessions },
+        commandName { value = "mux" command = .Mux },
+        commandName { value = "mount" command = .Mount },
+        commandName { value = "service" command = .Service },
         commandName { value = "help" command = .Help },
         commandName { value = "--help" command = .Help },
-        commandName { value = "-h" command = .Help }
+        commandName { value = "-h" command = .Help },
+        commandName { value = "--version" command = .Version }
     ]
     for name in names {
         if value == name.value return .Some(name.command)
@@ -88,19 +128,40 @@ fn executeCommand(command cliCommand, args [String]) Result<i32, failure> {
         Put: runPut(args)
         Get: runGet(args)
         Sync: runSync(args)
+        Alias: runAlias(args)
+        Group: runGroup(args)
+        Enroll: runEnroll(args)
+        Revoke: runRevoke(args)
+        Sessions: runSessions(args)
+        Mux: runMux(args)
+        Mount: runMount(args)
+        Service: runService(args)
         Help: {
             writeStdoutText(usage()) else error { return .Err(error) }
+            .Ok(0)
+        }
+        Version: {
+            writeStdoutText("1.0.0\n") else error { return .Err(error) }
             .Ok(0)
         }
     }
 }
 
 fn execute(args [String]) Result<i32, failure> {
-    if len(args) == 0 return .Err(invalid("expected a command"))
+    if len(args) == 0 {
+        writeStdoutText(usage()) else error { return .Err(error) }
+        return .Ok(0)
+    }
     const name = argument(args, 0)
     const command = commandFor(name)
     match command {
-        Some(value): executeCommand(value, args)
+        Some(value): {
+            if len(args) == 2 &&
+                (args[1] == "--help" || args[1] == "-h") {
+                return executeCommand(.Help, args)
+            }
+            executeCommand(value, args)
+        }
         None: .Err(invalid("unknown command: " + name))
     }
 }

@@ -1,0 +1,49 @@
+package remolo.cli
+
+import remolo.fusefs
+import remolo.session
+import std.fs
+
+fn runMount(args [String]) Result<i32, failure> {
+    if len(args) < 3 || len(args) > 4 {
+        return .Err(invalid("mount requires TOKEN MOUNTPOINT [--read-only]"))
+    }
+    var readOnly = false
+    if len(args) == 4 {
+        const option = argument(args, 3)
+        if option != "--read-only" && option != "-r" {
+            return .Err(invalid("unknown mount option: " + option))
+        }
+        readOnly = true
+    }
+    const mountpoint = argument(args, 2)
+    const kind = fs.Kind(mountpoint) else error {
+        discard error
+        return .Err(invalid("mountpoint is not available"))
+    }
+    match kind {
+        Directory: {}
+        _: { return .Err(invalid("mountpoint must be a directory")) }
+    }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    writeStdoutText("mounted remote filesystem at " + mountpoint + "\n") else error {
+        session.CloseClient($client)
+        return .Err(error)
+    }
+    const serving = spawn fusefs.Serve(
+        client.Handle(),
+        $mountpoint,
+        readOnly
+    )
+    const result = $serving.wait()
+    session.CloseClient($client)
+    result else error {
+        match error {
+            Unavailable: {
+                return .Err(failed("FUSE is unavailable on this system"))
+            }
+            _: { return .Err(failed("filesystem mount failed")) }
+        }
+    }
+    .Ok(0)
+}

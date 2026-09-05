@@ -71,6 +71,16 @@ test "exclude patterns match paths and basenames" {
     expect(!excludes.Match("src/main.fn", false))
 }
 
+test "exclude patterns can be added after option parsing" {
+    const patterns [0]String = []
+    var options = NewOptions(patterns)
+    options.AddExclude("*.tmp")
+    options.AddExclude("cache")
+    expect(options.Excludes.Match("src/cache.tmp", false))
+    expect(options.Excludes.Match("build/cache/data", false))
+    expect(!options.Excludes.Match("src/main.fn", false))
+}
+
 test "manifest encoding accepts the Go wire shape" {
     const encoded = bytes.FromText(
         "{\"link\":{\"kind\":2,\"mtime\":7,\"mode\":511," +

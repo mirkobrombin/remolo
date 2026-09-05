@@ -7,6 +7,8 @@ import remolo.token
 import remolo.transport
 import std.bytes
 import std.collections
+import std.concurrent
+import std.text
 
 enum Error {
     Expired
@@ -22,7 +24,12 @@ enum Error {
 }
 
 struct Host {
-    listener own transport.SecureListener
+    port u64
+    secureAcceptor Task<void>
+    quicAcceptor Task<void>
+    incoming Receiver<hostConnection>
+    secureController own transport.SecureListenerController
+    quicController own transport.QUICListenerController
     psk own bytes.Bytes
     publicKey own bytes.Bytes
     privateKey own bytes.Bytes
@@ -31,17 +38,40 @@ struct Host {
     expiry u64
     advertisement Option<Task<Result<void, discovery.Error>>>
     relay Option<own RelayHost>
+    authorizedPath String
+    resume own ResumeRegistry
 
     fn Port(self) u64 {
-        self.listener.Port()
+        self.port
+    }
+
+    fn Control(self) Result<own HostController, Error> {
+        .Ok(own HostController {
+            secure = self.secureController.Clone()
+            quic = self.quicController.Clone()
+        })
     }
 
     fn Close(&self) bool {
-        self.listener.Close()
+        const secureClosed = self.secureController.Close()
+        const quicClosed = self.quicController.Close()
+        secureClosed || quicClosed
     }
 
     fn TakeRelay(&self) Option<own RelayHost> {
         replace self.relay with .None
+    }
+}
+
+@concurrent.Transferable()
+struct HostController {
+    secure own transport.SecureListenerController
+    quic own transport.QUICListenerController
+
+    fn Close(&self) bool {
+        const secureClosed = self.secure.Close()
+        const quicClosed = self.quic.Close()
+        secureClosed || quicClosed
     }
 }
 
@@ -68,6 +98,50 @@ struct ConnectOptions {
     Rendezvous String
     Relay String
     LocalDiscovery bool
+    Preferred Option<token.Candidate>
+    SSH Option<own SSHRung>
+}
+
+struct SSHRung {
+    Address String
+    User String
+    KeyPath String
+    KnownHosts String
+    Target String
+}
+
+struct Policy {
+    AllowedKinds String
+    AllowedCommands String
+    AllowWrite bool
+    Approve bool
+}
+
+fn NewPolicy(
+    allowedKinds String,
+    allowedCommands String,
+    allowWrite bool,
+    approve bool
+) Policy {
+    Policy {
+        AllowedKinds = text.Copy(allowedKinds)
+        AllowedCommands = text.Copy(allowedCommands)
+        AllowWrite = allowWrite
+        Approve = approve
+    }
+}
+
+fn DefaultPolicy(allowWrite bool) Policy {
+    NewPolicy("", "", allowWrite, false)
+}
+
+fn copyPolicy(value Policy) Policy {
+    NewPolicy(
+        value.AllowedKinds,
+        value.AllowedCommands,
+        value.AllowWrite,
+        value.Approve
+    )
 }
 
 struct Client {
@@ -77,6 +151,9 @@ struct Client {
     controlWriter own mux.Writer
     sessionKey own bytes.Bytes
     capabilities protocol.Capabilities
+    daemon Option<own DaemonOwner>
+    route Option<own RouteOwner>
+    agent Option<own AgentForwardOwner>
 
     fn Capabilities(self) protocol.Capabilities {
         protocol.CopyCapabilities(self.capabilities)
@@ -93,6 +170,8 @@ struct Peer {
     controlReader own mux.Reader
     controlWriter own mux.Writer
     sessionKey own bytes.Bytes
+    authorizedPath String
+    resume ResumeHandle
 
     fn Handle(self) mux.Handle {
         self.handle.Clone()
@@ -156,13 +235,19 @@ fn CloseClient($client own Client) void {
         controlWriter
         sessionKey
         capabilities
+        daemon
+        route
+        agent
     } = client
+    mux.Close($session)
+    discard agent
+    discard route
+    discard daemon
     discard handle
     discard controlReader
     discard controlWriter
     discard sessionKey
     discard capabilities
-    mux.Close($session)
 }
 
 fn ClosePeer($peer own Peer) void {
@@ -172,10 +257,14 @@ fn ClosePeer($peer own Peer) void {
         controlReader
         controlWriter
         sessionKey
+        authorizedPath
+        resume
     } = peer
     discard handle
     discard controlReader
     discard controlWriter
     discard sessionKey
+    discard authorizedPath
+    discard resume
     mux.Close($session)
 }

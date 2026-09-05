@@ -105,6 +105,48 @@ fn VerifyClientSignature(
     Verify(clientPublicKeyPEM, message, clientSignature)
 }
 
+fn SessionKey(
+    hostRawPublicKey bytes.Bytes,
+    clientRawPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes
+) Result<own bytes.Bytes, IdentityError> {
+    validateTranscriptInputs(
+        hostRawPublicKey,
+        clientRawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    var digest = bytes.NewSha256()
+    digest.WriteText("remolo-clientkey-session-v1") else error {
+        discard error
+        return .Err(.Storage)
+    }
+    digest.WriteBytes(hostRawPublicKey) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    digest.WriteBytes(clientRawPublicKey) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    digest.WriteBytes(clientNonce) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    digest.WriteBytes(hostNonce) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const result = digest.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
 fn transcript(
     label String,
     hostRawPublicKey bytes.Bytes,

@@ -3,8 +3,11 @@ package remolo.session
 import foundation.worker
 import remolo.desktop
 import remolo.mux
+import remolo.protocol
 import remolo.rpc
 import remolo.tunnel
+import std.io
+import std.path
 import std.text
 import std.time
 
@@ -14,7 +17,12 @@ task ServePeer(
     allowWrite bool
 ) Result<void, Error> {
     const startedAt = time.MonotonicNow()
-    const serving = spawn servePeerSince($peer, $rootPath, allowWrite, startedAt)
+    const serving = spawn servePeerSince(
+        $peer,
+        $rootPath,
+        $DefaultPolicy(allowWrite),
+        startedAt
+    )
     const result = $serving.wait()
     result
 }
@@ -22,37 +30,130 @@ task ServePeer(
 task servePeerSince(
     $peer own Peer,
     $rootPath String,
-    allowWrite bool,
+    $policy Policy,
     startedAt time.MonotonicInstant
 ) Result<void, Error> {
-    var active = peer
-    const handle = active.Handle()
+    const Peer {
+        session
+        handle
+        controlReader
+        controlWriter
+        sessionKey
+        authorizedPath
+        resume
+    } = peer
+    const acceptingHandle = handle.Clone()
     const channels = worker.NewSupervisor()
+    const Channel { sender receiver } = newAgentState()
+    const state = agentStateHandle { requests = sender }
+    channels.Start(spawn serveAgentState($receiver))
+    channels.Start(spawn servePeerControl(
+            $controlReader,
+            $controlWriter,
+            handle.Clone(),
+            state.Clone()
+        ))
     while true {
-        const accepting = spawn mux.AcceptChannel($handle.Clone())
+        const accepting = spawn mux.AcceptChannel($acceptingHandle.Clone())
         const accepted = $accepting.wait()
         const channel = accepted else error {
             const result = acceptResult(error)
+            discard acceptingHandle
             discard handle
             discard rootPath
-            ClosePeer($active)
-            channels.Shutdown()
+            discard authorizedPath
+            discard resume
+            discard sessionKey
+            discard state
+            mux.Close($session)
+            const stopping = channels.CancelTask()
+            discard $stopping.wait()
             return result
         }
+        const readingPath = spawn agentSocket(state.Clone())
+        const socketPath = $readingPath.wait()
+        const prepared = attachAgentSocket($channel, $socketPath)
         channels.Start(channelTask(
-                $channel,
+                $prepared,
                 $text.Copy(rootPath),
-                allowWrite,
+                $text.Copy(authorizedPath),
+                resume.Clone(),
+                $copyPolicy(policy),
                 startedAt
             ))
     }
     .Ok
 }
 
+fn attachAgentSocket(
+    $channel mux.AcceptedChannel,
+    $socketPath String
+) mux.AcceptedChannel {
+    const mux.AcceptedChannel { Open Stream } = channel
+    const protocol.Open {
+        Kind
+        Cols
+        Rows
+        Command
+        Env
+        Term
+        Dir
+        Target
+        ResumeID
+    } = Open
+    var environment = Env
+    if !text.IsEmpty(socketPath) && processKind(Kind) {
+        environment.PushFront($protocol.Environment {
+            Name = "SSH_AUTH_SOCK"
+            Value = socketPath
+        })
+    } else {
+        discard socketPath
+    }
+    mux.AcceptedChannel {
+        Open = protocol.Open {
+            Kind = Kind
+            Cols = Cols
+            Rows = Rows
+            Command = Command
+            Env = environment
+            Term = Term
+            Dir = Dir
+            Target = Target
+            ResumeID = ResumeID
+        }
+        Stream = Stream
+    }
+}
+
+fn processKind(value protocol.Kind) bool {
+    match value {
+        PTY: true
+        Exec: true
+        _: false
+    }
+}
+
 task ServeHost(
     $host own Host,
     $rootPath String,
     allowWrite bool,
+    once bool
+) Result<void, Error> {
+    const serving = spawn ServeHostWithPolicy(
+        $host,
+        $rootPath,
+        $DefaultPolicy(allowWrite),
+        once
+    )
+    const result = $serving.wait()
+    result
+}
+
+task ServeHostWithPolicy(
+    $host own Host,
+    $rootPath String,
+    $policy Policy,
     once bool
 ) Result<void, Error> {
     var active = host
@@ -65,26 +166,37 @@ task ServeHost(
         active = restored
         const peer = Value else error {
             discard active
-            peers.Shutdown()
+            const stopping = peers.CancelTask()
+            discard $stopping.wait()
             return .Err(error)
+        }
+        if policy.Approve {
+            const address = peer.Handle().PeerAddress()
+            const approving = spawn approvedPeer($address)
+            const approved = $approving.wait()
+            if !approved {
+                ClosePeer($peer)
+                continue
+            }
         }
         if once {
             const serving = spawn servePeerSince(
                 $peer,
                 $rootPath,
-                allowWrite,
+                $copyPolicy(policy),
                 startedAt
             )
             const result = $serving.wait()
             discard active.Close()
             discard active
-            peers.Shutdown()
+            const stopping = peers.ShutdownTask()
+            discard $stopping.wait()
             return result
         }
         peers.Start(spawn runPeer(
                 $peer,
                 $text.Copy(rootPath),
-                allowWrite,
+                $copyPolicy(policy),
                 startedAt
             ))
     }
@@ -95,6 +207,20 @@ task ServeRelayHost(
     $host own RelayHost,
     $rootPath String,
     allowWrite bool
+) Result<void, Error> {
+    const serving = spawn ServeRelayHostWithPolicy(
+        $host,
+        $rootPath,
+        $DefaultPolicy(allowWrite)
+    )
+    const result = $serving.wait()
+    result
+}
+
+task ServeRelayHostWithPolicy(
+    $host own RelayHost,
+    $rootPath String,
+    $policy Policy
 ) Result<void, Error> {
     var active = host
     const startedAt = time.MonotonicNow()
@@ -108,10 +234,19 @@ task ServeRelayHost(
             discard rootPath
             return .Err(error)
         }
+        if policy.Approve {
+            const address = peer.Handle().PeerAddress()
+            const approving = spawn approvedPeer($address)
+            const approved = $approving.wait()
+            if !approved {
+                ClosePeer($peer)
+                continue
+            }
+        }
         const serving = spawn servePeerSince(
             $peer,
             $text.Copy(rootPath),
-            allowWrite,
+            $copyPolicy(policy),
             startedAt
         )
         const result = $serving.wait()
@@ -126,10 +261,10 @@ task ServeRelayHost(
 task runPeer(
     $peer own Peer,
     $rootPath String,
-    allowWrite bool,
+    $policy Policy,
     startedAt time.MonotonicInstant
 ) void {
-    const serving = spawn servePeerSince($peer, $rootPath, allowWrite, startedAt)
+    const serving = spawn servePeerSince($peer, $rootPath, $policy, startedAt)
     const result = $serving.wait()
     match result {
         Ok: {}
@@ -140,55 +275,202 @@ task runPeer(
 fn channelTask(
     $channel mux.AcceptedChannel,
     $rootPath String,
-    allowWrite bool,
+    $authorizedPath String,
+    $resume ResumeHandle,
+    $policy Policy,
     startedAt time.MonotonicInstant
 ) Task<void> {
-    const kind = channel.Open.Kind
+    const checked = checkChannelPolicy($channel, $policy)
+    const channelPolicyResult { Channel Allowed AllowWrite } = checked
+    const kind = Channel.Open.Kind
+    if !Allowed {
+        discard rootPath
+        discard authorizedPath
+        discard resume
+        return spawn rejectChannel($Channel)
+    }
     match kind {
         PTY: {
             discard rootPath
-            if allowWrite return spawn runPTYChannel($channel)
-            spawn rejectChannel($channel)
+            discard authorizedPath
+            if AllowWrite {
+                if text.IsEmpty(Channel.Open.ResumeID) {
+                    discard resume
+                    return spawn runPTYChannel($Channel)
+                }
+                return spawn runResumablePTYChannel($Channel, $resume)
+            }
+            discard resume
+            spawn rejectChannel($Channel)
         }
         Exec: {
             discard rootPath
-            if allowWrite return spawn runExecChannel($channel)
-            spawn rejectChannel($channel)
+            discard authorizedPath
+            discard resume
+            if AllowWrite return spawn runExecChannel($Channel)
+            spawn rejectChannel($Channel)
         }
         Desktop: {
             discard rootPath
-            spawn runDesktopChannel($channel)
+            discard authorizedPath
+            discard resume
+            spawn runDesktopChannel($Channel)
         }
         File: {
+            discard authorizedPath
+            discard resume
             spawn runFileChannel(
-                $channel,
+                $Channel,
                 $rootPath,
-                allowWrite
+                AllowWrite
             )
         }
         Sync: {
+            discard authorizedPath
+            discard resume
             spawn runDirectoryChannel(
-                $channel,
+                $Channel,
                 $rootPath,
-                allowWrite
+                AllowWrite
             )
         }
         Forward: {
             discard rootPath
-            spawn runForwardChannel($channel)
+            discard authorizedPath
+            discard resume
+            spawn runForwardChannel($Channel)
         }
         RPC: {
+            discard resume
             spawn runRPCChannel(
-                $channel,
+                $Channel,
                 $rootPath,
-                allowWrite,
+                $authorizedPath,
+                AllowWrite,
                 startedAt
             )
         }
         _: {
             discard rootPath
-            spawn rejectChannel($channel)
+            discard authorizedPath
+            discard resume
+            spawn rejectChannel($Channel)
         }
+    }
+}
+
+struct channelPolicyResult {
+    Channel mux.AcceptedChannel
+    Allowed bool
+    AllowWrite bool
+}
+
+fn checkChannelPolicy(
+    $channel mux.AcceptedChannel,
+    $policy Policy
+) channelPolicyResult {
+    const mux.AcceptedChannel { Open Stream } = channel
+    const protocol.Open {
+        Kind
+        Cols
+        Rows
+        Command
+        Env
+        Term
+        Dir
+        Target
+        ResumeID
+    } = Open
+    const Policy {
+        AllowedKinds
+        AllowedCommands
+        AllowWrite
+        Approve
+    } = policy
+    discard Approve
+    var commands = Command
+    const first = commands.PopFront()
+    var commandAllowed = text.IsEmpty(AllowedCommands)
+    match first {
+        Some(value): {
+            if !commandAllowed {
+                const name = path.FileName(value)
+                commandAllowed = text.Contains(
+                    AllowedCommands,
+                    "|" + name + "|"
+                )
+            }
+            commands.PushFront($value)
+        }
+        None: {}
+    }
+    const kindAllowed = text.IsEmpty(AllowedKinds) || text.Contains(
+        AllowedKinds,
+        "|" + policyKindName(Kind) + "|"
+    )
+    const restrictedCommand = match Kind {
+        PTY: !commandAllowed
+        Exec: !commandAllowed
+        _: false
+    }
+    const restrictedWrite = !AllowWrite && match Kind {
+        PTY: true
+        Exec: true
+        Forward: true
+        _: false
+    }
+    const restored = mux.AcceptedChannel {
+        Open = protocol.Open {
+            Kind = Kind
+            Cols = Cols
+            Rows = Rows
+            Command = commands
+            Env = Env
+            Term = Term
+            Dir = Dir
+            Target = Target
+            ResumeID = ResumeID
+        }
+        Stream = Stream
+    }
+    channelPolicyResult {
+        Channel = restored
+        Allowed = kindAllowed && !restrictedCommand && !restrictedWrite
+        AllowWrite = AllowWrite
+    }
+}
+
+fn policyKindName(value protocol.Kind) String {
+    match value {
+        Control: "control"
+        PTY: "pty"
+        Exec: "exec"
+        Desktop: "desktop"
+        File: "file"
+        RPC: "rpc"
+        Forward: "forward"
+        Sync: "sync"
+        Agent: "agent"
+    }
+}
+
+task approvedPeer($address String) bool {
+    io.WriteStdoutText(
+        "Allow connection from " + address + "? [y/N] "
+    ) else error {
+        discard error
+        return false
+    }
+    const reading = spawn io.ReadStdinLine()
+    const response = $reading.wait()
+    const value = response else error {
+        discard error
+        return false
+    }
+    match value {
+        Some(answer): answer == "y" || answer == "Y" ||
+            answer == "yes" || answer == "YES"
+        None: false
     }
 }
 
@@ -200,6 +482,15 @@ task runDesktopChannel($channel mux.AcceptedChannel) void {
 
 task runPTYChannel($channel mux.AcceptedChannel) void {
     const serving = spawn servePTYChannel($channel)
+    const result = $serving.wait()
+    discard result
+}
+
+task runResumablePTYChannel(
+    $channel mux.AcceptedChannel,
+    $resume ResumeHandle
+) void {
+    const serving = spawn ServeResumablePTY($channel, $resume)
     const result = $serving.wait()
     discard result
 }
@@ -247,10 +538,17 @@ task runForwardChannel($channel mux.AcceptedChannel) void {
 task runRPCChannel(
     $channel mux.AcceptedChannel,
     $rootPath String,
+    $authorizedPath String,
     allowExec bool,
     startedAt time.MonotonicInstant
 ) void {
-    const serving = spawn rpc.Serve($channel, $rootPath, allowExec, startedAt)
+    const serving = spawn rpc.Serve(
+        $channel,
+        $rootPath,
+        $authorizedPath,
+        allowExec,
+        startedAt
+    )
     const result = $serving.wait()
     discard result
 }
