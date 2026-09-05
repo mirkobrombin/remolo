@@ -1,0 +1,167 @@
+package remolo.desktop
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.desktop as platformDesktop
+
+fn startInput($reader own mux.Reader) Task<void> {
+    const input = platformDesktop.OpenInput()
+    match input {
+        Ok(active): spawn desktopInput($reader, $active)
+        Err(error): {
+            discard error
+            spawn desktopIgnoreInput($reader)
+        }
+    }
+}
+
+task desktopInput(
+    $reader own mux.Reader,
+    $input own platformDesktop.Input
+) void {
+    var source = reader
+    var active = input
+    while true {
+        const reading = spawn mux.ReadFrame($source)
+        const outcome = $reading.wait()
+        const mux.FrameReadOutcome { Reader Value } = outcome
+        source = Reader
+        const frame = Value else error {
+            discard error
+            discard source
+            discard active
+            return
+        }
+        const protocol.Frame { Type Payload } = frame
+        if jsonFrame(Type) {
+            desktopApplyInput(&active, $Payload)
+            continue
+        }
+        discard Payload
+        if endFrame(Type) {
+            discard source
+            discard active
+            return
+        }
+    }
+}
+
+task desktopIgnoreInput($reader own mux.Reader) void {
+    var source = reader
+    while true {
+        const reading = spawn mux.ReadFrame($source)
+        const outcome = $reading.wait()
+        const mux.FrameReadOutcome { Reader Value } = outcome
+        source = Reader
+        const frame = Value else error {
+            discard error
+            discard source
+            return
+        }
+        const protocol.Frame { Type Payload } = frame
+        discard Payload
+        if endFrame(Type) {
+            discard source
+            return
+        }
+    }
+}
+
+fn desktopApplyInput(
+    &input platformDesktop.Input,
+    $payload own bytes.Bytes
+) void {
+    const decoded = DecodeInput(payload)
+    discard payload
+    const event = decoded else error {
+        discard error
+        return
+    }
+    const result = applyInputEvent(&input, event)
+    match result {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
+fn applyInputEvent(
+    &input platformDesktop.Input,
+    event InputEvent
+) Result<void, platformDesktop.Error> {
+    match event.Type {
+        MouseMove: input.Move(event.X, event.Y)
+        MouseButton: input.Button(event.Button, event.Down)
+        Key: input.Key(event.Key, event.Down)
+        Wheel: input.Scroll(event.Delta)
+    }
+}
+
+task desktopDelay(fps u64) void {
+    const Channel { sender receiver } = channel<void>(0)
+    var endpoint = receiver
+    select {
+        endpoint.receive(): {
+            discard sender
+            discard endpoint
+        }
+        timeout desktopSecond() / normalizedFPS(fps): {
+            discard sender
+            discard endpoint
+        }
+        else error: {
+            discard error
+            discard sender
+            discard endpoint
+        }
+    }
+}
+
+fn desktopSecond() u64 {
+    1000000000
+}
+
+fn webRTCMode(mode Mode) bool {
+    match mode {
+        WebRTC: true
+        _: false
+    }
+}
+
+task desktopSend(
+    $writer own mux.Writer,
+    frameType protocol.FrameType,
+    $payload own bytes.Bytes
+) Result<own mux.Writer, Error> {
+    const pending = spawn mux.WriteFrame($writer, frameType, $payload)
+    const outcome = $pending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    Value else error {
+        discard error
+        discard Writer
+        return .Err(.Closed)
+    }
+    .Ok(Writer)
+}
+
+fn desktopKind(kind protocol.Kind) bool {
+    match kind {
+        Desktop: true
+        _: false
+    }
+}
+
+fn jsonFrame(frameType protocol.FrameType) bool {
+    match frameType {
+        JSON: true
+        _: false
+    }
+}
+
+fn endFrame(frameType protocol.FrameType) bool {
+    match frameType {
+        Exit: true
+        EOF: true
+        _: false
+    }
+}

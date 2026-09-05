@@ -1,0 +1,107 @@
+package remolo.desktop
+
+import std.bytes
+import std.collections
+import std.desktop as platformDesktop
+
+fn testPixels() own bytes.Bytes {
+    const opened = bytes.NewBuilder(8) else { fail("pixel builder failed") }
+    var builder = opened
+    const values [8]u64 = [255, 0, 0, 255, 0, 255, 0, 255]
+    for value in values {
+        builder.WriteByte(value) else { fail("pixel write failed") }
+    }
+    const result = builder.Finish() else { fail("pixel finish failed") }
+    result
+}
+
+fn testFrame() platformDesktop.Frame {
+    platformDesktop.Frame {
+        Width = 2
+        Height = 1
+        Pixels = testPixels()
+    }
+}
+
+test "desktop negotiation remains compatible with Go JSON" {
+    var modes = collections.NewList<Mode>()
+    modes.PushFront(.Diff)
+    modes.PushFront(.Screenshot)
+    const encoded = EncodeHello($own Hello {
+        Modes = modes
+        Width = 1920
+        Height = 1080
+    }) else { fail("hello encode failed") }
+    const decoded = DecodeHello(encoded) else { fail("hello decode failed") }
+    expect(decoded.Width == 1920)
+    expect(decoded.Height == 1080)
+    expect(decoded.Modes.Len() == 2)
+
+    const goSelect = bytes.FromText("{\"mode\":\"diff\",\"fps\":15}")
+    const selected = DecodeSelect(goSelect) else { fail("select decode failed") }
+    const diff = match selected.Mode {
+        Diff: true
+        _: false
+    }
+    expect(diff)
+    expect(selected.FPS == 15)
+}
+
+test "desktop input accepts omitted Go fields" {
+    const payload = bytes.FromText(
+        "{\"type\":\"mousemove\",\"x\":123,\"y\":456}"
+    )
+    const event = DecodeInput(payload) else { fail("input decode failed") }
+    const mouseMove = match event.Type {
+        MouseMove: true
+        _: false
+    }
+    expect(mouseMove)
+    expect(event.X == 123)
+    expect(event.Y == 456)
+    expect(event.Button == 0)
+    expect(!event.Down)
+}
+
+test "PNG encoder writes a valid RGBA image envelope" {
+    const image = EncodePNG(2, 1, testPixels()) else {
+        fail("PNG encode failed")
+    }
+    expect(frameByte(image, 0) == 137)
+    expect(frameByte(image, 1) == 80)
+    expect(frameByte(image, 2) == 78)
+    expect(frameByte(image, 3) == 71)
+    expect(frameU32(image, 16) == 2)
+    expect(frameU32(image, 20) == 1)
+    const length = frameLength(image)
+    expect(frameByte(image, length - 8) == 73)
+    expect(frameByte(image, length - 7) == 69)
+    expect(frameByte(image, length - 6) == 78)
+    expect(frameByte(image, length - 5) == 68)
+}
+
+test "diff encoding starts with a full frame and then emits no changed tiles" {
+    var encoder = NewEncoder(.Diff)
+    const first = EncodeFrame(&encoder, $testFrame()) else {
+        fail("first frame encode failed")
+    }
+    expect(frameByte(first, 0) == 1)
+    const decoded = DecodeFullFrame(first) else { fail("full frame decode failed") }
+    expect(decoded.Width == 2)
+    expect(decoded.Height == 1)
+    expect(frameByte(decoded.Image, 0) == 137)
+
+    const second = EncodeFrame(&encoder, $testFrame()) else {
+        fail("second frame encode failed")
+    }
+    expect(frameByte(second, 0) == 2)
+    expect(frameU32(second, 13) == 0)
+    expect(frameLength(second) == 17)
+}
+
+test "synthetic capture advances the frame" {
+    var capturer = NewSyntheticCapturer(2, 1)
+    const first = capturer.Capture() else { fail("first capture failed") }
+    const second = capturer.Capture() else { fail("second capture failed") }
+    expect(frameByte(first.Pixels, 0) != frameByte(second.Pixels, 0))
+}

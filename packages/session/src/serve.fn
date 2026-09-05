@@ -1,6 +1,7 @@
 package remolo.session
 
 import foundation.worker
+import remolo.desktop
 import remolo.mux
 import remolo.tunnel
 import std.text
@@ -132,6 +133,10 @@ fn channelTask(
             if allowWrite return spawn runExecChannel($channel)
             spawn rejectChannel($channel)
         }
+        Desktop: {
+            discard rootPath
+            spawn runDesktopChannel($channel)
+        }
         File: {
             spawn runFileChannel(
                 $channel,
@@ -155,6 +160,12 @@ fn channelTask(
             spawn rejectChannel($channel)
         }
     }
+}
+
+task runDesktopChannel($channel mux.AcceptedChannel) void {
+    const serving = spawn desktop.Serve($channel)
+    const result = $serving.wait()
+    discard result
 }
 
 task runPTYChannel($channel mux.AcceptedChannel) void {

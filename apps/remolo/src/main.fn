@@ -3,6 +3,8 @@ package remolo.cli
 enum cliCommand {
     Host
     Connect
+    Webterm
+    Desktop
     Exec
     Put
     Get
@@ -18,6 +20,8 @@ fn usage() String {
         "[--rendezvous URL] [--relay HOST:PORT] [--ro] [--once]\n" +
         "  remolo connect TOKEN [--mdns] [--rendezvous URL] " +
         "[--relay HOST:PORT] [-- COMMAND [ARG...]]\n" +
+        "  remolo webterm TOKEN [--addr HOST:PORT] [--no-open]\n" +
+        "  remolo desktop TOKEN [--addr HOST:PORT] [--fps RATE] [--no-open]\n" +
         "  remolo exec TOKEN COMMAND [ARG...]\n" +
         "  remolo put TOKEN LOCAL REMOTE\n" +
         "  remolo get TOKEN REMOTE LOCAL\n" +
@@ -27,6 +31,8 @@ fn usage() String {
 fn commandFor(value String) Option<cliCommand> {
     if value == "host" return .Some(.Host)
     if value == "connect" return .Some(.Connect)
+    if value == "webterm" return .Some(.Webterm)
+    if value == "desktop" return .Some(.Desktop)
     if value == "exec" return .Some(.Exec)
     if value == "put" return .Some(.Put)
     if value == "get" return .Some(.Get)
@@ -41,6 +47,8 @@ fn executeCommand(command cliCommand, args [String]) Result<i32, failure> {
     match command {
         Host: runHost(args)
         Connect: runShell(args)
+        Webterm: runWebterm(args)
+        Desktop: runDesktop(args)
         Exec: runExec(args)
         Put: runPut(args)
         Get: runGet(args)

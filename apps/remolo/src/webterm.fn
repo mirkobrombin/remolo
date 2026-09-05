@@ -1,0 +1,221 @@
+package remolo.cli
+
+import foundation.web
+import remolo.protocol
+import remolo.session
+import std.bytes
+
+enum terminalCommand {
+    Data(value own bytes.Bytes)
+    Resize(value protocol.Resize)
+}
+
+struct webtermPageHandler implements web.Handler<browserError> {}
+
+struct webtermOutputHandler implements web.Handler<browserError> {
+    output outputHandle
+}
+
+struct webtermInputHandler implements web.Handler<browserError> {
+    commands Sender<terminalCommand>
+}
+
+struct webtermResizeHandler implements web.Handler<browserError> {
+    commands Sender<terminalCommand>
+}
+
+methods webtermPageHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        discard request
+        var response = web.Text(200, $webtermPage())
+        response.SetHeader("Content-Type", "text/html; charset=utf-8")
+        .Ok(response)
+    }
+}
+
+methods webtermOutputHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        discard request
+        const taking = spawn takeOutput(self.output.Clone())
+        const value = $taking.wait()
+        match value {
+            None: .Ok(web.Empty(204))
+            Some(payload): {
+                var response = web.Binary(200, $payload, "application/octet-stream")
+                response.SetHeader("Cache-Control", "no-store")
+                .Ok(response)
+            }
+        }
+    }
+}
+
+methods webtermInputHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        const body = bytes.FromText(request.Body)
+        discard request
+        const sending = spawn sendTerminalCommand(
+            self.commands.clone(),
+            $ .Data(value = body)
+        )
+        if !$sending.wait() return .Err(.Failed)
+        .Ok(web.Empty(204))
+    }
+}
+
+methods webtermResizeHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        const payload = bytes.FromText(request.Body)
+        discard request
+        const resize = protocol.DecodeResize(payload) else error {
+            discard error
+            return .Err(.Failed)
+        }
+        const sending = spawn sendTerminalCommand(
+            self.commands.clone(),
+            $ .Resize(value = resize)
+        )
+        if !$sending.wait() return .Err(.Failed)
+        .Ok(web.Empty(204))
+    }
+}
+
+fn runWebterm(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("webterm requires a token"))
+    const options = parseBrowserOptions(args, 2, false) else error {
+        return .Err(error)
+    }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    var descriptor = protocol.NewOpen(.PTY)
+    descriptor.Cols = 80
+    descriptor.Rows = 24
+    descriptor.Term = "xterm-256color"
+    const opening = spawn session.OpenPTY(client.Handle(), $descriptor)
+    const opened = $opening.wait()
+    const remote = opened else error {
+        discard error
+        session.CloseClient($client)
+        return .Err(failed("could not open the remote terminal"))
+    }
+    const session.RemotePTY { Reader Writer Controller } = remote
+    const output = newOutputStore()
+    const Channel { sender receiver } = channel<terminalCommand>(64)
+    const reading = spawn pumpWebtermOutput($Reader, output.Handle.Clone())
+    const writing = spawn pumpWebtermInput($Writer, $receiver)
+    const router = webtermRouter($output.Handle.Clone(), $sender)
+    const result = serveBrowser($router, $options, "web terminal")
+    const closing = spawn session.ClosePTYChannel($Controller)
+    discard $closing.wait()
+    discard reading
+    discard writing
+    discard output
+    session.CloseClient($client)
+    result
+}
+
+fn webtermRouter(
+    $output outputHandle,
+    $commands Sender<terminalCommand>
+) own web.Router<browserError> {
+    var router = web.NewRouter<browserError>()
+    browserRoute(router.Map(.GET, "/", own webtermPageHandler {}))
+    browserRoute(router.Map(.GET, "/output", own webtermOutputHandler {
+        output = output
+    }))
+    browserRoute(router.Map(.POST, "/input", own webtermInputHandler {
+        commands = commands.clone()
+    }))
+    browserRoute(router.Map(.POST, "/resize", own webtermResizeHandler {
+        commands = commands
+    }))
+    router
+}
+
+task pumpWebtermOutput(
+    $reader own session.PTYReader,
+    $output outputHandle
+) void {
+    var source = reader
+    var destination = output
+    while true {
+        const reading = spawn session.ReadPTY($source)
+        const outcome = $reading.wait()
+        const session.PTYReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error {
+            discard error
+            discard source
+            discard destination
+            return
+        }
+        var ending = false
+        const value = match event {
+            Data(value): value
+            Exit(value): {
+                discard value
+                ending = true
+                bytes.FromText("\r\n[remolo: session ended]\r\n")
+            }
+        }
+        const appending = spawn appendOutput(destination.Clone(), $value)
+        $appending.wait()
+        if ending {
+            discard source
+            discard destination
+            return
+        }
+    }
+}
+
+task pumpWebtermInput(
+    $writer own session.PTYWriter,
+    $receiver Receiver<terminalCommand>
+) void {
+    var destination = writer
+    var inbox = receiver
+    while true {
+        const received = inbox.receive()
+        const command = received else error {
+            discard error
+            discard destination
+            discard inbox
+            return
+        }
+        const writing = match command {
+            Data(value): spawn session.WritePTY($destination, $value)
+            Resize(value): spawn session.ResizePTY(
+                $destination,
+                value.Cols,
+                value.Rows
+            )
+        }
+        const result = $writing.wait()
+        const next = result else error {
+            discard error
+            discard inbox
+            return
+        }
+        destination = next
+    }
+}
+
+task sendTerminalCommand(
+    $sender Sender<terminalCommand>,
+    $command terminalCommand
+) bool {
+    select {
+        sender.send(command): return true
+        else error: {
+            discard error
+            return false
+        }
+    }
+}
+
+fn browserRoute(
+    $value Result<void, web.RegistrationError>
+) void {
+    value else error {
+        discard error
+        panic("browser route registration failed")
+    }
+}

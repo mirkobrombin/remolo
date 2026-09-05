@@ -1,0 +1,49 @@
+package remolo.cli
+
+fn desktopPage() String {
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+        "<title>remolo desktop</title><style>" +
+        "html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#090c12;color:#fff}" +
+        "#stage{width:100%;height:100%;display:grid;place-items:center;cursor:crosshair}" +
+        "#screen{max-width:100%;max-height:100%;user-select:none}" +
+        "#status{position:fixed;top:12px;left:50%;transform:translateX(-50%);" +
+        "font:12px monospace;background:#0f1828dd;padding:7px 12px;border-radius:8px}" +
+        "</style></head><body><div id=\"stage\"><img id=\"screen\"></div>" +
+        "<div id=\"status\">click to control, F8 to release</div><script>" +
+        "const stage=document.getElementById('stage'),screen=document.getElementById('screen');" +
+        "let control=false,url='';const keys={KeyA:30,KeyB:48,KeyC:46,KeyD:32,KeyE:18," +
+        "KeyF:33,KeyG:34,KeyH:35,KeyI:23,KeyJ:36,KeyK:37,KeyL:38,KeyM:50,KeyN:49," +
+        "KeyO:24,KeyP:25,KeyQ:16,KeyR:19,KeyS:31,KeyT:20,KeyU:22,KeyV:47,KeyW:17," +
+        "KeyX:45,KeyY:21,KeyZ:44,Digit1:2,Digit2:3,Digit3:4,Digit4:5,Digit5:6," +
+        "Digit6:7,Digit7:8,Digit8:9,Digit9:10,Digit0:11,Enter:28,Escape:1,Backspace:14," +
+        "Tab:15,Space:57,Delete:111,Insert:110,ShiftLeft:42,ShiftRight:54,ControlLeft:29," +
+        "ControlRight:97,AltLeft:56,AltRight:100,MetaLeft:125,MetaRight:126,ArrowUp:103," +
+        "ArrowDown:108,ArrowLeft:105,ArrowRight:106,Home:102,End:107,PageUp:104,PageDown:109," +
+        "F1:59,F2:60,F3:61,F4:62,F5:63,F6:64,F7:65,F8:66,F9:67,F10:68,F11:87,F12:88};" +
+        "function post(v){fetch('/input',{method:'POST'," +
+        "headers:{'Content-Type':'application/json'}," +
+        "body:JSON.stringify(v)}).catch(()=>{})}" +
+        "async function poll(){try{const r=await fetch('/frame',{cache:'no-store'});" +
+        "if(r.status===200){const next=URL.createObjectURL(await r.blob());" +
+        "screen.onload=()=>{if(url)URL.revokeObjectURL(url);" +
+        "url=next};screen.src=next}}catch(e){}setTimeout(poll,50)}" +
+        "stage.onmousedown=e=>{if(!control){control=true;stage.requestPointerLock?.();return}" +
+        "const b=e.button===1?274:e.button===2?273:272;" +
+        "post({type:'mousebutton',button:b,down:true})};" +
+        "stage.onmouseup=e=>{if(!control)return;const b=e.button===1?274:e.button===2?273:272;" +
+        "post({type:'mousebutton',button:b,down:false})};" +
+        "stage.onmousemove=e=>{if(!control)return;const r=screen.getBoundingClientRect();" +
+        "const x=Math.max(0,Math.min(32767,Math.round((e.clientX-r.left)/r.width*32767)));" +
+        "const y=Math.max(0,Math.min(32767,Math.round((e.clientY-r.top)/r.height*32767)));" +
+        "post({type:'mousemove',x:x,y:y})};" +
+        "stage.onwheel=e=>{if(control){e.preventDefault();" +
+        "post({type:'wheel',dy:e.deltaY<0?1:-1})}};" +
+        "window.onkeydown=e=>{if(e.code==='F8'){control=!control;" +
+        "if(!control)document.exitPointerLock?.();e.preventDefault();return}" +
+        "if(control&&keys[e.code]){e.preventDefault();" +
+        "post({type:'key',key:keys[e.code],down:true})}};" +
+        "window.onkeyup=e=>{if(control&&keys[e.code]){e.preventDefault();" +
+        "post({type:'key',key:keys[e.code],down:false})}};" +
+        "stage.oncontextmenu=e=>{if(control)e.preventDefault()};poll();</script></body></html>"
+}

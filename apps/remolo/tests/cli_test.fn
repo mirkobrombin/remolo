@@ -6,7 +6,7 @@ test "host options preserve defaults" {
         fail("default host options failed")
     }
     expect(options.bindAddress == "0.0.0.0")
-    expect(options.advertiseAddress == "127.0.0.1")
+    expect(options.advertiseAddress == "")
     expect(options.port == 0)
     expect(options.ttl == 86400)
     expect(!options.readOnly)
@@ -90,5 +90,42 @@ test "exec keeps the command tail in order" {
     match third {
         None: fail("third command argument missing")
         Some(value): expect(value == "/tmp")
+    }
+}
+
+test "browser commands keep local defaults and validate frame rate" {
+    const defaults [2]String = ["desktop", "token"]
+    const options = parseBrowserOptions(defaults, 2, true) else {
+        fail("browser defaults failed")
+    }
+    expect(options.address == "127.0.0.1")
+    expect(options.port == 0)
+    expect(options.open)
+    expect(options.fps == 15)
+
+    const configured [7]String = [
+        "desktop",
+        "token",
+        "--addr",
+        "127.0.0.1:24002",
+        "--fps",
+        "30",
+        "--no-open"
+    ]
+    const selected = parseBrowserOptions(configured, 2, true) else {
+        fail("browser options failed")
+    }
+    expect(selected.address == "127.0.0.1")
+    expect(selected.port == 24002)
+    expect(!selected.open)
+    expect(selected.fps == 30)
+
+    const invalid [4]String = ["desktop", "token", "--fps", "0"]
+    match parseBrowserOptions(invalid, 2, true) {
+        Ok(value): {
+            discard value
+            fail("invalid frame rate was accepted")
+        }
+        Err(error): expect(error.code == 2)
     }
 }

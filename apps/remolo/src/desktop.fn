@@ -1,0 +1,218 @@
+package remolo.cli
+
+import foundation.web
+import remolo.desktop
+import remolo.session
+import std.bytes
+
+struct desktopPageHandler implements web.Handler<browserError> {}
+
+struct desktopFrameHandler implements web.Handler<browserError> {
+    frames own bytes.SecretMemory
+}
+
+struct desktopInputHandler implements web.Handler<browserError> {
+    input Sender<desktop.InputEvent>
+}
+
+methods desktopPageHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        discard request
+        var response = web.Text(200, $desktopPage())
+        response.SetHeader("Content-Type", "text/html; charset=utf-8")
+        .Ok(response)
+    }
+}
+
+methods desktopFrameHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        discard request
+        const frame = self.frames.Get("latest")
+        match frame {
+            Ok(image): {
+                var response = web.Binary(200, $image, "image/png")
+                response.SetHeader("Cache-Control", "no-store")
+                .Ok(response)
+            }
+            Err(error): {
+                discard error
+                .Ok(web.Empty(204))
+            }
+        }
+    }
+}
+
+methods desktopInputHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        const payload = bytes.FromText(request.Body)
+        discard request
+        const event = desktop.DecodeInput(payload) else error {
+            discard error
+            return .Err(.Failed)
+        }
+        const sending = spawn sendDesktopInput(self.input.clone(), event)
+        if !$sending.wait() return .Err(.Failed)
+        .Ok(web.Empty(204))
+    }
+}
+
+fn runDesktop(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("desktop requires a token"))
+    const options = parseBrowserOptions(args, 2, true) else error {
+        return .Err(error)
+    }
+    const fps = options.fps
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const capabilities = client.Capabilities()
+    if !capabilities.Desktop {
+        discard capabilities
+        session.CloseClient($client)
+        return .Err(failed("the host does not expose a desktop channel"))
+    }
+    discard capabilities
+    const opening = spawn desktop.Open(client.Handle(), fps)
+    const opened = $opening.wait()
+    const remote = opened else error {
+        discard error
+        session.CloseClient($client)
+        return .Err(failed("could not open the remote desktop"))
+    }
+    const desktop.RemoteDesktop {
+        Reader
+        Writer
+        Controller
+        Hello
+    } = remote
+    discard Hello
+    const frames = bytes.NewSecretMemory()
+    const readerMemory = frames.Clone() else error {
+        discard error
+        discard Reader
+        discard Writer
+        discard Controller
+        session.CloseClient($client)
+        return .Err(failed("could not create the desktop frame store"))
+    }
+    const handlerMemory = frames.Clone() else error {
+        discard error
+        discard readerMemory
+        discard Reader
+        discard Writer
+        discard Controller
+        session.CloseClient($client)
+        return .Err(failed("could not create the desktop frame store"))
+    }
+    const Channel { sender receiver } = channel<desktop.InputEvent>(256)
+    const reading = spawn pumpDesktopFrames($Reader, $readerMemory)
+    const writing = spawn pumpDesktopInput($Writer, $receiver)
+    const router = desktopRouter($handlerMemory, $sender)
+    const result = serveBrowser($router, $options, "live remote desktop")
+    const closing = spawn desktop.Close($Controller)
+    discard $closing.wait()
+    discard reading
+    discard writing
+    discard frames
+    session.CloseClient($client)
+    result
+}
+
+fn desktopRouter(
+    $frames own bytes.SecretMemory,
+    $input Sender<desktop.InputEvent>
+) own web.Router<browserError> {
+    var router = web.NewRouter<browserError>()
+    browserRoute(router.Map(.GET, "/", own desktopPageHandler {}))
+    browserRoute(router.Map(.GET, "/frame", own desktopFrameHandler {
+        frames = frames
+    }))
+    browserRoute(router.Map(.POST, "/input", own desktopInputHandler {
+        input = input
+    }))
+    router
+}
+
+task pumpDesktopFrames(
+    $reader own desktop.Reader,
+    $frames own bytes.SecretMemory
+) void {
+    var source = reader
+    var memory = frames
+    while true {
+        const reading = spawn desktop.Read($source)
+        const outcome = $reading.wait()
+        const desktop.ReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error {
+            discard error
+            discard source
+            discard memory
+            return
+        }
+        match event {
+            Frame(value): {
+                const desktop.EncodedFrame {
+                    Sequence
+                    Width
+                    Height
+                    Image
+                } = value
+                discard Sequence
+                discard Width
+                discard Height
+                const stored = memory.Set("latest", $Image)
+                match stored {
+                    Ok: {}
+                    Err(error): {
+                        discard error
+                        discard source
+                        discard memory
+                        return
+                    }
+                }
+            }
+            Exit: {
+                discard source
+                discard memory
+                return
+            }
+        }
+    }
+}
+
+task pumpDesktopInput(
+    $writer own desktop.Writer,
+    $receiver Receiver<desktop.InputEvent>
+) void {
+    var destination = writer
+    var inbox = receiver
+    while true {
+        const received = inbox.receive()
+        const event = received else error {
+            discard error
+            discard destination
+            discard inbox
+            return
+        }
+        const writing = spawn desktop.WriteInput($destination, event)
+        const result = $writing.wait()
+        const next = result else error {
+            discard error
+            discard inbox
+            return
+        }
+        destination = next
+    }
+}
+
+task sendDesktopInput(
+    $sender Sender<desktop.InputEvent>,
+    event desktop.InputEvent
+) bool {
+    select {
+        sender.send(event): return true
+        else error: {
+            discard error
+            return false
+        }
+    }
+}

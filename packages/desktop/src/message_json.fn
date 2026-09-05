@@ -1,0 +1,205 @@
+package remolo.desktop
+
+import std.bytes
+import std.collections
+import std.format
+import std.json
+import std.parse
+import std.text
+
+fn desktopEncodeJSON($object own json.Object) Result<own bytes.Bytes, Error> {
+    const encoded = json.Stringify(.Object(object)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(bytes.FromText(encoded))
+}
+
+fn desktopParseObject(source bytes.Bytes) Result<own json.Object, Error> {
+    const encoded = source.Text() else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    const parsed = json.Parse(encoded) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    match parsed {
+        Object(object): .Ok(object)
+        _: .Err(.Protocol)
+    }
+}
+
+fn desktopSet(
+    &object json.Object,
+    key String,
+    $value json.Value
+) Result<void, Error> {
+    object.Set($text.Copy(key), $value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn desktopSetText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, Error> {
+    desktopSet(&object, key, $ .Text(text.Copy(value)))
+}
+
+fn desktopSetNumber(
+    &object json.Object,
+    key String,
+    value u64
+) Result<void, Error> {
+    desktopSet(&object, key, $ .Number(format.U64(value)))
+}
+
+fn desktopSetSigned(
+    &object json.Object,
+    key String,
+    value i64
+) Result<void, Error> {
+    desktopSet(&object, key, $ .Number(format.I64(value)))
+}
+
+fn desktopRequiredText(
+    &object json.Object,
+    key String
+) Result<String, Error> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Err(.Protocol)
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn desktopRequiredU64(
+    &object json.Object,
+    key String
+) Result<u64, Error> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Err(.Protocol)
+        Some(value): desktopJSONU64($value)
+    }
+}
+
+fn desktopOptionalU64(
+    &object json.Object,
+    key String
+) Result<u64, Error> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Ok(0)
+        Some(value): desktopJSONU64($value)
+    }
+}
+
+fn desktopJSONU64($value json.Value) Result<u64, Error> {
+    match value {
+        Number(found): {
+            const parsed = parse.U64(found) else error {
+                discard error
+                return .Err(.Protocol)
+            }
+            .Ok(parsed)
+        }
+        _: .Err(.Protocol)
+    }
+}
+
+fn desktopOptionalI64(
+    &object json.Object,
+    key String
+) Result<i64, Error> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Ok(0)
+        Some(value): match value {
+            Number(found): {
+                const parsed = parse.I64(found) else error {
+                    discard error
+                    return .Err(.Protocol)
+                }
+                .Ok(parsed)
+            }
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn desktopOptionalBool(
+    &object json.Object,
+    key String
+) Result<bool, Error> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Ok(false)
+        Some(value): match value {
+            Bool(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn desktopModes(
+    &object json.Object
+) Result<own collections.List<Mode>, Error> {
+    const selected = object.Take("modes")
+    match selected {
+        None: .Err(.Protocol)
+        Some(value): match value {
+            Array(array): desktopModeList($array)
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn desktopModeList(
+    $values own json.Array
+) Result<own collections.List<Mode>, Error> {
+    var pending = values
+    var reversed = collections.NewList<Mode>()
+    while pending.Len() > 0 {
+        const value = desktopJSONValue(pending.PopFront())
+        const name = match value {
+            Text(found): found
+            _: { return .Err(.Protocol) }
+        }
+        const mode = ModeFor(name) else error { return .Err(error) }
+        reversed.PushFront(mode)
+    }
+    .Ok(desktopReverseModes($reversed))
+}
+
+fn desktopReverseModes(
+    $values own collections.List<Mode>
+) own collections.List<Mode> {
+    var pending = values
+    var result = collections.NewList<Mode>()
+    while !pending.IsEmpty() {
+        result.PushFront(modeValue(pending.PopFront()))
+    }
+    result
+}
+
+fn modeValue($value Option<Mode>) Mode {
+    match value {
+        None: panic("desktop mode list invariant failed")
+        Some(mode): mode
+    }
+}
+
+fn desktopJSONValue($value Option<json.Value>) json.Value {
+    match value {
+        None: panic("desktop JSON array invariant failed")
+        Some(found): found
+    }
+}

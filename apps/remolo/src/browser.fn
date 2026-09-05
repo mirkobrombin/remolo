@@ -1,0 +1,147 @@
+package remolo.cli
+
+import foundation.web
+import std.concurrent
+import std.format
+import std.net
+import std.parse
+import std.platform
+import std.process
+
+enum browserError {
+    Failed
+}
+
+struct browserOptions {
+    address String
+    port u64
+    open bool
+    fps u64
+}
+
+fn defaultBrowserOptions() own browserOptions {
+    own browserOptions {
+        address = "127.0.0.1"
+        port = 0
+        open = true
+        fps = 15
+    }
+}
+
+fn parseBrowserOptions(
+    args [String],
+    start usize,
+    allowFPS bool
+) Result<own browserOptions, failure> {
+    var options = defaultBrowserOptions()
+    var index = start
+    while index < len(args) {
+        const name = argument(args, index)
+        if name == "--no-open" {
+            options.open = false
+            index += 1
+            continue
+        }
+        if name == "--addr" {
+            const value = optionValue(args, index, name) else error {
+                return .Err(error)
+            }
+            const endpoint = net.ParseEndpoint(value) else error {
+                discard error
+                return .Err(invalid("--addr requires host:port"))
+            }
+            const net.Endpoint { Host Port } = endpoint
+            options.address = Host
+            options.port = u64.From(Port)
+            index += 2
+            continue
+        }
+        if allowFPS && name == "--fps" {
+            const value = optionValue(args, index, name) else error {
+                return .Err(error)
+            }
+            const fps = parseBrowserFPS(value) else error { return .Err(error) }
+            options.fps = fps
+            index += 2
+            continue
+        }
+        return .Err(invalid("unknown browser option: " + name))
+    }
+    .Ok(options)
+}
+
+fn serveBrowser(
+    $router own web.Router<browserError>,
+    $options own browserOptions,
+    label String
+) Result<i32, failure> {
+    const browserOptions { address port open fps } = options
+    discard fps
+    const server = web.NewServer<browserError>($address, port, $router) else error {
+        discard error
+        return .Err(failed("could not start the local browser server"))
+    }
+    const url = "http://" + browserAddress(server.Port()) + "/"
+    writeStdoutText("remolo: " + label + " at " + url + "\n") else error {
+        discard server
+        return .Err(error)
+    }
+    if open { openBrowser(url) }
+    const cancellation = concurrent.NewCancellationSource()
+    const serving = server.ServeUntil($cancellation.Token())
+    const result = $serving.wait()
+    discard cancellation
+    const stopped = result else error {
+        discard error
+        return .Err(failed("local browser server stopped"))
+    }
+    discard stopped
+    .Ok(0)
+}
+
+fn browserAddress(port u64) String {
+    "127.0.0.1:" + format.U64(port)
+}
+
+fn openBrowser(url String) void {
+    const current = platform.Current()
+    const program = match current {
+        MacOS: "open"
+        Windows: "rundll32"
+        _: "xdg-open"
+    }
+    const opened = process.Open(program, $process.DefaultOptions())
+    const command = opened else error {
+        discard error
+        return
+    }
+    var active = command
+    if windowsPlatform(current) {
+        active.AddArgument("url.dll,FileProtocolHandler") else error {
+            discard error
+            return
+        }
+    }
+    active.AddArgument(url) else error {
+        discard error
+        return
+    }
+    const result = active.Capture()
+    discard result
+}
+
+fn windowsPlatform(value platform.Kind) bool {
+    match value {
+        Windows: true
+        _: false
+    }
+}
+
+fn parseBrowserFPS(value String) Result<u64, failure> {
+    const fps = parse.U64(value) else error {
+        discard error
+        return .Err(invalid("--fps requires an integer"))
+    }
+    if fps == 0 || fps > 60 return .Err(invalid("--fps must be between 1 and 60"))
+    .Ok(fps)
+}

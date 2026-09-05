@@ -14,7 +14,7 @@ fn hostCapabilities() protocol.Capabilities {
         OS = platform.Name(platform.Current())
         Arch = "native"
         PTY = true
-        Desktop = false
+        Desktop = true
         Exec = true
         File = true
         Hostname = hostName()

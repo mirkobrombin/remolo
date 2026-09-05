@@ -1,5 +1,6 @@
 package remolo.session
 
+import remolo.desktop as remoteDesktop
 import remolo.dirsync
 import remolo.protocol
 import remolo.relay
@@ -1439,6 +1440,65 @@ test "peer dispatcher serves concurrent exec and file channels" {
     served else error { panic(sessionFailure(error)) }
     fs.RemoveTree(local, 16, 4) else { fail("dispatcher local cleanup failed") }
     fs.RemoveTree(remote, 16, 4) else { fail("dispatcher remote cleanup failed") }
+    expect(host.Close())
+}
+
+test "desktop channel negotiates and streams a browser image" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+    const serving = spawn ServePeer($peer, $".", true)
+    const opening = spawn remoteDesktop.Open(client.Handle(), 30)
+    const opened = $opening.wait() else error {
+        discard error
+        fail("desktop open failed")
+    }
+    const remoteDesktop.RemoteDesktop {
+        Reader
+        Writer
+        Controller
+        Hello
+    } = opened
+    expect(Hello.Width > 0)
+    expect(Hello.Height > 0)
+    discard Hello
+    discard Writer
+    const reading = spawn remoteDesktop.Read($Reader)
+    const outcome = $reading.wait()
+    const remoteDesktop.ReadOutcome { Reader as afterFrame Value as event } = outcome
+    const received = event else error {
+        discard error
+        fail("desktop frame read failed")
+    }
+    match received {
+        Frame(value): {
+            expect(value.Width > 0)
+            expect(value.Height > 0)
+            const signature = value.Image.At(0) else {
+                fail("desktop frame is empty")
+            }
+            expect(signature == 137)
+        }
+        Exit: fail("desktop stream exited before its first frame")
+    }
+    discard afterFrame
+    const closing = spawn remoteDesktop.Close($Controller)
+    discard $closing.wait()
+    CloseClient($client)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
     expect(host.Close())
 }
 
