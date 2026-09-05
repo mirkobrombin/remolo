@@ -1,0 +1,86 @@
+package remolo.cli
+
+import remolo.token
+import std.bytes
+import std.format
+import std.text
+import std.time
+
+fn runToken(args [String]) Result<i32, failure> {
+    if len(args) != 2 return .Err(invalid("token requires one token"))
+    const decoded = token.Decode(args[1]) else error {
+        discard error
+        return .Err(invalid("invalid session token"))
+    }
+    const token.Token {
+        Version
+        HostPublicKey
+        PSK
+        Candidates
+        SessionID
+        Expiry
+        Rendezvous
+    } = decoded
+    discard PSK
+    const expiry = time.FromUnix(Expiry).FormatUtc() else error {
+        discard error
+        discard HostPublicKey
+        discard Candidates
+        discard SessionID
+        return .Err(failed("token expiry is outside the supported range"))
+    }
+    const state = if time.Now().Unix() > Expiry { " (EXPIRED)" } else { "" }
+    const sessionID = encodeHex($SessionID) else error { return .Err(error) }
+    const hostKey = encodeHex($HostPublicKey) else error { return .Err(error) }
+    var output = "version:    " + format.U8(Version) + "\n" +
+        "session id: " + sessionID + "\n" +
+        "host key:   " + hostKey + "\n" +
+        "expiry:     " + expiry + state + "\n"
+    if !text.IsEmpty(Rendezvous) {
+        output = output + "rendezvous: " + Rendezvous + "\n"
+    }
+    output = output + "candidates (" + format.I32(Candidates.Len()) + "):\n"
+    var pending = Candidates
+    while !pending.IsEmpty() {
+        const candidate = match pending.PopFront() {
+            Some(found): found
+            None: { panic("token candidate list invariant failed") }
+        }
+        output = output + "  - " + candidate.Addr() + "\n"
+    }
+    writeStdoutText(output) else error { return .Err(error) }
+    .Ok(0)
+}
+
+fn encodeHex($value own bytes.Bytes) Result<String, failure> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(failed("could not inspect token bytes"))
+    }
+    var builder = text.NewBuilder()
+    var offset u64 = 0
+    while offset < length {
+        const byte = value.At(offset) else error {
+            discard error
+            return .Err(failed("could not inspect token bytes"))
+        }
+        writeHexDigit(&builder, byte >> 4) else error { return .Err(error) }
+        writeHexDigit(&builder, byte & 15) else error { return .Err(error) }
+        offset += 1
+    }
+    const encoded = builder.Finish() else error {
+        discard error
+        return .Err(failed("could not format token bytes"))
+    }
+    .Ok(encoded)
+}
+
+fn writeHexDigit(&builder text.Builder, value u64) Result<void, failure> {
+    const codePoint = if value < 10 { value + 48 } else { value + 87 }
+    const written = builder.WriteCodePoint(codePoint) else error {
+        discard error
+        return .Err(failed("could not format token bytes"))
+    }
+    if !written return .Err(failed("could not format token bytes"))
+    .Ok
+}

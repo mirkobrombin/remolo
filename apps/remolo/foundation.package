@@ -8,5 +8,6 @@ test_source tests
 dependency remolo.dirsync 1.0.0 path ../../packages/dirsync
 dependency remolo.desktop 1.0.0 path ../../packages/desktop
 dependency remolo.protocol 1.0.0 path ../../packages/protocol
+dependency remolo.rpc 1.0.0 path ../../packages/rpc
 dependency remolo.session 1.0.0 path ../../packages/session
 dependency remolo.token 1.0.0 path ../../packages/token

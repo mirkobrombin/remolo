@@ -1,7 +1,6 @@
 package remolo.cli
 
 import std.bytes
-import std.concurrent
 
 enum outputRequest {
     Append(value own bytes.Bytes)

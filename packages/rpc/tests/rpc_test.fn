@@ -1,0 +1,73 @@
+package remolo.rpc
+
+import std.json
+
+test "RPC requests remain compatible with Go JSON" {
+    const encoded = encodeRequest($request {
+        id = 7
+        method = "sysinfo"
+        params = .None
+    }) else { fail("request encode failed") }
+    expect(encoded == "{\"id\":7,\"method\":\"sysinfo\"}")
+    const decoded = decodeRequest(encoded) else { fail("request decode failed") }
+    expect(decoded.id == 7)
+    expect(decoded.method == "sysinfo")
+}
+
+test "RPC responses preserve remote failures" {
+    const decoded = decodeResponse("{\"id\":9,\"error\":\"denied\"}") else {
+        fail("response decode failed")
+    }
+    const response { id result error } = decoded
+    expect(id == 9)
+    expect(error == "denied")
+    match result {
+        Some(value): {
+            discard value
+            fail("failure response contained a result")
+        }
+        None: {}
+    }
+}
+
+test "RPC paths reject root escapes" {
+    match remotePath("../secret") {
+        Ok(value): {
+            discard value
+            fail("parent traversal was accepted")
+        }
+        Err(error): match error {
+            InvalidRequest: {}
+            _: fail("parent traversal returned the wrong error")
+        }
+    }
+    const absolute = remotePath("/absolute/file") else {
+        fail("root-relative absolute path was rejected")
+    }
+    expect(absolute == "absolute/file")
+    match remotePath("/../secret") {
+        Ok(value): {
+            discard value
+            fail("rooted parent traversal was accepted")
+        }
+        Err(error): match error {
+            InvalidRequest: {}
+            _: fail("rooted parent traversal returned the wrong error")
+        }
+    }
+}
+
+test "RPC system information decoder requires every field" {
+    const parsed = json.Parse(
+        "{\"os\":\"linux\",\"arch\":\"x86_64\",\"hostname\":\"host\"," +
+        "\"numcpu\":8,\"uptime\":12}"
+    ) else { fail("system information JSON failed") }
+    const info = decodeSystemInfo($parsed) else {
+        fail("system information decode failed")
+    }
+    expect(info.OS == "linux")
+    expect(info.Arch == "x86_64")
+    expect(info.Hostname == "host")
+    expect(info.NumCPU == 8)
+    expect(info.Uptime == 12)
+}

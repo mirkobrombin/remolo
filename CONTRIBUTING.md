@@ -19,7 +19,7 @@ Use a current Foundation SDK and keep generated outputs under `build/`:
 foundationc package resolve .
 foundationc imports --write .
 foundationc format --write .
-foundationc check .
+foundationc package check .
 foundationc lint .
 foundationc test .
 ```

@@ -4,6 +4,7 @@ import remolo.desktop as remoteDesktop
 import remolo.dirsync
 import remolo.protocol
 import remolo.relay
+import remolo.rpc
 import remolo.token
 import remolo.tunnel
 import std.bytes
@@ -1410,6 +1411,7 @@ test "peer dispatcher serves concurrent exec and file channels" {
 
     const serving = spawn ServePeer($peer, $text.Copy(remote), true)
     const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const inspecting = spawn rpc.SystemInfo(client.Handle())
     const putting = spawn PutFile(
         $client.Handle(),
         $text.Copy(source),
@@ -1417,6 +1419,10 @@ test "peer dispatcher serves concurrent exec and file channels" {
     )
     const executed = $executing.wait() else error {
         panic(sessionFailure(error))
+    }
+    const inspected = $inspecting.wait() else error {
+        discard error
+        fail("dispatcher RPC failed")
     }
     const uploaded = $putting.wait()
     uploaded else error { panic(sessionFailure(error)) }
@@ -1427,6 +1433,9 @@ test "peer dispatcher serves concurrent exec and file channels" {
     expect(Exit.Code == 7)
     expect(stdout == "foundation-exec\n")
     expect(stderr == "foundation-stderr\n")
+    expect(!text.IsEmpty(inspected.Hostname))
+    expect(!text.IsEmpty(inspected.Arch))
+    expect(inspected.NumCPU > 0)
     const stored = fs.ReadBytesSync(remote + "/uploaded.txt", 64) else {
         fail("dispatcher upload read failed")
     }

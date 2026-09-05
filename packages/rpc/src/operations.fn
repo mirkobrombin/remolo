@@ -1,0 +1,125 @@
+package remolo.rpc
+
+import remolo.mux
+import std.collections
+import std.json
+
+task SystemInfo($handle mux.Handle) Result<SysInfo, Error> {
+    const requesting = spawn Request($handle, $"sysinfo", $ .None)
+    const response = $requesting.wait()
+    const value = response else error { return .Err(error) }
+    decodeSystemInfo($value)
+}
+
+task List($handle mux.Handle, $path String) Result<own collections.List<DirEntry>, Error> {
+    const params = pathParams(path) else error { return .Err(error) }
+    const requesting = spawn Request($handle, $"ls", $ .Some(params))
+    const response = $requesting.wait()
+    const value = response else error { return .Err(error) }
+    decodeDirectory($value)
+}
+
+task Stat($handle mux.Handle, $path String) Result<StatResult, Error> {
+    const params = pathParams(path) else error { return .Err(error) }
+    const requesting = spawn Request($handle, $"stat", $ .Some(params))
+    const response = $requesting.wait()
+    const value = response else error { return .Err(error) }
+    decodeStat($value)
+}
+
+task ExecuteList(
+    $handle mux.Handle,
+    $command own collections.List<String>
+) Result<ExecResult, Error> {
+    const params = commandListParams($command) else error { return .Err(error) }
+    const requesting = spawn Request($handle, $"exec", $ .Some(params))
+    const response = $requesting.wait()
+    const value = response else error { return .Err(error) }
+    decodeExecution($value)
+}
+
+fn decodeSystemInfo($value json.Value) Result<SysInfo, Error> {
+    const selected = objectValue($value) else error { return .Err(error) }
+    var object = selected
+    const os = takeText(&object, "os") else error { return .Err(error) }
+    const arch = takeText(&object, "arch") else error { return .Err(error) }
+    const hostname = takeText(&object, "hostname") else error {
+        return .Err(error)
+    }
+    const cpus = takeU64(&object, "numcpu") else error { return .Err(error) }
+    const uptime = takeU64(&object, "uptime") else error { return .Err(error) }
+    .Ok(SysInfo {
+        OS = os
+        Arch = arch
+        Hostname = hostname
+        NumCPU = cpus
+        Uptime = uptime
+    })
+}
+
+fn decodeDirectory(
+    $value json.Value
+) Result<own collections.List<DirEntry>, Error> {
+    var source = match value {
+        Array(found): found
+        _: { return .Err(.Protocol) }
+    }
+    var reversed = collections.NewList<DirEntry>()
+    while source.Len() > 0 {
+        const entryValue = match source.PopFront() {
+            Some(found): found
+            None: { panic("RPC directory array invariant failed") }
+        }
+        const entry = decodeDirectoryEntry($entryValue) else error {
+            discard reversed
+            return .Err(error)
+        }
+        reversed.PushFront($entry)
+    }
+    .Ok(reverseEntries($reversed))
+}
+
+fn decodeDirectoryEntry($value json.Value) Result<DirEntry, Error> {
+    const selected = objectValue($value) else error { return .Err(error) }
+    var object = selected
+    const name = takeText(&object, "name") else error { return .Err(error) }
+    const size = takeU64(&object, "size") else error { return .Err(error) }
+    const isDir = takeBool(&object, "is_dir") else error { return .Err(error) }
+    const mode = takeText(&object, "mode") else error { return .Err(error) }
+    .Ok(DirEntry { Name = name Size = size IsDir = isDir Mode = mode })
+}
+
+fn decodeStat($value json.Value) Result<StatResult, Error> {
+    const selected = objectValue($value) else error { return .Err(error) }
+    var object = selected
+    const name = takeText(&object, "name") else error { return .Err(error) }
+    const size = takeU64(&object, "size") else error { return .Err(error) }
+    const isDir = takeBool(&object, "is_dir") else error { return .Err(error) }
+    const mode = takeText(&object, "mode") else error { return .Err(error) }
+    const modified = takeU64(&object, "mod_time") else error {
+        return .Err(error)
+    }
+    .Ok(StatResult {
+        Name = name
+        Size = size
+        IsDir = isDir
+        Mode = mode
+        ModTime = modified
+    })
+}
+
+fn decodeExecution($value json.Value) Result<ExecResult, Error> {
+    const selected = objectValue($value) else error { return .Err(error) }
+    var object = selected
+    const stdout = takeText(&object, "stdout") else error { return .Err(error) }
+    const stderr = takeText(&object, "stderr") else error { return .Err(error) }
+    const code = takeI32(&object, "code") else error { return .Err(error) }
+    .Ok(ExecResult { Stdout = stdout Stderr = stderr Code = code })
+}
+
+fn objectValue($value json.Value) Result<own json.Object, Error> {
+    match value {
+        Object(found): .Ok(found)
+        _: .Err(.Protocol)
+    }
+}

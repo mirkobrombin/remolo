@@ -1,0 +1,332 @@
+package remolo.cli
+
+import remolo.mux
+import remolo.rpc
+import remolo.session
+import std.collections
+import std.format
+import std.io
+import std.path
+import std.text
+
+enum fsAction {
+    Noop
+    Exit
+    PrintWorkingDirectory
+    List
+    ChangeDirectory
+    Stat
+    Get
+    Put
+    Unknown
+}
+
+struct fsInput {
+    command fsAction
+    arguments own collections.List<String>
+}
+
+fn runFS(args [String]) Result<i32, failure> {
+    if len(args) != 2 return .Err(invalid("fs requires a token"))
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    var current = "."
+    writeStdoutText(
+        "remolo fs: ls, cd, pwd, stat, get, put, exit\n"
+    ) else error {
+        session.CloseClient($client)
+        return .Err(error)
+    }
+    var running = true
+    while running {
+        writeStdoutText("remote:" + current + "$ ") else error {
+            session.CloseClient($client)
+            return .Err(error)
+        }
+        const reading = spawn io.ReadStdinLine()
+        const read = $reading.wait()
+        const line = read else error {
+            discard error
+            session.CloseClient($client)
+            return .Err(failed("could not read standard input"))
+        }
+        const source = match line {
+            None: {
+                running = false
+                continue
+            }
+            Some(value): value
+        }
+        const input = parseFSInput(source) else error {
+            writeStdoutText("error: " + error.message + "\n") else outputError {
+                session.CloseClient($client)
+                return .Err(outputError)
+            }
+            continue
+        }
+        const fsInput { command arguments } = input
+        const outcome = runFSAction(command, $arguments, &current, client.Handle())
+        match outcome {
+            Ok(stop): { if stop { running = false } }
+            Err(error): {
+                writeStdoutText("error: " + error.message + "\n") else outputError {
+                    session.CloseClient($client)
+                    return .Err(outputError)
+                }
+            }
+        }
+    }
+    session.CloseClient($client)
+    .Ok(0)
+}
+
+fn runFSAction(
+    command fsAction,
+    $arguments own collections.List<String>,
+    &current String,
+    $handle mux.Handle
+) Result<bool, failure> {
+    match command {
+        Noop: {
+            discard arguments
+            discard handle
+            .Ok(false)
+        }
+        Exit: {
+            discard arguments
+            discard handle
+            .Ok(true)
+        }
+        PrintWorkingDirectory: printWorkingDirectory($arguments, $handle, current)
+        List: listRemote($arguments, $handle, current)
+        ChangeDirectory: changeRemoteDirectory($arguments, $handle, &current)
+        Stat: statRemote($arguments, $handle, current)
+        Get: getRemote($arguments, $handle, current)
+        Put: putRemote($arguments, $handle, current)
+        Unknown: {
+            discard arguments
+            discard handle
+            .Err(invalid("unknown fs command"))
+        }
+    }
+}
+
+fn printWorkingDirectory(
+    $arguments own collections.List<String>,
+    $handle mux.Handle,
+    current String
+) Result<bool, failure> {
+    discard arguments
+    discard handle
+    writeStdoutText(current + "\n") else error { return .Err(error) }
+    .Ok(false)
+}
+
+fn listRemote(
+    $arguments own collections.List<String>,
+    $handle mux.Handle,
+    current String
+) Result<bool, failure> {
+    var values = arguments
+    const selected = match values.PopFront() {
+        None: text.Copy(current)
+        Some(value): resolveRemote(current, value)
+    }
+    if !values.IsEmpty() return .Err(invalid("ls accepts one path"))
+    const loading = spawn rpc.List($handle, $selected)
+    const result = $loading.wait() else error {
+        discard error
+        return .Err(failed("remote list failed"))
+    }
+    var entries = result
+    while !entries.IsEmpty() {
+        const entry = match entries.PopFront() {
+            Some(value): value
+            None: { panic("RPC directory list invariant failed") }
+        }
+        const suffix = if entry.IsDir { "/" } else { "" }
+        writeStdoutText(
+            "  " + format.U64(entry.Size) + "  " + entry.Name + suffix + "\n"
+        ) else error { return .Err(error) }
+    }
+    .Ok(false)
+}
+
+fn changeRemoteDirectory(
+    $arguments own collections.List<String>,
+    $handle mux.Handle,
+    &current String
+) Result<bool, failure> {
+    var values = arguments
+    const selected = match values.PopFront() {
+        None: "."
+        Some(value): resolveRemote(current, value)
+    }
+    if !values.IsEmpty() return .Err(invalid("cd accepts one path"))
+    const loading = spawn rpc.Stat($handle, $text.Copy(selected))
+    const result = $loading.wait() else error {
+        discard error
+        return .Err(failed("remote stat failed"))
+    }
+    if !result.IsDir return .Err(invalid(selected + " is not a directory"))
+    current = selected
+    .Ok(false)
+}
+
+fn statRemote(
+    $arguments own collections.List<String>,
+    $handle mux.Handle,
+    current String
+) Result<bool, failure> {
+    var values = arguments
+    const value = match values.PopFront() {
+        Some(found): found
+        None: { return .Err(invalid("stat requires a path")) }
+    }
+    if !values.IsEmpty() return .Err(invalid("stat accepts one path"))
+    const selected = resolveRemote(current, value)
+    const loading = spawn rpc.Stat($handle, $selected)
+    const result = $loading.wait() else error {
+        discard error
+        return .Err(failed("remote stat failed"))
+    }
+    writeStdoutText(
+        "name=" + result.Name + " size=" + format.U64(result.Size) +
+        " dir=" + if result.IsDir { "true" } else { "false" } +
+        " mode=" + result.Mode + "\n"
+    ) else error { return .Err(error) }
+    .Ok(false)
+}
+
+fn getRemote(
+    $arguments own collections.List<String>,
+    $handle mux.Handle,
+    current String
+) Result<bool, failure> {
+    var values = arguments
+    const remoteValue = match values.PopFront() {
+        Some(found): found
+        None: { return .Err(invalid("get requires a remote path")) }
+    }
+    const remote = resolveRemote(current, remoteValue)
+    const local = match values.PopFront() {
+        Some(found): found
+        None: path.FileName(remoteValue)
+    }
+    if !values.IsEmpty() return .Err(invalid("get accepts remote and local paths"))
+    const displayedRemote = text.Copy(remote)
+    const displayedLocal = text.Copy(local)
+    const transferring = spawn session.GetFile($handle, $remote, $local)
+    const result = $transferring.wait() else error {
+        discard error
+        return .Err(failed("download failed"))
+    }
+    writeStdoutText(
+        "downloaded " + displayedRemote + " -> " + displayedLocal + "\n"
+    ) else error {
+        return .Err(error)
+    }
+    discard result
+    .Ok(false)
+}
+
+fn putRemote(
+    $arguments own collections.List<String>,
+    $handle mux.Handle,
+    current String
+) Result<bool, failure> {
+    var values = arguments
+    const local = match values.PopFront() {
+        Some(found): found
+        None: { return .Err(invalid("put requires local and remote paths")) }
+    }
+    const remoteValue = match values.PopFront() {
+        Some(found): found
+        None: { return .Err(invalid("put requires local and remote paths")) }
+    }
+    if !values.IsEmpty() return .Err(invalid("put accepts local and remote paths"))
+    const remote = resolveRemote(current, remoteValue)
+    const displayedLocal = text.Copy(local)
+    const displayedRemote = text.Copy(remote)
+    const transferring = spawn session.PutFile($handle, $local, $remote)
+    $transferring.wait() else error {
+        discard error
+        return .Err(failed("upload failed"))
+    }
+    writeStdoutText(
+        "uploaded " + displayedLocal + " -> " + displayedRemote + "\n"
+    ) else error {
+        return .Err(error)
+    }
+    .Ok(false)
+}
+
+fn parseFSInput(value String) Result<own fsInput, failure> {
+    var words = splitWords(value)
+    const command = match words.PopFront() {
+        None: { return .Ok(own fsInput { command = .Noop arguments = words }) }
+        Some(found): found
+    }
+    .Ok(own fsInput { command = fsActionFor(command) arguments = words })
+}
+
+fn fsActionFor(value String) fsAction {
+    if value == "exit" || value == "quit" return .Exit
+    if value == "pwd" return .PrintWorkingDirectory
+    if value == "ls" return .List
+    if value == "cd" return .ChangeDirectory
+    if value == "stat" return .Stat
+    if value == "get" return .Get
+    if value == "put" return .Put
+    .Unknown
+}
+
+fn splitWords(value String) own collections.List<String> {
+    var reversed = collections.NewList<String>()
+    const length = text.ByteLen(value)
+    var offset u64 = 0
+    while offset < length {
+        while offset < length && whitespace(textByte(value, offset)) { offset += 1 }
+        const start = offset
+        while offset < length && !whitespace(textByte(value, offset)) { offset += 1 }
+        if start < offset {
+            const word = text.Slice(value, start, offset) else error {
+                discard error
+                panic("word boundaries must be valid UTF-8 boundaries")
+            }
+            reversed.PushFront($word)
+        }
+    }
+    reverseWords($reversed)
+}
+
+fn reverseWords(
+    $values own collections.List<String>
+) own collections.List<String> {
+    var source = values
+    var result = collections.NewList<String>()
+    while !source.IsEmpty() {
+        const value = match source.PopFront() {
+            Some(found): found
+            None: { panic("word list invariant failed") }
+        }
+        result.PushFront($value)
+    }
+    result
+}
+
+fn resolveRemote(current String, value String) String {
+    if path.IsAbsolute(value) return path.Normalize(value)
+    path.Normalize(path.Join(current, value))
+}
+
+fn textByte(value String, offset u64) u64 {
+    const byte = text.ByteAt(value, offset) else error {
+        discard error
+        panic("text byte must exist")
+    }
+    byte
+}
+
+fn whitespace(value u64) bool {
+    value == 32 || value == 9 || value == 10 || value == 13
+}

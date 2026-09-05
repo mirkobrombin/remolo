@@ -1,0 +1,67 @@
+package remolo.cli
+
+import remolo.rpc
+import remolo.session
+import std.format
+import std.json
+
+fn runInfo(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("info requires a token"))
+    if len(args) > 3 || (len(args) == 3 && args[2] != "--json") {
+        return .Err(invalid("info accepts only --json"))
+    }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const loading = spawn rpc.SystemInfo(client.Handle())
+    const result = $loading.wait()
+    session.CloseClient($client)
+    const info = result else error {
+        discard error
+        return .Err(failed("could not read remote system information"))
+    }
+    var output = ""
+    if len(args) == 3 {
+        const encoded = encodeSystemInfo($info) else error { return .Err(error) }
+        output = encoded
+    } else {
+        output = displaySystemInfo(info)
+    }
+    writeStdoutText(output) else error { return .Err(error) }
+    .Ok(0)
+}
+
+fn displaySystemInfo(value rpc.SysInfo) String {
+    "host:     " + value.Hostname + "\n" +
+        "os/arch:  " + value.OS + "/" + value.Arch + "\n" +
+        "cpus:     " + format.U64(value.NumCPU) + "\n" +
+        "uptime:   " + format.U64(value.Uptime) + "s\n"
+}
+
+fn encodeSystemInfo($value rpc.SysInfo) Result<String, failure> {
+    const rpc.SysInfo { OS Arch Hostname NumCPU Uptime } = value
+    var object = json.NewObject()
+    object.Set($"os", $ .Text(OS)) else error {
+        discard error
+        return .Err(failed("could not encode system information"))
+    }
+    object.Set($"arch", $ .Text(Arch)) else error {
+        discard error
+        return .Err(failed("could not encode system information"))
+    }
+    object.Set($"hostname", $ .Text(Hostname)) else error {
+        discard error
+        return .Err(failed("could not encode system information"))
+    }
+    object.Set($"numcpu", $ .Number(format.U64(NumCPU))) else error {
+        discard error
+        return .Err(failed("could not encode system information"))
+    }
+    object.Set($"uptime", $ .Number(format.U64(Uptime))) else error {
+        discard error
+        return .Err(failed("could not encode system information"))
+    }
+    const encoded = json.Stringify(.Object(object)) else error {
+        discard error
+        return .Err(failed("could not encode system information"))
+    }
+    .Ok(encoded + "\n")
+}

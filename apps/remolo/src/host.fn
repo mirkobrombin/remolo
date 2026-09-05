@@ -3,44 +3,41 @@ package remolo.cli
 import remolo.protocol
 import remolo.session
 import remolo.token
-import std.env
 import std.format
 import std.platform
+import std.system
 import std.text
 import std.time
 
 fn hostCapabilities() protocol.Capabilities {
+    const info = system.Snapshot() else error {
+        discard error
+        return fallbackHostCapabilities()
+    }
+    const system.Info { Hostname Architecture LogicalCPUs } = info
+    discard LogicalCPUs
     protocol.Capabilities {
         OS = platform.Name(platform.Current())
-        Arch = "native"
+        Arch = Architecture
         PTY = true
         Desktop = true
         Exec = true
         File = true
-        Hostname = hostName()
+        Hostname = Hostname
         Version = "1.0.0"
     }
 }
 
-fn hostName() String {
-    const primary = env.Get("HOSTNAME") else error {
-        discard error
-        return ""
-    }
-    match primary {
-        Some(value): value
-        None: windowsHostName()
-    }
-}
-
-fn windowsHostName() String {
-    const value = env.Get("COMPUTERNAME") else error {
-        discard error
-        return ""
-    }
-    match value {
-        None: ""
-        Some(name): name
+fn fallbackHostCapabilities() protocol.Capabilities {
+    protocol.Capabilities {
+        OS = platform.Name(platform.Current())
+        Arch = "unknown"
+        PTY = true
+        Desktop = true
+        Exec = true
+        File = true
+        Hostname = ""
+        Version = "1.0.0"
     }
 }
 

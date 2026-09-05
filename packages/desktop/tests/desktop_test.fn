@@ -23,6 +23,17 @@ fn testFrame() platformDesktop.Frame {
     }
 }
 
+fn changedTestFrame() platformDesktop.Frame {
+    const opened = bytes.NewBuilder(8) else { fail("pixel builder failed") }
+    var builder = opened
+    const values [8]u64 = [255, 0, 0, 255, 0, 0, 255, 255]
+    for value in values {
+        builder.WriteByte(value) else { fail("pixel write failed") }
+    }
+    const pixels = builder.Finish() else { fail("pixel finish failed") }
+    platformDesktop.Frame { Width = 2 Height = 1 Pixels = pixels }
+}
+
 test "desktop negotiation remains compatible with Go JSON" {
     var modes = collections.NewList<Mode>()
     modes.PushFront(.Diff)
@@ -97,6 +108,33 @@ test "diff encoding starts with a full frame and then emits no changed tiles" {
     expect(frameByte(second, 0) == 2)
     expect(frameU32(second, 13) == 0)
     expect(frameLength(second) == 17)
+}
+
+test "diff decoder rebuilds complete PNG frames" {
+    var encoder = NewEncoder(.Diff)
+    var decoder = NewDecoder()
+    const first = EncodeFrame(&encoder, $testFrame()) else {
+        fail("first frame encode failed")
+    }
+    const firstDecoded = DecodeFrame(&decoder, $first) else {
+        fail("first frame decode failed")
+    }
+    expect(firstDecoded.Width == 2)
+    expect(frameByte(firstDecoded.Image, 0) == 137)
+
+    const second = EncodeFrame(&encoder, $changedTestFrame()) else {
+        fail("second frame encode failed")
+    }
+    const secondDecoded = DecodeFrame(&decoder, $second) else {
+        fail("second frame decode failed")
+    }
+    const pixels = decodePNG(secondDecoded.Image) else {
+        fail("rebuilt PNG decode failed")
+    }
+    expect(frameByte(pixels.pixels, 4) == 0)
+    expect(frameByte(pixels.pixels, 5) == 0)
+    expect(frameByte(pixels.pixels, 6) == 255)
+    expect(frameByte(pixels.pixels, 7) == 255)
 }
 
 test "synthetic capture advances the frame" {

@@ -1,0 +1,185 @@
+package remolo.rpc
+
+import std.collections
+import std.fs
+import std.path
+import std.text
+
+fn listPath(root String, requested String) Result<own collections.List<DirEntry>, Error> {
+    const target = remotePath(requested) else error { return .Err(error) }
+    const opened = fs.OpenTree(root, 1000000, 4096) else error {
+        discard error
+        return .Err(.File)
+    }
+    var reader = opened
+    var reversed = collections.NewList<DirEntry>()
+    var found = target == "."
+    var reading = true
+    while reading {
+        const next = reader.Next() else error {
+            discard error
+            return .Err(.File)
+        }
+        match next {
+            None: { reading = false }
+            Some(entry): {
+                if entry.Path == target {
+                    found = directoryKind(entry.Kind)
+                }
+                if path.Parent(entry.Path) == target {
+                    reversed.PushFront(directoryEntry(entry))
+                }
+            }
+        }
+    }
+    const closed = reader.Close() else error {
+        discard error
+        return .Err(.File)
+    }
+    discard closed
+    if !found {
+        discard reversed
+        return .Err(.File)
+    }
+    .Ok(reverseEntries($reversed))
+}
+
+fn statPath(root String, requested String) Result<StatResult, Error> {
+    const target = remotePath(requested) else error { return .Err(error) }
+    if target == "." {
+        return .Ok(StatResult {
+            Name = path.FileName(root)
+            Size = 0
+            IsDir = true
+            Mode = "d---------"
+            ModTime = 0
+        })
+    }
+    const opened = fs.OpenTree(root, 1000000, 4096) else error {
+        discard error
+        return .Err(.File)
+    }
+    var reader = opened
+    var result Option<StatResult> = .None
+    var reading = true
+    while reading {
+        const next = reader.Next() else error {
+            discard error
+            return .Err(.File)
+        }
+        match next {
+            None: { reading = false }
+            Some(entry): {
+                if entry.Path == target {
+                    result = .Some(statEntry(entry))
+                    reading = false
+                }
+            }
+        }
+    }
+    const closed = reader.Close() else error {
+        discard error
+        return .Err(.File)
+    }
+    discard closed
+    match result {
+        Some(value): .Ok(value)
+        None: .Err(.File)
+    }
+}
+
+fn remotePath(value String) Result<String, Error> {
+    const length = text.ByteLen(value)
+    var start u64 = 0
+    while start < length {
+        const byte = text.ByteAt(value, start) else error {
+            discard error
+            return .Err(.InvalidRequest)
+        }
+        if byte != 47 break
+        start += 1
+    }
+    const selected = if start == length {
+        "."
+    } else {
+        const relative = text.Slice(value, start, length) else error {
+            discard error
+            return .Err(.InvalidRequest)
+        }
+        relative
+    }
+    const normalized = path.Normalize(selected)
+    if normalized == ".." || text.StartsWith(normalized, "../") ||
+        text.StartsWith(normalized, "..\\") {
+        return .Err(.InvalidRequest)
+    }
+    .Ok(normalized)
+}
+
+fn directoryEntry(entry fs.TreeEntry) DirEntry {
+    DirEntry {
+        Name = path.FileName(entry.Path)
+        Size = entry.Size
+        IsDir = directoryKind(entry.Kind)
+        Mode = modeString(entry.Kind, entry.Permissions)
+    }
+}
+
+fn statEntry(entry fs.TreeEntry) StatResult {
+    StatResult {
+        Name = path.FileName(entry.Path)
+        Size = entry.Size
+        IsDir = directoryKind(entry.Kind)
+        Mode = modeString(entry.Kind, entry.Permissions)
+        ModTime = entry.Modified
+    }
+}
+
+fn directoryKind(value fs.TreeKind) bool {
+    match value {
+        Directory: true
+        _: false
+    }
+}
+
+fn modeString(kind fs.TreeKind, permissions u32) String {
+    kindCharacter(kind) +
+        permissionCharacter(permissions, 256, "r") +
+        permissionCharacter(permissions, 128, "w") +
+        permissionCharacter(permissions, 64, "x") +
+        permissionCharacter(permissions, 32, "r") +
+        permissionCharacter(permissions, 16, "w") +
+        permissionCharacter(permissions, 8, "x") +
+        permissionCharacter(permissions, 4, "r") +
+        permissionCharacter(permissions, 2, "w") +
+        permissionCharacter(permissions, 1, "x")
+}
+
+fn kindCharacter(value fs.TreeKind) String {
+    match value {
+        File: "-"
+        Directory: "d"
+        SymbolicLink: "L"
+        Other: "?"
+    }
+}
+
+fn permissionCharacter(permissions u32, bit u32, value String) String {
+    if (permissions & bit) != 0 return text.Copy(value)
+    "-"
+}
+
+fn reverseEntries(
+    $values own collections.List<DirEntry>
+) own collections.List<DirEntry> {
+    var source = values
+    var result = collections.NewList<DirEntry>()
+    while !source.IsEmpty() {
+        const value = match source.PopFront() {
+            Some(found): found
+            None: { panic("RPC directory list invariant failed") }
+        }
+        result.PushFront($value)
+    }
+    result
+}

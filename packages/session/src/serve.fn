@@ -3,13 +3,27 @@ package remolo.session
 import foundation.worker
 import remolo.desktop
 import remolo.mux
+import remolo.rpc
 import remolo.tunnel
 import std.text
+import std.time
 
 task ServePeer(
     $peer own Peer,
     $rootPath String,
     allowWrite bool
+) Result<void, Error> {
+    const startedAt = time.MonotonicNow()
+    const serving = spawn servePeerSince($peer, $rootPath, allowWrite, startedAt)
+    const result = $serving.wait()
+    result
+}
+
+task servePeerSince(
+    $peer own Peer,
+    $rootPath String,
+    allowWrite bool,
+    startedAt time.MonotonicInstant
 ) Result<void, Error> {
     var active = peer
     const handle = active.Handle()
@@ -28,7 +42,8 @@ task ServePeer(
         channels.Start(channelTask(
                 $channel,
                 $text.Copy(rootPath),
-                allowWrite
+                allowWrite,
+                startedAt
             ))
     }
     .Ok
@@ -41,6 +56,7 @@ task ServeHost(
     once bool
 ) Result<void, Error> {
     var active = host
+    const startedAt = time.MonotonicNow()
     const peers = worker.NewSupervisor()
     while true {
         const accepting = spawn Accept($active)
@@ -53,10 +69,11 @@ task ServeHost(
             return .Err(error)
         }
         if once {
-            const serving = spawn ServePeer(
+            const serving = spawn servePeerSince(
                 $peer,
                 $rootPath,
-                allowWrite
+                allowWrite,
+                startedAt
             )
             const result = $serving.wait()
             discard active.Close()
@@ -67,7 +84,8 @@ task ServeHost(
         peers.Start(spawn runPeer(
                 $peer,
                 $text.Copy(rootPath),
-                allowWrite
+                allowWrite,
+                startedAt
             ))
     }
     .Ok
@@ -79,6 +97,7 @@ task ServeRelayHost(
     allowWrite bool
 ) Result<void, Error> {
     var active = host
+    const startedAt = time.MonotonicNow()
     while true {
         const accepting = spawn AcceptRelayHost($active)
         const accepted = $accepting.wait()
@@ -89,10 +108,11 @@ task ServeRelayHost(
             discard rootPath
             return .Err(error)
         }
-        const serving = spawn ServePeer(
+        const serving = spawn servePeerSince(
             $peer,
             $text.Copy(rootPath),
-            allowWrite
+            allowWrite,
+            startedAt
         )
         const result = $serving.wait()
         match result {
@@ -106,9 +126,10 @@ task ServeRelayHost(
 task runPeer(
     $peer own Peer,
     $rootPath String,
-    allowWrite bool
+    allowWrite bool,
+    startedAt time.MonotonicInstant
 ) void {
-    const serving = spawn ServePeer($peer, $rootPath, allowWrite)
+    const serving = spawn servePeerSince($peer, $rootPath, allowWrite, startedAt)
     const result = $serving.wait()
     match result {
         Ok: {}
@@ -119,7 +140,8 @@ task runPeer(
 fn channelTask(
     $channel mux.AcceptedChannel,
     $rootPath String,
-    allowWrite bool
+    allowWrite bool,
+    startedAt time.MonotonicInstant
 ) Task<void> {
     const kind = channel.Open.Kind
     match kind {
@@ -154,6 +176,14 @@ fn channelTask(
         Forward: {
             discard rootPath
             spawn runForwardChannel($channel)
+        }
+        RPC: {
+            spawn runRPCChannel(
+                $channel,
+                $rootPath,
+                allowWrite,
+                startedAt
+            )
         }
         _: {
             discard rootPath
@@ -210,6 +240,17 @@ task runDirectoryChannel(
 
 task runForwardChannel($channel mux.AcceptedChannel) void {
     const serving = spawn tunnel.ServeForwardChannel($channel)
+    const result = $serving.wait()
+    discard result
+}
+
+task runRPCChannel(
+    $channel mux.AcceptedChannel,
+    $rootPath String,
+    allowExec bool,
+    startedAt time.MonotonicInstant
+) void {
+    const serving = spawn rpc.Serve($channel, $rootPath, allowExec, startedAt)
     const result = $serving.wait()
     discard result
 }

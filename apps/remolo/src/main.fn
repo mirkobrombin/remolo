@@ -5,11 +5,22 @@ enum cliCommand {
     Connect
     Webterm
     Desktop
+    Info
+    Token
+    Forward
+    REST
+    FS
+    Snapshot
     Exec
     Put
     Get
     Sync
     Help
+}
+
+struct commandName {
+    value String
+    command cliCommand
 }
 
 fn usage() String {
@@ -22,6 +33,13 @@ fn usage() String {
         "[--relay HOST:PORT] [-- COMMAND [ARG...]]\n" +
         "  remolo webterm TOKEN [--addr HOST:PORT] [--no-open]\n" +
         "  remolo desktop TOKEN [--addr HOST:PORT] [--fps RATE] [--no-open]\n" +
+        "  remolo info TOKEN [--json]\n" +
+        "  remolo token TOKEN\n" +
+        "  remolo forward TOKEN [-L [BIND:]PORT:HOST:PORT] " +
+        "[-D [BIND:]PORT]\n" +
+        "  remolo rest TOKEN [--addr HOST:PORT]\n" +
+        "  remolo fs TOKEN\n" +
+        "  remolo snapshot TOKEN [--num COUNT] [--out PATH] [--diff]\n" +
         "  remolo exec TOKEN COMMAND [ARG...]\n" +
         "  remolo put TOKEN LOCAL REMOTE\n" +
         "  remolo get TOKEN REMOTE LOCAL\n" +
@@ -29,16 +47,27 @@ fn usage() String {
 }
 
 fn commandFor(value String) Option<cliCommand> {
-    if value == "host" return .Some(.Host)
-    if value == "connect" return .Some(.Connect)
-    if value == "webterm" return .Some(.Webterm)
-    if value == "desktop" return .Some(.Desktop)
-    if value == "exec" return .Some(.Exec)
-    if value == "put" return .Some(.Put)
-    if value == "get" return .Some(.Get)
-    if value == "sync" return .Some(.Sync)
-    if value == "help" || value == "--help" || value == "-h" {
-        return .Some(.Help)
+    const names [17]commandName = [
+        commandName { value = "host" command = .Host },
+        commandName { value = "connect" command = .Connect },
+        commandName { value = "webterm" command = .Webterm },
+        commandName { value = "desktop" command = .Desktop },
+        commandName { value = "info" command = .Info },
+        commandName { value = "token" command = .Token },
+        commandName { value = "forward" command = .Forward },
+        commandName { value = "rest" command = .REST },
+        commandName { value = "fs" command = .FS },
+        commandName { value = "snapshot" command = .Snapshot },
+        commandName { value = "exec" command = .Exec },
+        commandName { value = "put" command = .Put },
+        commandName { value = "get" command = .Get },
+        commandName { value = "sync" command = .Sync },
+        commandName { value = "help" command = .Help },
+        commandName { value = "--help" command = .Help },
+        commandName { value = "-h" command = .Help }
+    ]
+    for name in names {
+        if value == name.value return .Some(name.command)
     }
     .None
 }
@@ -49,6 +78,12 @@ fn executeCommand(command cliCommand, args [String]) Result<i32, failure> {
         Connect: runShell(args)
         Webterm: runWebterm(args)
         Desktop: runDesktop(args)
+        Info: runInfo(args)
+        Token: runToken(args)
+        Forward: runForward(args)
+        REST: runREST(args)
+        FS: runFS(args)
+        Snapshot: runSnapshot(args)
         Exec: runExec(args)
         Put: runPut(args)
         Get: runGet(args)

@@ -1,5 +1,9 @@
 package remolo.cli
 
+import foundation.web
+import std.collections
+import std.text
+
 test "host options preserve defaults" {
     const args [1]String = ["host"]
     const options = parseHostOptions(args) else {
@@ -128,4 +132,100 @@ test "browser commands keep local defaults and validate frame rate" {
         }
         Err(error): expect(error.code == 2)
     }
+}
+
+test "forward options keep local and SOCKS values separate" {
+    const args [6]String = [
+        "forward",
+        "token",
+        "-L",
+        "8080:example.com:80",
+        "-D",
+        "1080"
+    ]
+    const options = parseForwardOptions(args) else {
+        fail("forward options failed")
+    }
+    expect(options.local == "8080:example.com:80")
+    expect(options.socks == "1080")
+    const local = parseLocalSpec(options.local) else {
+        fail("local forward parsing failed")
+    }
+    expect(local.address == "127.0.0.1")
+    expect(local.port == 8080)
+    expect(local.target == "example.com:80")
+}
+
+test "snapshot options select diff mode" {
+    const args [7]String = [
+        "snapshot",
+        "token",
+        "--num",
+        "3",
+        "--out",
+        "frames",
+        "--diff"
+    ]
+    const options = parseSnapshotOptions(args) else {
+        fail("snapshot options failed")
+    }
+    expect(options.count == 3)
+    expect(options.output == "frames")
+    const diff = match options.mode {
+        Diff: true
+        _: false
+    }
+    expect(diff)
+}
+
+test "file browser input splits command words" {
+    const input = parseFSInput("put local.txt remote.txt") else {
+        fail("file browser input failed")
+    }
+    const fsInput { command arguments } = input
+    const put = match command {
+        Put: true
+        _: false
+    }
+    expect(put)
+    expect(arguments.Len() == 2)
+}
+
+test "REST rejects wrong methods with a JSON response" {
+    const handled = restMethodGuard(
+        $restRequest(.POST, "/sysinfo"),
+        acceptedRESTRequest
+    )
+    const response = handled else {
+        fail("REST method guard failed")
+    }
+    var active = response
+    expect(active.Status == 405)
+    const allow = active.Header("Allow")
+    match allow {
+        Some(value): expect(value == "GET")
+        None: fail("REST method response omitted Allow")
+    }
+    const body = active.TextBody() else {
+        fail("REST method response was not text")
+    }
+    expect(body == "{\"error\":\"method not allowed\"}\n")
+}
+
+fn restRequest(method web.Method, path String) web.Request {
+    web.Request {
+        Method = method
+        Target = text.Copy(path)
+        Path = text.Copy(path)
+        Version = "HTTP/1.1"
+        Headers = collections.NewList<web.HeaderValue>()
+        Params = collections.NewList<web.Parameter>()
+    }
+}
+
+fn acceptedRESTRequest(
+    $request web.Request
+) Result<web.Response, web.DispatchError<browserError>> {
+    discard request
+    .Ok(web.Empty(204))
 }

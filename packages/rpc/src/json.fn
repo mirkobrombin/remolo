@@ -1,0 +1,280 @@
+package remolo.rpc
+
+import std.collections
+import std.format
+import std.json
+import std.parse
+import std.text
+
+fn setValue(
+    &object json.Object,
+    key String,
+    $value json.Value
+) Result<void, Error> {
+    object.Set($text.Copy(key), $value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setText(&object json.Object, key String, value String) Result<void, Error> {
+    setValue(&object, key, $ .Text(text.Copy(value)))
+}
+
+fn setNumber(&object json.Object, key String, value u64) Result<void, Error> {
+    setValue(&object, key, $ .Number(format.U64(value)))
+}
+
+fn setSigned(&object json.Object, key String, value i32) Result<void, Error> {
+    setValue(&object, key, $ .Number(format.I32(value)))
+}
+
+fn setBool(&object json.Object, key String, value bool) Result<void, Error> {
+    setValue(&object, key, $ .Bool(value))
+}
+
+fn parseObject(source String) Result<own json.Object, Error> {
+    const parsed = json.Parse(source) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    match parsed {
+        Object(object): .Ok(object)
+        _: .Err(.Protocol)
+    }
+}
+
+fn takeText(&object json.Object, key String) Result<String, Error> {
+    match object.Take(key) {
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+        None: .Err(.Protocol)
+    }
+}
+
+fn takeOptionalText(&object json.Object, key String) Result<String, Error> {
+    match object.Take(key) {
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+        None: .Ok("")
+    }
+}
+
+fn takeU64(&object json.Object, key String) Result<u64, Error> {
+    match object.Take(key) {
+        Some(value): jsonU64($value)
+        None: .Err(.Protocol)
+    }
+}
+
+fn takeI32(&object json.Object, key String) Result<i32, Error> {
+    match object.Take(key) {
+        Some(value): match value {
+            Number(found): {
+                const parsed = parse.I32(found) else error {
+                    discard error
+                    return .Err(.Protocol)
+                }
+                .Ok(parsed)
+            }
+            _: .Err(.Protocol)
+        }
+        None: .Err(.Protocol)
+    }
+}
+
+fn takeBool(&object json.Object, key String) Result<bool, Error> {
+    match object.Take(key) {
+        Some(value): match value {
+            Bool(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+        None: .Err(.Protocol)
+    }
+}
+
+fn jsonU64($value json.Value) Result<u64, Error> {
+    match value {
+        Number(found): {
+            const parsed = parse.U64(found) else error {
+                discard error
+                return .Err(.Protocol)
+            }
+            .Ok(parsed)
+        }
+        _: .Err(.Protocol)
+    }
+}
+
+fn encodeRequest($value request) Result<String, Error> {
+    const request { id method params } = value
+    var object = json.NewObject()
+    setNumber(&object, "id", id) else error { return .Err(error) }
+    setText(&object, "method", method) else error { return .Err(error) }
+    match params {
+        Some(value): {
+            setValue(&object, "params", $value) else error {
+                return .Err(error)
+            }
+        }
+        None: {}
+    }
+    const encoded = json.Stringify(.Object(object)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}
+
+fn decodeRequest(source String) Result<request, Error> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const id = takeU64(&object, "id") else error { return .Err(error) }
+    const method = takeText(&object, "method") else error {
+        return .Err(error)
+    }
+    const params = object.Take("params")
+    .Ok(request { id = id method = method params = params })
+}
+
+fn encodeResponse($value response) Result<String, Error> {
+    const response { id result error as message } = value
+    var object = json.NewObject()
+    setNumber(&object, "id", id) else error { return .Err(error) }
+    match result {
+        Some(value): {
+            setValue(&object, "result", $value) else error {
+                return .Err(error)
+            }
+        }
+        None: {}
+    }
+    if !text.IsEmpty(message) {
+        setText(&object, "error", message) else error { return .Err(error) }
+    }
+    const encoded = json.Stringify(.Object(object)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}
+
+fn decodeResponse(source String) Result<response, Error> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const id = takeU64(&object, "id") else error { return .Err(error) }
+    const result = object.Take("result")
+    const message = takeOptionalText(&object, "error") else error {
+        return .Err(error)
+    }
+    .Ok(response { id = id result = result error = message })
+}
+
+fn pathParams(value String) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setText(&object, "path", value) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn commandParams(values [String]) Result<json.Value, Error> {
+    var array = json.NewArray()
+    var index usize = 0
+    while index < len(values) {
+        array.Add(.Text(text.Copy(values[index])))
+        index += 1
+    }
+    var object = json.NewObject()
+    setValue(&object, "cmd", $ .Array(array)) else error {
+        return .Err(error)
+    }
+    .Ok(.Object(object))
+}
+
+fn commandListParams(
+    $values own collections.List<String>
+) Result<json.Value, Error> {
+    var pending = values
+    var array = json.NewArray()
+    while !pending.IsEmpty() {
+        const value = match pending.PopFront() {
+            Some(found): found
+            None: { panic("RPC command list invariant failed") }
+        }
+        array.Add(.Text(value))
+    }
+    var object = json.NewObject()
+    setValue(&object, "cmd", $ .Array(array)) else error {
+        return .Err(error)
+    }
+    .Ok(.Object(object))
+}
+
+fn takePath($params Option<json.Value>) Result<String, Error> {
+    match params {
+        Some(value): match value {
+            Object(object): {
+                var fields = object
+                takeOptionalText(&fields, "path")
+            }
+            _: .Err(.InvalidRequest)
+        }
+        None: .Ok("")
+    }
+}
+
+fn takeCommand(
+    $params Option<json.Value>
+) Result<own collections.List<String>, Error> {
+    const value = match params {
+        Some(found): found
+        None: { return .Err(.InvalidRequest) }
+    }
+    const object = match value {
+        Object(found): found
+        _: { return .Err(.InvalidRequest) }
+    }
+    var fields = object
+    const selected = fields.Take("cmd")
+    const selectedValue = match selected {
+        Some(found): found
+        None: { return .Err(.InvalidRequest) }
+    }
+    const array = match selectedValue {
+        Array(found): found
+        _: { return .Err(.InvalidRequest) }
+    }
+    var pending = array
+    var reversed = collections.NewList<String>()
+    while pending.Len() > 0 {
+        const item = match pending.PopFront() {
+            Some(found): found
+            None: { panic("RPC command array invariant failed") }
+        }
+        match item {
+            Text(found): reversed.PushFront($found)
+            _: { return .Err(.InvalidRequest) }
+        }
+    }
+    if reversed.IsEmpty() return .Err(.InvalidRequest)
+    .Ok(reverseStrings($reversed))
+}
+
+fn reverseStrings(
+    $values own collections.List<String>
+) own collections.List<String> {
+    var source = values
+    var result = collections.NewList<String>()
+    while !source.IsEmpty() {
+        const value = match source.PopFront() {
+            Some(found): found
+            None: { panic("RPC string list invariant failed") }
+        }
+        result.PushFront($value)
+    }
+    result
+}

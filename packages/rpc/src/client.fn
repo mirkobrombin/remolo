@@ -1,0 +1,146 @@
+package remolo.rpc
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.json
+import std.text
+
+task Open($handle mux.Handle) Result<own Client, Error> {
+    const opening = spawn mux.OpenChannel($handle, $protocol.NewOpen(.RPC))
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        return .Err(.Transport)
+    }
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    .Ok(own Client { reader = Reader writer = Writer nextID = 1 })
+}
+
+task Call(
+    $client own Client,
+    $method String,
+    $params Option<json.Value>
+) CallOutcome {
+    const Client { reader writer nextID } = client
+    const encoded = encodeRequest($request {
+        id = nextID
+        method = method
+        params = params
+    }) else error {
+        return callFailure($reader, $writer, nextID, $error)
+    }
+    const sending = spawn mux.WriteFrame(
+        $writer,
+        .JSON,
+        $bytes.FromText(encoded)
+    )
+    const sent = $sending.wait()
+    const mux.WriteOutcome { Writer Value } = sent
+    Value else error {
+        discard error
+        return callFailure($reader, $Writer, nextID, .Transport)
+    }
+    const receiving = spawn callResponse($reader, $Writer, nextID, 64)
+    const result = $receiving.wait()
+    result
+}
+
+task Request(
+    $handle mux.Handle,
+    $method String,
+    $params Option<json.Value>
+) Result<json.Value, Error> {
+    const opened = spawn Open($handle)
+    const openedResult = $opened.wait()
+    const client = openedResult else error { return .Err(error) }
+    const calling = spawn Call($client, $method, $params)
+    const callResult = $calling.wait()
+    const CallOutcome { Client Value } = callResult
+    discard Client
+    Value
+}
+
+task callResponse(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    id u64,
+    remaining u64
+) CallOutcome {
+    if remaining == 0 return callFailure($reader, $writer, id, .Protocol)
+    const reading = spawn mux.ReadFrame($reader)
+    const read = $reading.wait()
+    const mux.FrameReadOutcome { Reader Value } = read
+    const frame = Value else error {
+        discard error
+        return callFailure($Reader, $writer, id, .Transport)
+    }
+    const protocol.Frame { Type Payload } = frame
+    if !jsonFrame(Type) {
+        discard Payload
+        const receiving = spawn callResponse($Reader, $writer, id, remaining - 1)
+        const outcome = $receiving.wait()
+        return outcome
+    }
+    const sourceText = Payload.Text() else error {
+        discard error
+        return callFailure($Reader, $writer, id, .Protocol)
+    }
+    const decoded = decodeResponse(sourceText) else error {
+        return callFailure($Reader, $writer, id, $error)
+    }
+    const response { id as responseID result error as message } = decoded
+    if responseID != id {
+        discard result
+        discard message
+        const receiving = spawn callResponse($Reader, $writer, id, remaining - 1)
+        const outcome = $receiving.wait()
+        return outcome
+    }
+    const restored = own Client {
+        reader = Reader
+        writer = writer
+        nextID = nextCallID(id)
+    }
+    if !text.IsEmpty(message) {
+        discard result
+        return CallOutcome {
+            Client = restored
+            Value = .Err(.Remote(message = message))
+        }
+    }
+    const value = match result {
+        Some(found): found
+        None: .Null
+    }
+    CallOutcome { Client = restored Value = .Ok(value) }
+}
+
+fn callFailure(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    id u64,
+    $error Error
+) CallOutcome {
+    CallOutcome {
+        Client = own Client {
+            reader = reader
+            writer = writer
+            nextID = nextCallID(id)
+        }
+        Value = .Err(error)
+    }
+}
+
+fn nextCallID(value u64) u64 {
+    if value == 18446744073709551615 return 1
+    value + 1
+}
+
+fn jsonFrame(value protocol.FrameType) bool {
+    match value {
+        JSON: true
+        _: false
+    }
+}

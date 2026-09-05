@@ -7,6 +7,7 @@ import std.concurrent
 @concurrent.Transferable()
 struct Reader {
     source own mux.Reader
+    decoder own Decoder
 }
 
 @concurrent.Transferable()
@@ -39,6 +40,16 @@ struct ReadOutcome {
 
 task Open(
     $handle mux.Handle,
+    fps u64
+) Result<own RemoteDesktop, Error> {
+    const opening = spawn OpenMode($handle, .Screenshot, fps)
+    const result = $opening.wait()
+    result
+}
+
+task OpenMode(
+    $handle mux.Handle,
+    mode Mode,
     fps u64
 ) Result<own RemoteDesktop, Error> {
     const descriptor = protocol.NewOpen(.Desktop)
@@ -76,7 +87,7 @@ task Open(
         return .Err(error)
     }
     const selection = EncodeSelect(Select {
-        Mode = .Screenshot
+        Mode = mode
         FPS = normalizedFPS(fps)
     }) else error {
         discard hello
@@ -94,7 +105,7 @@ task Open(
         return .Err(error)
     }
     .Ok(own RemoteDesktop {
-        Reader = own Reader { source = restored }
+        Reader = own Reader { source = restored decoder = NewDecoder() }
         Writer = own Writer { destination = destination }
         Controller = own Controller { control = control }
         Hello = hello
@@ -102,11 +113,12 @@ task Open(
 }
 
 task Read($reader own Reader) ReadOutcome {
-    const Reader { source } = reader
+    const Reader { source decoder } = reader
+    var active = decoder
     const reading = spawn mux.ReadFrame($source)
     const outcome = $reading.wait()
     const mux.FrameReadOutcome { Reader Value } = outcome
-    const restored = own Reader { source = Reader }
+    var restored = own Reader { source = Reader decoder = active }
     const frame = Value else error {
         discard error
         return ReadOutcome { Reader = restored Value = .Err(.Closed) }
@@ -114,7 +126,7 @@ task Read($reader own Reader) ReadOutcome {
     const protocol.Frame { Type Payload } = frame
     match Type {
         Data: {
-            const decoded = DecodeFullFrame(Payload) else error {
+            const decoded = DecodeFrame(&restored.decoder, $Payload) else error {
                 return ReadOutcome { Reader = restored Value = .Err(error) }
             }
             ReadOutcome {
