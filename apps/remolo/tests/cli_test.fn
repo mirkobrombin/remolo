@@ -362,6 +362,16 @@ test "REST rejects wrong methods with a JSON response" {
     expect(body == "{\"error\":\"method not allowed\"}\n")
 }
 
+test "remote file navigation preserves roots and parents" {
+    expect(remoteChild(".", "cache") == "cache")
+    expect(remoteChild("/srv", "data") == "/srv/data")
+    expect(remoteChild("/srv/", "data") == "/srv/data")
+    expect(remoteParent("cache") == ".")
+    expect(remoteParent("/srv/data") == "/srv")
+    expect(remoteParent("/srv") == "/")
+    expect(remoteParent("/") == "/")
+}
+
 fn restRequest(method web.Method, path String) web.Request {
     web.Request {
         Method = method

@@ -4,7 +4,7 @@ target linux
 package remolo.codec 1.0.0 sha256:0b669009e86d2d19ad75fb45e813fbc25b11c68889b94a2bc9e5a74dadda0f70 path ../../packages/codec
 package remolo.config 1.0.0 sha256:7dafae0b4613e0b37711675b86aac214f3d80ef8070f899e0976f93534bc1a84 path ../../packages/config
 package remolo.crypto 1.0.0 sha256:3ea8b896bdd067940c183f08860421c535179e35b1cf5e7e773d1c6cd0865dca path ../../packages/crypto
-package remolo.desktop 1.0.0 sha256:2caa9ff1e382dd517852fd5c525a882171d76f581cc99f8762639c229c599c48 path ../../packages/desktop
+package remolo.desktop 1.0.0 sha256:eb02d627bd6319db7204be9c6c9d4d42fde336319f2053b8796628ea301044b5 path ../../packages/desktop
 package remolo.dirsync 1.0.0 sha256:78345640ec51d1d9e179c18af1d57371cbfaff329ada6d1c4e359eb056f79218 path ../../packages/dirsync
 package remolo.discovery 1.0.0 sha256:be6c31de1c83f43e24ca02757d7082a51d5b1e494ed40297a01e7210921106e7 path ../../packages/discovery
 package remolo.filetransfer 1.0.0 sha256:83d83d23bc4a3727c3ac159fd168fc02e6513aed4b23f91db748aee32aa849d5 path ../../packages/filetransfer
@@ -16,10 +16,11 @@ package remolo.protocol 1.0.0 sha256:5a26ca47013edd03b97092c499b9295a4d95544c97d
 package remolo.relay 1.0.0 sha256:134259408251451c272daf274f31bcc5a3b5932d171e3cafbbfca503d73491c9 path ../../packages/relay
 package remolo.rendezvous 1.0.0 sha256:dfd9e0279378e671f6d0d0baaecc6a4435d8d2aa4e18add83af746b474523b87 path ../../packages/rendezvous
 package remolo.rpc 1.0.0 sha256:89277004226fd4b5df5a3e12950af798ac981ea88a363bc26e2c155d9c09770e path ../../packages/rpc
-package remolo.session 1.0.0 sha256:2c5add6f6b3925144609584f80be30ace9a30f2be5e07f5ed3f01e4520079639 path ../../packages/session
+package remolo.session 1.0.0 sha256:01b49aa4fa70c9544dc7b0fef1c1e9e12e424a378a2301d691122b47fb7b0701 path ../../packages/session
 package remolo.token 1.0.0 sha256:801b2dbc7ab324d450e49f652e63b50fe383f399cc6ecc5ee1ad865da820884c path ../../packages/token
 package remolo.transport 1.0.0 sha256:85de38aef8a4062981b3b999eaee877ce6a983d9a28e27682779cf427bdeb3ea path ../../packages/transport
 package remolo.tunnel 1.0.0 sha256:4e1c7ded5ec720af9c28a5c015cf6cd8e3d905eab84613f43f37825e6154ea13 path ../../packages/tunnel
+package remolo.ui 1.0.0 sha256:4d12da1ec07c1f170548d40f53ad7a1a8a1c1733deb653468abe6fd9751e76a9 path ../../packages/ui
 edge remolo.cli remolo.config
 edge remolo.cli remolo.desktop
 edge remolo.cli remolo.dirsync
@@ -28,6 +29,7 @@ edge remolo.cli remolo.protocol
 edge remolo.cli remolo.rpc
 edge remolo.cli remolo.session
 edge remolo.cli remolo.token
+edge remolo.cli remolo.ui
 edge remolo.desktop remolo.mux
 edge remolo.desktop remolo.protocol
 edge remolo.dirsync remolo.mux

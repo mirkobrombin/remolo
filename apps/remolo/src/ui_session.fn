@@ -1,0 +1,186 @@
+package remolo.cli
+
+import foundation.worker
+import remolo.desktop
+import remolo.session
+import std.concurrent
+import std.text
+
+struct uiTerminalSession {
+    writer own session.PTYWriter
+    controller own session.PTYController
+}
+
+@concurrent.Transferable()
+struct uiDesktopSession {
+    input Sender<desktop.InputEvent>
+    controller own desktop.Controller
+}
+
+task connectFromUI($value String, $events Sender<uiEvent>) void {
+    const connected = connectToken(value) else error {
+        discard events.send($ .ConnectionFailed(message = text.Copy(error.message)))
+        return
+    }
+    const capabilities = connected.Capabilities()
+    const Channel { sender receiver } = channel<uiCommand>(64)
+    discard events.send($ .Connected(value = uiConnected {
+        name = text.Copy(capabilities.Hostname)
+        platform = text.Copy(capabilities.OS)
+        architecture = text.Copy(capabilities.Arch)
+        terminal = capabilities.PTY
+        files = capabilities.File
+        remoteDesktop = capabilities.Desktop
+        commands = sender
+    }))
+    discard capabilities
+    const serving = spawn serveUISession($connected, $receiver, $events)
+    $serving.wait()
+}
+
+task serveUISession(
+    $client own session.Client,
+    $commands Receiver<uiCommand>,
+    $events Sender<uiEvent>
+) void {
+    var activeClient = client
+    var inbox = commands
+    var terminal Option<own uiTerminalSession> = .None
+    var remoteDesktop Option<own uiDesktopSession> = .None
+    const workers = worker.NewSupervisor()
+    var running = true
+    while running {
+        const received = inbox.receive()
+        const command = received else error {
+            discard error
+            running = false
+            continue
+        }
+        match command {
+            OpenTerminal: {
+                if !uiTerminalOpen(terminal) {
+                    const opened = openUITerminal(activeClient.Handle())
+                    match opened {
+                        Err(error): {
+                            discard error
+                            discard events.send($ .TerminalFailed(
+                                    message = "Could not open the terminal."
+                                ))
+                        }
+                        Ok(remote): {
+                            const session.RemotePTY { Reader Writer Controller } = remote
+                            workers.Start(spawn pumpUITerminal($Reader, events.clone()))
+                            terminal = .Some(own uiTerminalSession {
+                                writer = Writer
+                                controller = Controller
+                            })
+                            discard events.send($ .TerminalOpened)
+                        }
+                    }
+                }
+            }
+            TerminalInput(value): {
+                const selected = replace terminal with .None
+                match selected {
+                    None: { discard value }
+                    Some(active): {
+                        const written = writeUITerminal($active, $value)
+                        match written {
+                            Ok(restored): { terminal = .Some(restored) }
+                            Err(error): {
+                                discard error
+                                discard events.send($ .TerminalFailed(
+                                        message = "The terminal was closed."
+                                    ))
+                            }
+                        }
+                    }
+                }
+            }
+            ListFiles(path): workers.Start(spawn listUIFiles(
+                    activeClient.Handle(),
+                    $path,
+                    events.clone()
+                ))
+            Upload(value): workers.Start(spawn uploadUIFile(
+                    activeClient.Handle(),
+                    $value,
+                    events.clone()
+                ))
+            Download(value): workers.Start(spawn downloadUIFile(
+                    activeClient.Handle(),
+                    $value,
+                    events.clone()
+                ))
+            OpenDesktop: {
+                if !uiDesktopOpen(remoteDesktop) {
+                    const opened = openUIDesktop(activeClient.Handle())
+                    match opened {
+                        Err(error): {
+                            discard error
+                            discard events.send($ .DesktopFailed(
+                                    message = "Could not open the desktop."
+                                ))
+                        }
+                        Ok(remote): {
+                            const desktop.RemoteDesktop {
+                                Reader
+                                Writer
+                                Controller
+                                Hello
+                            } = remote
+                            discard Hello
+                            const Channel { sender receiver } =
+                                channel<desktop.InputEvent>(512)
+                            workers.Start(spawn pumpUIDesktopInput(
+                                    $Writer,
+                                    $receiver,
+                                    events.clone()
+                                ))
+                            remoteDesktop = .Some(own uiDesktopSession {
+                                input = sender
+                                controller = Controller
+                            })
+                            discard events.send($ .DesktopOpened)
+                            workers.Start(spawn pumpUIDesktop($Reader, events.clone()))
+                        }
+                    }
+                }
+            }
+            DesktopInput(value): {
+                const selected = uiDesktopInputSender(remoteDesktop)
+                match selected {
+                    None: { discard value }
+                    Some(destination): {
+                        const sending = spawn sendUIDesktopInputs($destination, $value)
+                        discard $sending.wait()
+                    }
+                }
+            }
+        }
+    }
+    discard inbox
+    closeUITerminal($terminal)
+    closeUIDesktop($remoteDesktop)
+    const stopping = workers.CancelTask()
+    discard $stopping.wait()
+    discard events
+    session.CloseClient($activeClient)
+}
+
+fn uiTerminalOpen(value Option<own uiTerminalSession>) bool {
+    match value { None: false Some(_): true }
+}
+
+fn uiDesktopOpen(value Option<own uiDesktopSession>) bool {
+    match value { None: false Some(_): true }
+}
+
+fn uiDesktopInputSender(
+    value Option<own uiDesktopSession>
+) Option<Sender<desktop.InputEvent>> {
+    match value {
+        None: .None
+        Some(active): .Some(active.input.clone())
+    }
+}

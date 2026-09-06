@@ -13,3 +13,4 @@ dependency remolo.protocol 1.0.0 path ../../packages/protocol
 dependency remolo.rpc 1.0.0 path ../../packages/rpc
 dependency remolo.session 1.0.0 path ../../packages/session
 dependency remolo.token 1.0.0 path ../../packages/token
+dependency remolo.ui 1.0.0 path ../../packages/ui

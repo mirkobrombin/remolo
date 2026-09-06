@@ -1,0 +1,194 @@
+package remolo.cli
+
+import foundation.worker
+import remolo.ui
+import std.text
+
+fn renderUI(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    $events Sender<uiEvent>
+) Result<void, ui.Error> {
+    if !window.BeginRoot() {
+        window.EndRoot()
+        discard events
+        return .Ok
+    }
+    const size = window.Size() else error {
+        window.EndRoot()
+        discard events
+        return .Err(error)
+    }
+    const height = f32.From(size.Height) else error {
+        discard error
+        window.EndRoot()
+        discard events
+        return .Err(.Invalid)
+    }
+    window.BeginRow(height, 2)
+    window.PushColumn(0.065)
+    if window.BeginGroup("navigation") {
+        renderRail(&window, &state, height)
+        window.EndGroup()
+    }
+    window.PushColumn(0.935)
+    if window.BeginGroup("workspace") {
+        window.BeginRow(height - 24.0, 3)
+        window.PushColumn(0.04)
+        window.Empty()
+        window.PushColumn(0.95)
+        if window.BeginGroup("content") {
+            window.Space(20.0)
+            renderCurrentPage(&window, &state, workers, $events, height - 44.0)
+            window.EndGroup()
+        } else {
+            discard events
+        }
+        window.PushColumn(0.01)
+        window.Empty()
+        window.EndRow()
+        window.EndGroup()
+    } else {
+        discard events
+    }
+    window.EndRow()
+    window.Titlebar()
+    window.EndRoot()
+    .Ok
+}
+
+fn renderRail(&window ui.Window, &state uiState, height f32) void {
+    window.Row(44.0, 1)
+    window.Brand()
+    window.Space(2.0)
+    window.Row(44.0, 1)
+    if window.IconButton(0, "Connect", isPage(state.page, .Connect), true) {
+        state.page = .Connect
+    }
+    window.Row(44.0, 1)
+    if window.IconButton(1, "Share this machine", isPage(state.page, .Host), true) {
+        state.page = .Host
+    }
+    window.Space(14.0)
+    window.Separator()
+    window.Space(14.0)
+    window.Row(44.0, 1)
+    if window.IconButton(
+        2,
+        "Terminal",
+        isPage(state.page, .Terminal),
+        state.terminalAvailable
+    ) {
+        state.page = .Terminal
+    }
+    window.Row(44.0, 1)
+    if window.IconButton(
+        3,
+        "Files",
+        isPage(state.page, .Files),
+        state.filesAvailable
+    ) {
+        state.page = .Files
+    }
+    window.Row(44.0, 1)
+    if window.IconButton(
+        4,
+        "Desktop",
+        isPage(state.page, .Desktop),
+        state.desktopAvailable
+    ) {
+        state.page = .Desktop
+    }
+    window.Space(height - 390.0)
+    window.Row(44.0, 1)
+    const themeLabel = match state.theme {
+        Dark: "Use light theme"
+        Light: "Use dark theme"
+    }
+    if window.IconButton(5, themeLabel, false, true) {
+        state.theme = match state.theme {
+            Dark: .Light
+            Light: .Dark
+        }
+        discard window.SetTheme(state.theme)
+    }
+}
+
+fn renderCurrentPage(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    $events Sender<uiEvent>,
+    height f32
+) void {
+    match state.page {
+        Connect: renderConnectPage(&window, &state, workers, $events)
+        Host: renderHostPage(&window, &state, workers, $events)
+        Terminal: {
+            discard events
+            renderTerminalPage(&window, &state, workers, height)
+        }
+        Files: {
+            discard events
+            renderFilesPage(&window, &state, workers, height)
+        }
+        Desktop: {
+            discard events
+            renderDesktopPage(&window, &state, workers, height)
+        }
+    }
+}
+
+fn renderRemoteHeader(&window ui.Window, state uiState, title String) void {
+    window.Row(44.0, 1)
+    window.Heading(title)
+    window.Row(34.0, 1)
+    window.Label(
+        state.remoteName + "  " + state.remotePlatform + " / " + state.remoteArchitecture,
+        .Accent,
+        true
+    )
+}
+
+fn renderConnectionStatus(&window ui.Window, state uiState) void {
+    window.Space(18.0)
+    window.Separator()
+    window.Space(12.0)
+    window.Row(44.0, 1)
+    const tone = if isConnection(state.connection, .Failed) {
+        ui.LabelTone.Danger
+    } else {
+        ui.LabelTone.Muted
+    }
+    window.Label(state.status, tone, true)
+}
+
+fn dispatchTransfer(&state uiState, workers worker.Supervisor, upload bool) void {
+    if text.IsEmpty(state.localPath) || text.IsEmpty(state.transferRemotePath) return
+    const transfer = uiTransfer {
+        localPath = text.Copy(state.localPath)
+        remotePath = text.Copy(state.transferRemotePath)
+    }
+    dispatchUICommand(
+        &state,
+        workers,
+        if upload {.Upload(value = transfer) } else {.Download(value = transfer) }
+    )
+}
+
+fn dispatchUICommand(
+    &state uiState,
+    workers worker.Supervisor,
+    $command uiCommand
+) void {
+    const selected = uiCommandSender(&state)
+    match selected {
+        None: { discard command }
+        Some(sender): workers.Start(spawn sendUICommand($sender, $command))
+    }
+}
+
+task sendUICommand($sender Sender<uiCommand>, $command uiCommand) void {
+    discard sender.send(command)
+}

@@ -3,7 +3,7 @@ root remolo.session 1.0.0
 target linux
 package remolo.codec 1.0.0 sha256:0b669009e86d2d19ad75fb45e813fbc25b11c68889b94a2bc9e5a74dadda0f70 path ../codec
 package remolo.crypto 1.0.0 sha256:3ea8b896bdd067940c183f08860421c535179e35b1cf5e7e773d1c6cd0865dca path ../crypto
-package remolo.desktop 1.0.0 sha256:2caa9ff1e382dd517852fd5c525a882171d76f581cc99f8762639c229c599c48 path ../desktop
+package remolo.desktop 1.0.0 sha256:eb02d627bd6319db7204be9c6c9d4d42fde336319f2053b8796628ea301044b5 path ../desktop
 package remolo.dirsync 1.0.0 sha256:78345640ec51d1d9e179c18af1d57371cbfaff329ada6d1c4e359eb056f79218 path ../dirsync
 package remolo.discovery 1.0.0 sha256:be6c31de1c83f43e24ca02757d7082a51d5b1e494ed40297a01e7210921106e7 path ../discovery
 package remolo.filetransfer 1.0.0 sha256:83d83d23bc4a3727c3ac159fd168fc02e6513aed4b23f91db748aee32aa849d5 path ../filetransfer

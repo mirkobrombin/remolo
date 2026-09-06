@@ -1,0 +1,16 @@
+package remolo.ui
+
+test "native statuses map to typed errors" {
+    match errorFor(1) {
+        Unavailable: {}
+        _: fail("unavailable status changed")
+    }
+    match errorFor(2) {
+        Invalid: {}
+        _: fail("invalid status changed")
+    }
+    match errorFor(9) {
+        Failed: {}
+        _: fail("failed status changed")
+    }
+}

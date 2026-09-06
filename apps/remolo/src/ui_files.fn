@@ -1,0 +1,60 @@
+package remolo.cli
+
+import remolo.mux
+import remolo.rpc
+import remolo.session
+import std.format
+
+task listUIFiles(
+    $handle mux.Handle,
+    $path String,
+    $events Sender<uiEvent>
+) void {
+    const listing = spawn rpc.List($handle, $path)
+    const listed = $listing.wait()
+    const entries = listed else error {
+        discard error
+        discard events.send($ .FilesFailed(message = "Could not list the remote directory."))
+        return
+    }
+    discard events.send($ .FilesLoaded(value = entries))
+}
+task uploadUIFile(
+    $handle mux.Handle,
+    $transfer uiTransfer,
+    $events Sender<uiEvent>
+) void {
+    const uiTransfer { localPath remotePath } = transfer
+    const uploading = spawn session.PutFile($handle, $localPath, $remotePath)
+    const uploaded = $uploading.wait()
+    match uploaded {
+        Ok: {
+            discard events.send($ .FileOperation(message = "Upload complete."))
+        }
+        Err(error): {
+            discard error
+            discard events.send($ .FileOperation(message = "Upload failed."))
+        }
+    }
+}
+
+task downloadUIFile(
+    $handle mux.Handle,
+    $transfer uiTransfer,
+    $events Sender<uiEvent>
+) void {
+    const uiTransfer { localPath remotePath } = transfer
+    const downloading = spawn session.GetFile($handle, $remotePath, $localPath)
+    const downloaded = $downloading.wait()
+    match downloaded {
+        Ok(size): {
+            discard events.send($ .FileOperation(
+                    message = "Downloaded " + format.U64(size) + " bytes."
+                ))
+        }
+        Err(error): {
+            discard error
+            discard events.send($ .FileOperation(message = "Download failed."))
+        }
+    }
+}

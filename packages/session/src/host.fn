@@ -29,51 +29,60 @@ struct hostTransport {
 }
 
 fn listenHostTransport(
-    $address String,
+    address String,
     port u64,
     privateKey bytes.Bytes
 ) Result<own hostTransport, Error> {
-    const quicAddress = text.Copy(address)
-    const secure = transport.ListenSecure($address, port, privateKey) else error {
-        discard quicAddress
-        discard error
-        return .Err(.Transport)
+    var remaining u64 = 1
+    if port == 0 { remaining = 8 }
+    while remaining > 0 {
+        const secure = transport.ListenSecure(
+            $text.Copy(address),
+            port,
+            privateKey
+        ) else error {
+            discard error
+            remaining = remaining - 1
+            continue
+        }
+        const boundPort = secure.Port()
+        const quic = transport.ListenQUIC(
+            $text.Copy(address),
+            boundPort,
+            privateKey
+        ) else error {
+            discard secure
+            discard error
+            remaining = remaining - 1
+            continue
+        }
+        const secureController = secure.Control() else error {
+            discard quic
+            discard error
+            return .Err(.Transport)
+        }
+        const quicController = quic.Control() else error {
+            discard secure
+            discard secureController
+            discard error
+            return .Err(.Transport)
+        }
+        const Channel { sender receiver } = channel<hostConnection>(16)
+        const secureAcceptor = spawn acceptSecureConnections(
+            $secure,
+            sender.clone()
+        )
+        const quicAcceptor = spawn acceptQUICConnections($quic, $sender)
+        return .Ok(own hostTransport {
+            port = boundPort
+            secureAcceptor = secureAcceptor
+            quicAcceptor = quicAcceptor
+            incoming = receiver
+            secureController = secureController
+            quicController = quicController
+        })
     }
-    const boundPort = secure.Port()
-    const quic = transport.ListenQUIC(
-        $quicAddress,
-        boundPort,
-        privateKey
-    ) else error {
-        discard secure
-        discard error
-        return .Err(.Transport)
-    }
-    const secureController = secure.Control() else error {
-        discard quic
-        discard error
-        return .Err(.Transport)
-    }
-    const quicController = quic.Control() else error {
-        discard secure
-        discard secureController
-        discard error
-        return .Err(.Transport)
-    }
-    const Channel { sender receiver } = channel<hostConnection>(16)
-    const secureAcceptor = spawn acceptSecureConnections(
-        $secure,
-        sender.clone()
-    )
-    const quicAcceptor = spawn acceptQUICConnections($quic, $sender)
-    .Ok(own hostTransport {
-        port = boundPort
-        secureAcceptor = secureAcceptor
-        quicAcceptor = quicAcceptor
-        incoming = receiver
-        secureController = secureController
-        quicController = quicController
-    })
+    .Err(.Transport)
 }
 
 task acceptSecureConnections(
@@ -162,7 +171,7 @@ fn ListenLocal(
         return .Err(.Storage)
     }
     const listener = listenHostTransport(
-        $"127.0.0.1",
+        "127.0.0.1",
         0,
         generated.PrivateKeyPEM
     ) else error {
@@ -277,11 +286,13 @@ task Listen($options HostOptions) Result<ListeningHost, Error> {
         discard tokenKey
         return .Err(.Storage)
     }
-    const listener = listenHostTransport(
-        $BindAddress,
+    const listenerResult = listenHostTransport(
+        BindAddress,
         Port,
         generated.PrivateKeyPEM
-    ) else error {
+    )
+    discard BindAddress
+    const listener = listenerResult else error {
         discard error
         discard hostKey
         discard tokenKey

@@ -1,0 +1,252 @@
+package remolo.cli
+
+import remolo.desktop
+import remolo.rpc
+import remolo.ui
+import std.collections
+import std.format
+import std.text
+
+enum uiPage {
+    Connect
+    Host
+    Terminal
+    Files
+    Desktop
+}
+
+enum uiConnectionState {
+    Idle
+    Connecting
+    Connected
+    Failed
+}
+
+struct uiConnected {
+    name String
+    platform String
+    architecture String
+    terminal bool
+    files bool
+    remoteDesktop bool
+    commands Sender<uiCommand>
+}
+
+struct uiHostReady {
+    token String
+    port u64
+}
+
+struct uiTransfer {
+    localPath String
+    remotePath String
+}
+
+enum uiCommand {
+    OpenTerminal
+    TerminalInput(value String)
+    ListFiles(path String)
+    Upload(value uiTransfer)
+    Download(value uiTransfer)
+    OpenDesktop
+    DesktopInput(value own collections.List<desktop.InputEvent>)
+}
+
+enum uiEvent {
+    Connected(value uiConnected)
+    ConnectionFailed(message String)
+    HostReady(value uiHostReady)
+    HostFailed(message String)
+    TerminalOpened
+    TerminalOutput(value String)
+    TerminalFailed(message String)
+    FilesLoaded(value own collections.List<rpc.DirEntry>)
+    FilesFailed(message String)
+    FileOperation(message String)
+    DesktopOpened
+    DesktopFrame(value own desktop.DecodedFrame)
+    DesktopFailed(message String)
+}
+
+struct uiState {
+    page uiPage
+    theme ui.Theme
+    connection uiConnectionState
+    token String
+    hostToken String
+    status String
+    remoteName String
+    remotePlatform String
+    remoteArchitecture String
+    hosting bool
+    terminalAvailable bool
+    filesAvailable bool
+    desktopAvailable bool
+    commands Option<Sender<uiCommand>>
+    terminalOpen bool
+    terminalOutput String
+    terminalInput String
+    remotePath String
+    localPath String
+    transferRemotePath String
+    files own collections.List<rpc.DirEntry>
+    filesLoaded bool
+    filesLoading bool
+    desktopOpen bool
+    desktopFrame bool
+}
+
+fn newUIState() own uiState {
+    own uiState {
+        page = .Connect
+        theme = .Dark
+        connection = .Idle
+        token = ""
+        hostToken = ""
+        status = "Paste a Remolo token to reach another machine."
+        remoteName = ""
+        remotePlatform = ""
+        remoteArchitecture = ""
+        hosting = false
+        terminalAvailable = false
+        filesAvailable = false
+        desktopAvailable = false
+        commands = .None
+        terminalOpen = false
+        terminalOutput = ""
+        terminalInput = ""
+        remotePath = "."
+        localPath = ""
+        transferRemotePath = ""
+        files = collections.NewList<rpc.DirEntry>()
+        filesLoaded = false
+        filesLoading = false
+        desktopOpen = false
+        desktopFrame = false
+    }
+}
+
+fn applyUIEvent(&window ui.Window, &state uiState, $event uiEvent) void {
+    match event {
+        Connected(value): {
+            const uiConnected {
+                name
+                platform
+                architecture
+                terminal
+                files
+                remoteDesktop
+                commands
+            } = value
+            state.connection = .Connected
+            state.remoteName = name
+            state.remotePlatform = platform
+            state.remoteArchitecture = architecture
+            state.terminalAvailable = terminal
+            state.filesAvailable = files
+            state.desktopAvailable = remoteDesktop
+            state.commands = .Some(commands)
+            state.status = "Connected and ready."
+        }
+        ConnectionFailed(message): {
+            state.connection = .Failed
+            state.status = message
+        }
+        HostReady(value): {
+            const uiHostReady { token as encoded port } = value
+            state.hosting = true
+            state.hostToken = encoded
+            state.status = "Hosting on port " + format.U64(port) + "."
+        }
+        HostFailed(message): {
+            state.hosting = false
+            state.status = message
+        }
+        TerminalOpened: {
+            state.terminalOpen = true
+            state.status = "Terminal channel open."
+        }
+        TerminalOutput(value): appendTerminalOutput(&state, value)
+        TerminalFailed(message): {
+            state.terminalOpen = false
+            state.status = message
+        }
+        FilesLoaded(value): {
+            const previous = replace state.files with value
+            discard previous
+            state.filesLoaded = true
+            state.filesLoading = false
+            state.status = "Remote directory loaded."
+        }
+        FilesFailed(message): {
+            state.filesLoading = false
+            state.status = message
+        }
+        FileOperation(message): { state.status = message }
+        DesktopOpened: {
+            state.desktopOpen = true
+            state.status = "Desktop channel open."
+        }
+        DesktopFrame(value): {
+            const desktop.DecodedFrame { Width Height Pixels } = value
+            window.UpdateImage(Width, Height, $Pixels) else error {
+                discard error
+                state.status = "The remote frame could not be displayed."
+                return
+            }
+            state.desktopFrame = true
+        }
+        DesktopFailed(message): {
+            window.ReleaseDesktopControl()
+            state.desktopOpen = false
+            state.desktopFrame = false
+            state.status = message
+        }
+    }
+}
+
+fn appendTerminalOutput(&state uiState, value String) void {
+    const combined = state.terminalOutput + value
+    const length = text.ByteLen(combined)
+    if length <= 262144 {
+        state.terminalOutput = combined
+        return
+    }
+    const trimmed = text.Slice(combined, length - 196608, length) else error {
+        discard error
+        state.terminalOutput = text.Copy(value)
+        return
+    }
+    state.terminalOutput = trimmed
+}
+
+fn isPage(value uiPage, expected uiPage) bool {
+    match value {
+        Connect: match expected { Connect: true _: false }
+        Host: match expected { Host: true _: false }
+        Terminal: match expected { Terminal: true _: false }
+        Files: match expected { Files: true _: false }
+        Desktop: match expected { Desktop: true _: false }
+    }
+}
+
+fn isConnection(value uiConnectionState, expected uiConnectionState) bool {
+    match value {
+        Idle: match expected { Idle: true _: false }
+        Connecting: match expected { Connecting: true _: false }
+        Connected: match expected { Connected: true _: false }
+        Failed: match expected { Failed: true _: false }
+    }
+}
+
+fn uiCommandSender(&state uiState) Option<Sender<uiCommand>> {
+    const selected = replace state.commands with .None
+    match selected {
+        None: .None
+        Some(sender): {
+            const result = sender.clone()
+            state.commands = .Some(sender)
+            .Some(result)
+        }
+    }
+}

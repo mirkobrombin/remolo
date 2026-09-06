@@ -33,6 +33,7 @@ server installation is required.
 
 ## Commands
 
+- `remolo ui` opens the native client for terminal, file transfer, and remote desktop sessions.
 - `remolo connect <token>` opens an interactive shell. `--resume` survives network changes.
 - `remolo exec <token> -- <cmd>` runs one command with its real exit code and stderr.
 - `remolo put` and `remolo get` transfer files with resume and checksum verification.

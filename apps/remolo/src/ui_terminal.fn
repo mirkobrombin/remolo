@@ -1,0 +1,92 @@
+package remolo.cli
+
+import remolo.mux
+import remolo.protocol
+import remolo.session
+import std.bytes
+import std.format
+
+fn openUITerminal(
+    $handle mux.Handle
+) Result<own session.RemotePTY, session.Error> {
+    var descriptor = protocol.NewOpen(.PTY)
+    descriptor.Cols = 100
+    descriptor.Rows = 32
+    descriptor.Term = "xterm-256color"
+    const opening = spawn session.OpenPTY($handle, $descriptor)
+    const result = $opening.wait()
+    result
+}
+
+fn writeUITerminal(
+    $active own uiTerminalSession,
+    $value String
+) Result<own uiTerminalSession, session.Error> {
+    const uiTerminalSession { writer controller } = active
+    const writing = spawn session.WritePTY($writer, $bytes.FromText(value))
+    const written = $writing.wait()
+    const restored = written else error {
+        discard controller
+        return .Err(error)
+    }
+    .Ok(own uiTerminalSession {
+        writer = restored
+        controller = controller
+    })
+}
+
+task pumpUITerminal(
+    $reader own session.PTYReader,
+    $events Sender<uiEvent>
+) void {
+    var source = reader
+    var activeEvents = events
+    while true {
+        const reading = spawn session.ReadPTY($source)
+        const outcome = $reading.wait()
+        const session.PTYReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error {
+            discard error
+            discard source
+            discard activeEvents.send($ .TerminalFailed(message = "The terminal was closed."))
+            return
+        }
+        match event {
+            Data(value): {
+                const decoded = value.Text()
+                const output = match decoded {
+                    Ok(found): found
+                    Err(error): {
+                        discard error
+                        "[binary terminal output]\n"
+                    }
+                }
+                discard activeEvents.send($ .TerminalOutput(value = output))
+            }
+            Exit(value): {
+                const protocol.Exit { Code Error } = value
+                discard Error
+                discard source
+                discard activeEvents.send($ .TerminalOutput(
+                        value = "\n[session exited " + format.I32(Code) + "]\n"
+                    ))
+                discard activeEvents.send($ .TerminalFailed(message = "Terminal session ended."))
+                return
+            }
+        }
+    }
+}
+
+fn closeUITerminal($value Option<own uiTerminalSession>) void {
+    match value {
+        None: {}
+        Some(active): {
+            const uiTerminalSession { writer controller } = active
+            discard writer
+            const closing = spawn session.ClosePTYChannel($controller)
+            const result = $closing.wait()
+            discard result
+        }
+    }
+}

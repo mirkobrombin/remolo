@@ -1,6 +1,7 @@
 package remolo.cli
 
 enum cliCommand {
+    UI
     Host
     Connect
     Webterm
@@ -39,6 +40,7 @@ fn usage() String {
         "[--file-root PATH] " +
         "[--rendezvous URL] [--relay HOST:PORT] [--cap KIND] " +
         "[--cmd NAME] [--approve] [--ro] [--once]\n" +
+        "  remolo ui\n" +
         "  remolo connect TOKEN [--mdns] [--rendezvous URL] " +
         "[--relay HOST:PORT] [--ssh-addr HOST:PORT] [--ssh-user USER] " +
         "[--ssh-key PATH] [--ssh-known-hosts PATH] " +
@@ -78,7 +80,8 @@ fn usage() String {
 }
 
 fn commandFor(value String) Option<cliCommand> {
-    const names [26]commandName = [
+    const names [27]commandName = [
+        commandName { value = "ui" command = .UI },
         commandName { value = "host" command = .Host },
         commandName { value = "connect" command = .Connect },
         commandName { value = "webterm" command = .Webterm },
@@ -114,6 +117,7 @@ fn commandFor(value String) Option<cliCommand> {
 
 fn executeCommand(command cliCommand, args [String]) Result<i32, failure> {
     match command {
+        UI: runUI(args)
         Host: runHost(args)
         Connect: runShell(args)
         Webterm: runWebterm(args)

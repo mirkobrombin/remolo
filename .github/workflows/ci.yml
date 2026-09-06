@@ -53,8 +53,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: mirkobrombin/foundation-lang
-          ref: eb31584b36506df0e8e3839c4e6408e62ac172f9
+          ref: 5250e72a922c94cc6ccae019f77616d5b504162d
           path: toolchain
+          persist-credentials: false
+
+      - name: Checkout SDL
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: libsdl-org/SDL
+          ref: 8e37db5e797b6167f3a00d697d816a684bd259c7
+          path: sdl
           persist-credentials: false
 
       - name: Checkout libdatachannel
@@ -73,7 +81,9 @@ jobs:
           wget -qO "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
           chmod +x "$RUNNER_TEMP/llvm.sh"
           sudo "$RUNNER_TEMP/llvm.sh" 21
-          sudo apt-get install --no-install-recommends -y libfuse3-dev llvm-21-dev
+          sudo apt-get install --no-install-recommends -y \
+            libfuse3-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
+            libxi-dev libxrandr-dev libxss-dev libxtst-dev llvm-21-dev
           echo "LLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm" >> "$GITHUB_ENV"
 
       - name: Install macOS dependencies
@@ -122,12 +132,26 @@ jobs:
           make -j"$(getconf _NPROCESSORS_ONLN)"
           make install_sw
 
+      - name: Build pinned SDL
+        run: |
+          prefix="$RUNNER_TEMP/deps/sdl-prefix"
+          cmake -S sdl -B sdl/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF \
+            -DSDL_TEST_LIBRARY=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_EXAMPLES=OFF
+          cmake --build sdl/build --target install --parallel 3
+
       - name: Configure native paths
         run: |
-          include="$RUNNER_TEMP/deps/openssl-prefix/include"
+          include="$RUNNER_TEMP/deps/openssl-prefix/include:$RUNNER_TEMP/deps/sdl-prefix/include"
           openssl_lib="$RUNNER_TEMP/deps/openssl-prefix/lib"
           openssl_lib64="$RUNNER_TEMP/deps/openssl-prefix/lib64"
-          libraries="$openssl_lib:$openssl_lib64"
+          sdl_lib="$RUNNER_TEMP/deps/sdl-prefix/lib"
+          libraries="$openssl_lib:$openssl_lib64:$sdl_lib"
           if [ "${{ runner.os }}" = "macOS" ]; then
             include="$include:$FUSE_INCLUDE_ROOT"
             libraries="$libraries:$FUSE_LIBRARY_ROOT"
@@ -135,7 +159,8 @@ jobs:
           compiler="$RUNNER_TEMP/foundation-cc"
           cat > "$compiler" <<'EOF'
           #!/bin/sh
-          exec cc -L"$FOUNDATION_OPENSSL_LIB" -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+          exec cc -L"$FOUNDATION_OPENSSL_LIB" -L"$FOUNDATION_OPENSSL_LIB64" \
+            -L"$FOUNDATION_SDL_LIB" "$@"
           EOF
           chmod +x "$compiler"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
@@ -146,6 +171,7 @@ jobs:
           echo "FOUNDATION_CC=$compiler" >> "$GITHUB_ENV"
           echo "FOUNDATION_OPENSSL_LIB=$openssl_lib" >> "$GITHUB_ENV"
           echo "FOUNDATION_OPENSSL_LIB64=$openssl_lib64" >> "$GITHUB_ENV"
+          echo "FOUNDATION_SDL_LIB=$sdl_lib" >> "$GITHUB_ENV"
 
       - name: Build pinned libdatachannel
         if: matrix.behavior
@@ -253,8 +279,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: mirkobrombin/foundation-lang
-          ref: eb31584b36506df0e8e3839c4e6408e62ac172f9
+          ref: 5250e72a922c94cc6ccae019f77616d5b504162d
           path: toolchain
+          persist-credentials: false
+
+      - name: Checkout SDL
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: libsdl-org/SDL
+          ref: 8e37db5e797b6167f3a00d697d816a684bd259c7
+          path: sdl
           persist-credentials: false
 
       - name: Install dependencies
@@ -263,7 +297,9 @@ jobs:
           chmod +x "$RUNNER_TEMP/llvm.sh"
           sudo "$RUNNER_TEMP/llvm.sh" 21
           sudo apt-get install --no-install-recommends -y \
-            libfuse3-dev libzstd-dev llvm-21-dev zlib1g-dev
+            libfuse3-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
+            libxi-dev libxrandr-dev libxss-dev libxtst-dev libzstd-dev \
+            llvm-21-dev zlib1g-dev
           echo "LLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm" >> "$GITHUB_ENV"
 
       - name: Build static OpenSSL
@@ -282,20 +318,34 @@ jobs:
           make -j"$(getconf _NPROCESSORS_ONLN)"
           make install_sw
 
+      - name: Build static SDL
+        run: |
+          prefix="$RUNNER_TEMP/deps/sdl-prefix"
+          cmake -S sdl -B sdl/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" \
+            -DSDL_SHARED=OFF \
+            -DSDL_STATIC=ON \
+            -DSDL_TEST_LIBRARY=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_EXAMPLES=OFF
+          cmake --build sdl/build --target install --parallel 3
+
       - name: Configure static compiler driver
         run: |
-          include="$RUNNER_TEMP/deps/openssl-prefix/include"
+          include="$RUNNER_TEMP/deps/openssl-prefix/include:$RUNNER_TEMP/deps/sdl-prefix/include"
           openssl_lib="$RUNNER_TEMP/deps/openssl-prefix/lib"
           openssl_lib64="$RUNNER_TEMP/deps/openssl-prefix/lib64"
+          sdl_lib="$RUNNER_TEMP/deps/sdl-prefix/lib"
           compiler="$RUNNER_TEMP/foundation-cc"
           cat > "$compiler" <<'EOF'
           #!/bin/sh
           if [ "${FOUNDATION_STATIC_EXECUTABLE:-0}" = "1" ]; then
             exec cc -static -L"$FOUNDATION_OPENSSL_LIB" \
-              -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+              -L"$FOUNDATION_OPENSSL_LIB64" -L"$FOUNDATION_SDL_LIB" "$@"
           fi
           exec cc -L"$FOUNDATION_OPENSSL_LIB" \
-            -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+            -L"$FOUNDATION_OPENSSL_LIB64" -L"$FOUNDATION_SDL_LIB" "$@"
           EOF
           chmod +x "$compiler"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
@@ -303,6 +353,7 @@ jobs:
           echo "FOUNDATION_CC=$compiler" >> "$GITHUB_ENV"
           echo "FOUNDATION_OPENSSL_LIB=$openssl_lib" >> "$GITHUB_ENV"
           echo "FOUNDATION_OPENSSL_LIB64=$openssl_lib64" >> "$GITHUB_ENV"
+          echo "FOUNDATION_SDL_LIB=$sdl_lib" >> "$GITHUB_ENV"
 
       - name: Build Foundation compiler
         run: |
@@ -385,8 +436,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: mirkobrombin/foundation-lang
-          ref: eb31584b36506df0e8e3839c4e6408e62ac172f9
+          ref: 5250e72a922c94cc6ccae019f77616d5b504162d
           path: toolchain
+          persist-credentials: false
+
+      - name: Checkout SDL
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: libsdl-org/SDL
+          ref: 8e37db5e797b6167f3a00d697d816a684bd259c7
+          path: sdl
           persist-credentials: false
 
       - name: Install LLVM 21
@@ -445,6 +504,27 @@ jobs:
           nmake install_sw
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
+          "INCLUDE=$prefix\include;$env:INCLUDE" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB=$prefix\lib;$env:LIB" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build pinned SDL
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP "sdl-prefix"
+          cmake -S sdl -B sdl/build -A "${{ matrix.cmake_arch }}" `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_INSTALL_PREFIX=$prefix" `
+            -DSDL_SHARED=ON `
+            -DSDL_STATIC=OFF `
+            -DSDL_TEST_LIBRARY=OFF `
+            -DSDL_TESTS=OFF `
+            -DSDL_EXAMPLES=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build sdl/build --config Release --target install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "INCLUDE=$prefix\include;$env:INCLUDE" | Out-File `
             -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "LIB=$prefix\lib;$env:LIB" | Out-File `

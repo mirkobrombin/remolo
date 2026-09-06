@@ -9,6 +9,22 @@ struct pixelFrame {
     pixels own bytes.Bytes
 }
 
+struct DecodedFrame {
+    Width u64
+    Height u64
+    Pixels own bytes.Bytes
+}
+
+fn DecodePNG(value bytes.Bytes) Result<own DecodedFrame, Error> {
+    const decoded = decodePNG(value) else error { return .Err(error) }
+    const pixelFrame { width height pixels } = decoded
+    .Ok(own DecodedFrame {
+        Width = width
+        Height = height
+        Pixels = pixels
+    })
+}
+
 fn decodePNG(value bytes.Bytes) Result<own pixelFrame, Error> {
     const length = pngLength(value)
     if length < 57 || !pngSignatureValid(value) return .Err(.InvalidFrame)

@@ -1,0 +1,398 @@
+package remolo.ui
+
+import std.bytes
+
+enum Error {
+    Unavailable
+    Invalid
+    Failed
+}
+
+enum Theme {
+    Dark
+    Light
+}
+
+enum FrameState {
+    Active
+    Closing
+}
+
+enum LabelTone {
+    Primary
+    Muted
+    Accent
+    Danger
+}
+
+enum DesktopInputKind {
+    MouseMove
+    MouseButton
+    Key
+    Wheel
+}
+
+struct DesktopInput {
+    Type DesktopInputKind
+    X u64
+    Y u64
+    Button u64
+    Key u64
+    Down bool
+    Delta i64
+}
+
+struct TextEdit {
+    Value String
+    Changed bool
+    Committed bool
+}
+
+struct Size {
+    Width u64
+    Height u64
+}
+
+extern c fn openNative(
+    title String,
+    width u64,
+    height u64,
+    &handle u64
+) i32 as remolo_ui_open
+
+extern c fn closeNative(&handle u64) void as remolo_ui_close
+extern c fn beginFrameNative(handle u64) i32 as remolo_ui_begin_frame
+extern c fn endFrameNative(handle u64) i32 as remolo_ui_end_frame
+extern c fn setThemeNative(handle u64, theme u64) i32 as remolo_ui_set_theme
+extern c fn sizeNative(handle u64, &width u64, &height u64) i32 as remolo_ui_size
+extern c fn beginRootNative(handle u64) bool as remolo_ui_begin_root
+extern c fn endRootNative(handle u64) void as remolo_ui_end_root
+extern c fn titlebarNative(handle u64) void as remolo_ui_titlebar
+extern c fn rowNative(handle u64, height f32, columns u64) void as remolo_ui_row
+extern c fn rowBeginNative(handle u64, height f32, columns u64) void as remolo_ui_row_begin
+extern c fn rowPushNative(handle u64, ratio f32) void as remolo_ui_row_push
+extern c fn rowEndNative(handle u64) void as remolo_ui_row_end
+extern c fn beginGroupNative(
+    handle u64,
+    name String,
+    scrollable bool
+) bool as remolo_ui_begin_group
+extern c fn endGroupNative(handle u64) void as remolo_ui_end_group
+extern c fn spaceNative(handle u64, height f32) void as remolo_ui_space
+extern c fn emptyNative(handle u64) void as remolo_ui_empty
+extern c fn separatorNative(handle u64) void as remolo_ui_separator
+extern c fn brandNative(handle u64) void as remolo_ui_brand
+extern c fn iconButtonNative(
+    handle u64,
+    icon u64,
+    label String,
+    selected bool,
+    enabled bool
+) bool as remolo_ui_icon_button
+extern c fn headingNative(handle u64, value String) void as remolo_ui_heading
+extern c fn labelNative(handle u64, value String, tone u64, wrap bool) void as remolo_ui_label
+extern c fn terminalTextNative(
+    handle u64,
+    value String,
+    minimumHeight f32
+) void as remolo_ui_terminal_text
+extern c fn buttonNative(
+    handle u64,
+    value String,
+    selected bool,
+    primary bool
+) bool as remolo_ui_button
+extern c fn fileEntryNative(
+    handle u64,
+    name String,
+    details String,
+    directory bool
+) bool as remolo_ui_file_entry
+extern c fn editNative(
+    handle u64,
+    name String,
+    value String,
+    capacity u64,
+    &result String,
+    &changed bool,
+    &committed bool
+) i32 as remolo_ui_edit
+extern c fn imageBufferNative(
+    handle u64,
+    width u64,
+    height u64,
+    &capacity u64
+) *u8 as remolo_ui_image_buffer
+extern c fn imageCommitNative(handle u64) i32 as remolo_ui_image_commit
+extern c fn imageNative(handle u64) void as remolo_ui_image
+extern c fn pollDesktopInputNative(
+    handle u64,
+    &kind u64,
+    &x u64,
+    &y u64,
+    &button u64,
+    &key u64,
+    &down bool,
+    &delta i64
+) i32 as remolo_ui_poll_desktop_input
+extern c fn desktopControlledNative(handle u64) bool as remolo_ui_desktop_controlled
+extern c fn releaseDesktopControlNative(
+    handle u64
+) void as remolo_ui_release_desktop_control
+
+struct Window {
+    handle u64
+
+    fn SetTheme(&self, theme Theme) Result<void, Error> {
+        const value u64 = match theme {
+            Dark: 0
+            Light: 1
+        }
+        status(setThemeNative(self.handle, value))
+    }
+
+    fn BeginFrame(&self) Result<FrameState, Error> {
+        const value = beginFrameNative(self.handle)
+        if value == 0 return .Ok(.Active)
+        if value == 1 return .Ok(.Closing)
+        .Err(errorFor(value))
+    }
+
+    fn EndFrame(&self) Result<void, Error> {
+        status(endFrameNative(self.handle))
+    }
+
+    fn Size(self) Result<Size, Error> {
+        var width u64 = 0
+        var height u64 = 0
+        const value = sizeNative(self.handle, &width, &height)
+        if value != 0 return .Err(errorFor(value))
+        .Ok(Size { Width = width Height = height })
+    }
+
+    fn BeginRoot(&self) bool {
+        beginRootNative(self.handle)
+    }
+
+    fn Titlebar(&self) void {
+        titlebarNative(self.handle)
+    }
+
+    fn EndRoot(&self) void {
+        endRootNative(self.handle)
+    }
+
+    fn Row(&self, height f32, columns u64) void {
+        rowNative(self.handle, height, columns)
+    }
+
+    fn BeginRow(&self, height f32, columns u64) void {
+        rowBeginNative(self.handle, height, columns)
+    }
+
+    fn PushColumn(&self, ratio f32) void {
+        rowPushNative(self.handle, ratio)
+    }
+
+    fn EndRow(&self) void {
+        rowEndNative(self.handle)
+    }
+
+    fn BeginGroup(&self, name String) bool {
+        beginGroupNative(self.handle, name, false)
+    }
+
+    fn BeginScrollable(&self, name String) bool {
+        beginGroupNative(self.handle, name, true)
+    }
+
+    fn EndGroup(&self) void {
+        endGroupNative(self.handle)
+    }
+
+    fn Space(&self, height f32) void {
+        spaceNative(self.handle, height)
+    }
+
+    fn Empty(&self) void {
+        emptyNative(self.handle)
+    }
+
+    fn Separator(&self) void {
+        separatorNative(self.handle)
+    }
+
+    fn Brand(&self) void {
+        brandNative(self.handle)
+    }
+
+    fn IconButton(
+        &self,
+        icon u64,
+        label String,
+        selected bool,
+        enabled bool
+    ) bool {
+        iconButtonNative(self.handle, icon, label, selected, enabled)
+    }
+
+    fn Heading(&self, value String) void {
+        headingNative(self.handle, value)
+    }
+
+    fn Label(&self, value String, tone LabelTone, wrap bool) void {
+        labelNative(self.handle, value, labelToneValue(tone), wrap)
+    }
+
+    fn TerminalText(&self, value String, minimumHeight f32) void {
+        terminalTextNative(self.handle, value, minimumHeight)
+    }
+
+    fn Button(&self, value String, selected bool, primary bool) bool {
+        buttonNative(self.handle, value, selected, primary)
+    }
+
+    fn FileEntry(&self, name String, details String, directory bool) bool {
+        fileEntryNative(self.handle, name, details, directory)
+    }
+
+    fn Edit(
+        &self,
+        name String,
+        value String,
+        capacity u64
+    ) Result<TextEdit, Error> {
+        var result = ""
+        var changed = false
+        var committed = false
+        const valueStatus = editNative(
+            self.handle,
+            name,
+            value,
+            capacity,
+            &result,
+            &changed,
+            &committed
+        )
+        if valueStatus != 0 return .Err(errorFor(valueStatus))
+        .Ok(TextEdit {
+            Value = result
+            Changed = changed
+            Committed = committed
+        })
+    }
+
+    fn UpdateImage(
+        &self,
+        width u64,
+        height u64,
+        $pixels own bytes.Bytes
+    ) Result<void, Error> {
+        const length = pixels.Len() else error {
+            discard error
+            return .Err(.Invalid)
+        }
+        if width == 0 || height == 0 || width > 18446744073709551615 / height ||
+            width * height > 4611686018427387903 || length != width * height * 4 {
+            discard pixels
+            return .Err(.Invalid)
+        }
+        // SAFETY: imageBufferNative returns a live window-owned buffer with capacity bytes.
+        unsafe {
+            var capacity u64 = 0
+            const destination = imageBufferNative(self.handle, width, height, &capacity)
+            if isNull(destination) {
+                discard pixels
+                return .Err(.Failed)
+            }
+            pixels.CopyToRaw(destination, capacity) else error {
+                discard error
+                return .Err(.Failed)
+            }
+        }
+        status(imageCommitNative(self.handle))
+    }
+
+    fn Image(&self) void {
+        imageNative(self.handle)
+    }
+
+    fn PollDesktopInput(&self) Result<Option<DesktopInput>, Error> {
+        var kind u64 = 0
+        var x u64 = 0
+        var y u64 = 0
+        var button u64 = 0
+        var key u64 = 0
+        var down = false
+        var delta i64 = 0
+        const value = pollDesktopInputNative(
+            self.handle,
+            &kind,
+            &x,
+            &y,
+            &button,
+            &key,
+            &down,
+            &delta
+        )
+        if value < 0 return .Err(.Failed)
+        if value == 0 return .Ok(.None)
+        const type = desktopInputKind(kind) else error { return .Err(error) }
+        .Ok(.Some(DesktopInput {
+            Type = type
+            X = x
+            Y = y
+            Button = button
+            Key = key
+            Down = down
+            Delta = delta
+        }))
+    }
+
+    fn DesktopControlled(self) bool {
+        desktopControlledNative(self.handle)
+    }
+
+    fn ReleaseDesktopControl(&self) void {
+        releaseDesktopControlNative(self.handle)
+    }
+
+    fn drop(&self) void {
+        closeNative(&self.handle)
+    }
+}
+
+fn Open(title String, width u64, height u64) Result<own Window, Error> {
+    var handle u64 = 0
+    const value = openNative(title, width, height, &handle)
+    if value != 0 return .Err(errorFor(value))
+    .Ok(own Window { handle = handle })
+}
+
+fn labelToneValue(value LabelTone) u64 {
+    match value {
+        Primary: 0
+        Muted: 1
+        Accent: 2
+        Danger: 3
+    }
+}
+
+fn desktopInputKind(value u64) Result<DesktopInputKind, Error> {
+    if value == 0 return .Ok(.MouseMove)
+    if value == 1 return .Ok(.MouseButton)
+    if value == 2 return .Ok(.Key)
+    if value == 3 return .Ok(.Wheel)
+    .Err(.Invalid)
+}
+
+fn status(value i32) Result<void, Error> {
+    if value == 0 return .Ok
+    .Err(errorFor(value))
+}
+
+fn errorFor(value i32) Error {
+    if value == 1 return .Unavailable
+    if value == 2 return .Invalid
+    .Failed
+}

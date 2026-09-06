@@ -1,0 +1,161 @@
+package remolo.cli
+
+import remolo.desktop
+import remolo.mux
+import remolo.ui
+import std.collections
+
+task pumpUIDesktop(
+    $reader own desktop.Reader,
+    $events Sender<uiEvent>
+) void {
+    var source = reader
+    var activeEvents = events
+    while true {
+        const reading = spawn desktop.Read($source)
+        const outcome = $reading.wait()
+        const desktop.ReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error {
+            discard error
+            discard source
+            discard activeEvents.send($ .DesktopFailed(message = "The desktop was closed."))
+            return
+        }
+        match event {
+            Frame(value): {
+                const desktop.EncodedFrame { Sequence Width Height Image } = value
+                discard Sequence
+                discard Width
+                discard Height
+                const decoded = desktop.DecodePNG(Image) else error {
+                    discard error
+                    discard source
+                    discard activeEvents.send($ .DesktopFailed(
+                            message = "The remote frame was invalid."
+                        ))
+                    return
+                }
+                discard activeEvents.send($ .DesktopFrame(value = decoded))
+            }
+            Exit: {
+                discard source
+                discard activeEvents.send($ .DesktopFailed(message = "Desktop session ended."))
+                return
+            }
+        }
+    }
+}
+
+fn openUIDesktop(
+    $handle mux.Handle
+) Result<own desktop.RemoteDesktop, desktop.Error> {
+    const opening = spawn desktop.Open($handle, 15)
+    const result = $opening.wait()
+    result
+}
+
+task pumpUIDesktopInput(
+    $writer own desktop.Writer,
+    $receiver Receiver<desktop.InputEvent>,
+    $events Sender<uiEvent>
+) void {
+    var destination = writer
+    var inbox = receiver
+    var activeEvents = events
+    while true {
+        const received = inbox.receive()
+        const event = received else error {
+            discard error
+            discard destination
+            discard inbox
+            discard activeEvents
+            return
+        }
+        const writing = spawn desktop.WriteInput($destination, event)
+        const result = $writing.wait()
+        const next = result else error {
+            discard error
+            discard inbox
+            discard activeEvents.send($ .DesktopFailed(
+                    message = "The desktop input channel was closed."
+                ))
+            return
+        }
+        destination = next
+    }
+}
+
+task sendUIDesktopInputs(
+    $sender Sender<desktop.InputEvent>,
+    $events own collections.List<desktop.InputEvent>
+) void {
+    var pending = events
+    while !pending.IsEmpty() {
+        const event = desktopInputValue(pending.PopFront())
+        discard sender.send(event)
+    }
+}
+
+fn collectUIDesktopInputs(
+    &window ui.Window
+) Result<own collections.List<desktop.InputEvent>, ui.Error> {
+    var reversed = collections.NewList<desktop.InputEvent>()
+    var polling = true
+    while polling {
+        const input = window.PollDesktopInput() else error { return .Err(error) }
+        match input {
+            None: { polling = false }
+            Some(value): reversed.PushFront(uiDesktopInput(value))
+        }
+    }
+    .Ok(reverseUIDesktopInputs($reversed))
+}
+
+fn reverseUIDesktopInputs(
+    $values own collections.List<desktop.InputEvent>
+) own collections.List<desktop.InputEvent> {
+    var pending = values
+    var result = collections.NewList<desktop.InputEvent>()
+    while !pending.IsEmpty() {
+        result.PushFront(desktopInputValue(pending.PopFront()))
+    }
+    result
+}
+
+fn desktopInputValue($value Option<desktop.InputEvent>) desktop.InputEvent {
+    match value {
+        None: panic("desktop input queue invariant failed")
+        Some(event): event
+    }
+}
+
+fn uiDesktopInput(value ui.DesktopInput) desktop.InputEvent {
+    desktop.InputEvent {
+        Type = match value.Type {
+            MouseMove: .MouseMove
+            MouseButton: .MouseButton
+            Key: .Key
+            Wheel: .Wheel
+        }
+        X = value.X
+        Y = value.Y
+        Button = value.Button
+        Key = value.Key
+        Down = value.Down
+        Delta = value.Delta
+    }
+}
+
+fn closeUIDesktop($value Option<own uiDesktopSession>) void {
+    match value {
+        None: {}
+        Some(active): {
+            const uiDesktopSession { input controller } = active
+            discard input
+            const closing = spawn desktop.Close($controller)
+            const result = $closing.wait()
+            discard result
+        }
+    }
+}

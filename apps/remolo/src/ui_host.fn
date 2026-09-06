@@ -1,0 +1,56 @@
+package remolo.cli
+
+import remolo.session
+import remolo.token
+import std.time
+
+task hostFromUI($events Sender<uiEvent>) void {
+    const now = time.Now().Unix()
+    const listening = spawn session.Listen($session.HostOptions {
+        BindAddress = "0.0.0.0"
+        AdvertiseAddress = ""
+        Port = 0
+        IdentityPath = ""
+        Capabilities = hostCapabilities()
+        Expiry = now + 86400
+        Rendezvous = ""
+        IncludeLoopback = false
+        MDNS = true
+        STUN = ""
+        Relay = ""
+    })
+    const opened = $listening.wait()
+    const active = opened else error {
+        discard error
+        discard events.send($ .HostFailed(message = "Could not start a session."))
+        return
+    }
+    const session.ListeningHost { Host Token } = active
+    var host = Host
+    discard host.TakeRelay()
+    const encoded = token.Encode($Token) else error {
+        discard error
+        discard host
+        discard events.send($ .HostFailed(message = "Could not create a session token."))
+        return
+    }
+    const port = host.Port()
+    discard events.send($ .HostReady(value = uiHostReady {
+        token = encoded
+        port = port
+    }))
+    const serving = spawn session.ServeHostWithPolicy(
+        $host,
+        $defaultFileRoot(),
+        $session.DefaultPolicy(true),
+        false
+    )
+    const result = $serving.wait()
+    match result {
+        Ok: {}
+        Err(error): {
+            discard error
+            discard events.send($ .HostFailed(message = "The hosted session stopped."))
+        }
+    }
+}

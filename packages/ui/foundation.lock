@@ -1,0 +1,4 @@
+format foundation.lock/v1
+root remolo.ui 1.0.0
+target linux
+foreign c sdl3-nuklear 1.0.0 path native abi c/v1 sha256:5175a377deaa251e7e5193d494b1cfb6bcc8fb0ad65edbfe0d9426b0b752f18a

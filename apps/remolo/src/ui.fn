@@ -1,0 +1,76 @@
+package remolo.cli
+
+import foundation.worker
+import remolo.ui
+
+fn runUI(args [String]) Result<i32, failure> {
+    if len(args) != 1 return .Err(invalid("ui accepts no arguments"))
+    const running = spawn runUILoop()
+    $running.wait()
+}
+
+task runUILoop() Result<i32, failure> {
+    const opened = ui.Open("Remolo", 1180, 760) else error {
+        discard error
+        return .Err(failed("could not open the native interface"))
+    }
+    var window = opened
+    var state = newUIState()
+    const Channel { sender receiver } = channel<uiEvent>(32)
+    var eventSender = sender
+    var eventReceiver = receiver
+    const workers = worker.NewSupervisor()
+    var running = true
+    while running {
+        const frame = window.BeginFrame() else error {
+            discard error
+            discard eventSender
+            discard eventReceiver
+            discard state
+            const stopping = workers.CancelTask()
+            discard $stopping.wait()
+            return .Err(failed("the native interface stopped"))
+        }
+        match frame {
+            Closing: { running = false }
+            Active: {
+                select {
+                    const received = eventReceiver.receive(): {
+                        applyUIEvent(&window, &state, $received)
+                    }
+                    timeout 16.milliseconds: {}
+                    else error: { discard error }
+                }
+                const rendered = renderUI(
+                    &window,
+                    &state,
+                    workers,
+                    eventSender.clone()
+                )
+                match rendered {
+                    Ok: {
+                        const ended = window.EndFrame()
+                        match ended {
+                            Ok: {}
+                            Err(error): {
+                                discard error
+                                running = false
+                            }
+                        }
+                    }
+                    Err(error): {
+                        discard error
+                        running = false
+                    }
+                }
+            }
+        }
+    }
+    discard eventSender
+    discard eventReceiver
+    discard state
+    const stopping = workers.CancelTask()
+    discard $stopping.wait()
+    discard window
+    .Ok(0)
+}

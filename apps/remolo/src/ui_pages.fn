@@ -1,0 +1,452 @@
+package remolo.cli
+
+import foundation.worker
+import remolo.desktop
+import remolo.rpc
+import remolo.ui
+import std.collections
+import std.format
+import std.text
+
+fn renderConnectPage(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    $events Sender<uiEvent>
+) void {
+    window.Row(44.0, 1)
+    window.Heading("Reach another machine")
+    window.Row(56.0, 1)
+    window.Label(
+        "Paste its session token. Remolo negotiates the route and verifies the host.",
+        .Muted,
+        true
+    )
+    window.Space(18.0)
+    window.Row(42.0, 1)
+    const edited = window.Edit("connect-token", state.token, 8192) else error {
+        discard error
+        discard events
+        state.status = "The token field could not be updated."
+        return
+    }
+    const ui.TextEdit { Value Changed Committed } = edited
+    discard Changed
+    state.token = Value
+    window.Space(8.0)
+    window.BeginRow(44.0, 2)
+    window.PushColumn(0.34)
+    const connecting = isConnection(state.connection, .Connecting)
+    const pressed = window.Button(
+        if connecting { "Connecting..." } else { "Connect" },
+        false,
+        true
+    )
+    if (pressed || Committed) && !connecting && !text.IsEmpty(state.token) {
+        window.PushColumn(0.66)
+        window.Empty()
+        window.EndRow()
+        state.connection = .Connecting
+        state.status = "Finding the machine..."
+        workers.Start(spawn connectFromUI($text.Copy(state.token), $events))
+        return
+    }
+    window.PushColumn(0.66)
+    window.Empty()
+    window.EndRow()
+    discard events
+    renderConnectionStatus(&window, state)
+}
+
+fn renderHostPage(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    $events Sender<uiEvent>
+) void {
+    window.Row(44.0, 1)
+    window.Heading("Share this machine")
+    window.Row(56.0, 1)
+    window.Label(
+        "Start a verified session, then send the token to the person connecting.",
+        .Muted,
+        true
+    )
+    window.Space(18.0)
+    window.BeginRow(44.0, 2)
+    window.PushColumn(0.34)
+    if window.Button(if state.hosting { "Hosting" } else { "Start hosting" }, false, true) &&
+        !state.hosting {
+        window.PushColumn(0.66)
+        window.Empty()
+        window.EndRow()
+        state.hosting = true
+        state.status = "Opening a session..."
+        workers.Start(spawn hostFromUI($events))
+        return
+    }
+    window.PushColumn(0.66)
+    window.Empty()
+    window.EndRow()
+    discard events
+    if state.hosting {
+        window.Space(18.0)
+        window.Row(26.0, 1)
+        window.Label("SESSION TOKEN", .Accent, false)
+        window.Row(150.0, 1)
+        window.Label(state.hostToken, .Primary, true)
+    }
+    renderConnectionStatus(&window, state)
+}
+
+fn renderTerminalPage(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    height f32
+) void {
+    renderRemoteHeader(&window, state, "Terminal")
+    if !state.terminalOpen {
+        window.Space(18.0)
+        window.BeginRow(44.0, 2)
+        window.PushColumn(0.28)
+        if window.Button("Open terminal", false, true) {
+            dispatchUICommand(&state, workers, $ .OpenTerminal)
+        }
+        window.PushColumn(0.72)
+        window.Empty()
+        window.EndRow()
+        return
+    }
+    window.Space(4.0)
+    window.Row(height - 300.0, 1)
+    if window.BeginScrollable("terminal-output") {
+        window.TerminalText(state.terminalOutput, height - 332.0)
+        window.EndGroup()
+    }
+    window.Space(4.0)
+    window.BeginRow(42.0, 2)
+    window.PushColumn(0.84)
+    const edited = window.Edit("terminal-input", state.terminalInput, 8192) else error {
+        discard error
+        state.status = "Terminal input could not be updated."
+        window.PushColumn(0.16)
+        window.Empty()
+        window.EndRow()
+        return
+    }
+    const ui.TextEdit { Value Changed Committed } = edited
+    discard Changed
+    state.terminalInput = Value
+    window.PushColumn(0.16)
+    const sent = window.Button("Send", false, true)
+    window.EndRow()
+    if (sent || Committed) && !text.IsEmpty(state.terminalInput) {
+        const input = text.Copy(state.terminalInput) + "\n"
+        dispatchUICommand(
+            &state,
+            workers,
+            $ .TerminalInput(value = input)
+        )
+        state.terminalInput = ""
+    }
+}
+
+fn renderFilesPage(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    height f32
+) void {
+    renderRemoteHeader(&window, state, "Files")
+    if !state.filesLoaded && !state.filesLoading {
+        const path = text.Copy(state.remotePath)
+        state.filesLoading = true
+        dispatchUICommand(
+            &state,
+            workers,
+            $ .ListFiles(path = path)
+        )
+    }
+    window.Space(12.0)
+    window.BeginRow(42.0, 3)
+    window.PushColumn(0.72)
+    const remote = window.Edit("remote-path", state.remotePath, 4096) else error {
+        discard error
+        state.status = "The remote path could not be updated."
+        window.PushColumn(0.12)
+        window.Empty()
+        window.PushColumn(0.16)
+        window.Empty()
+        window.EndRow()
+        return
+    }
+    const ui.TextEdit {
+        Value as remoteValue
+        Changed as remoteChanged
+        Committed as remoteCommitted
+    } = remote
+    discard remoteChanged
+    state.remotePath = remoteValue
+    window.PushColumn(0.12)
+    const parent = window.Button("Up", false, false)
+    window.PushColumn(0.16)
+    const refreshed = window.Button("Refresh", false, true)
+    window.EndRow()
+    if parent {
+        state.remotePath = remoteParent(state.remotePath)
+        requestUIFiles(&state, workers)
+        return
+    }
+    if refreshed || remoteCommitted {
+        requestUIFiles(&state, workers)
+    }
+    window.Space(8.0)
+    window.Row(height - 490.0, 1)
+    if window.BeginScrollable("remote-files") {
+        renderRemoteFiles(&window, &state, workers)
+        window.EndGroup()
+    }
+    renderFileTransfer(&window, &state, workers)
+}
+
+fn requestUIFiles(&state uiState, workers worker.Supervisor) void {
+    if state.filesLoading return
+    const path = text.Copy(state.remotePath)
+    state.filesLoading = true
+    state.filesLoaded = false
+    dispatchUICommand(
+        &state,
+        workers,
+        $ .ListFiles(path = path)
+    )
+}
+
+fn renderRemoteFiles(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor
+) void {
+    if state.filesLoading {
+        window.Row(40.0, 1)
+        window.Label("Loading directory...", .Muted, false)
+        return
+    }
+    if state.files.IsEmpty() {
+        window.Row(40.0, 1)
+        window.Label("This directory is empty.", .Muted, false)
+        return
+    }
+    var pending = replace state.files with collections.NewList<rpc.DirEntry>()
+    var reversed = collections.NewList<rpc.DirEntry>()
+    while !pending.IsEmpty() {
+        const entry = directoryEntry(pending.PopFront())
+        const rpc.DirEntry { Name Size IsDir Mode } = entry
+        const details = if IsDir {
+            text.Copy(Mode)
+        } else {
+            format.U64(Size) + " bytes  " + Mode
+        }
+        window.Row(48.0, 1)
+        const selected = window.FileEntry(Name, details, IsDir)
+        if selected {
+            const selectedPath = remoteChild(state.remotePath, Name)
+            if IsDir {
+                state.remotePath = selectedPath
+                requestUIFiles(&state, workers)
+            } else {
+                state.transferRemotePath = selectedPath
+            }
+        }
+        reversed.PushFront($rpc.DirEntry {
+            Name = Name
+            Size = Size
+            IsDir = IsDir
+            Mode = Mode
+        })
+    }
+    state.files = reverseDirectoryEntries($reversed)
+}
+
+fn directoryEntry($value Option<rpc.DirEntry>) rpc.DirEntry {
+    match value {
+        Some(entry): entry
+        None: panic("directory entry invariant failed")
+    }
+}
+
+fn reverseDirectoryEntries(
+    $values own collections.List<rpc.DirEntry>
+) own collections.List<rpc.DirEntry> {
+    var pending = values
+    var result = collections.NewList<rpc.DirEntry>()
+    while !pending.IsEmpty() {
+        result.PushFront($directoryEntry(pending.PopFront()))
+    }
+    result
+}
+
+fn remoteChild(parent String, name String) String {
+    if text.IsEmpty(parent) || parent == "." return text.Copy(name)
+    if text.EndsWith(parent, "/") return parent + name
+    parent + "/" + name
+}
+
+fn remoteParent(value String) String {
+    if text.IsEmpty(value) || value == "." || value == "/" return text.Copy(value)
+    var end = text.ByteLen(value)
+    while end > 1 && uiTextByte(value, end - 1) == 47 {
+        end -= 1
+    }
+    var offset = end
+    while offset > 0 && uiTextByte(value, offset - 1) != 47 {
+        offset -= 1
+    }
+    if offset == 0 return "."
+    if offset == 1 return "/"
+    const result = text.Slice(value, 0, offset - 1) else error {
+        discard error
+        return "."
+    }
+    result
+}
+
+fn uiTextByte(value String, index u64) u64 {
+    const result = text.ByteAt(value, index) else error {
+        discard error
+        panic("remote path index is out of range")
+    }
+    result
+}
+
+fn renderFileTransfer(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor
+) void {
+    window.Space(8.0)
+    window.BeginRow(22.0, 2)
+    window.PushColumn(0.5)
+    window.Label("LOCAL PATH", .Muted, false)
+    window.PushColumn(0.5)
+    window.Label("REMOTE PATH", .Muted, false)
+    window.EndRow()
+    window.BeginRow(42.0, 2)
+    window.PushColumn(0.5)
+    const local = window.Edit("local-path", state.localPath, 4096) else error {
+        discard error
+        state.status = "The local path could not be updated."
+        window.PushColumn(0.5)
+        window.Empty()
+        window.EndRow()
+        return
+    }
+    const ui.TextEdit { Value as localValue Changed as localChanged Committed as localCommit } =
+        local
+    discard localChanged
+    discard localCommit
+    state.localPath = localValue
+    window.PushColumn(0.5)
+    const remote = window.Edit(
+        "transfer-remote-path",
+        state.transferRemotePath,
+        4096
+    ) else error {
+        discard error
+        state.status = "The transfer path could not be updated."
+        window.EndRow()
+        return
+    }
+    const ui.TextEdit {
+        Value as transferValue
+        Changed as transferChanged
+        Committed as transferCommit
+    } = remote
+    discard transferChanged
+    discard transferCommit
+    state.transferRemotePath = transferValue
+    window.EndRow()
+    window.BeginRow(40.0, 3)
+    window.PushColumn(0.2)
+    if window.Button("Upload", false, false) {
+        dispatchTransfer(&state, workers, true)
+    }
+    window.PushColumn(0.2)
+    if window.Button("Download", false, false) {
+        dispatchTransfer(&state, workers, false)
+    }
+    window.PushColumn(0.6)
+    window.Empty()
+    window.EndRow()
+}
+
+fn renderDesktopPage(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    height f32
+) void {
+    renderRemoteHeader(&window, state, "Desktop")
+    if !state.desktopOpen {
+        window.Space(18.0)
+        window.BeginRow(44.0, 2)
+        window.PushColumn(0.28)
+        if window.Button("Open desktop", false, true) {
+            state.desktopOpen = true
+            state.status = "Opening the desktop channel..."
+            dispatchUICommand(&state, workers, $ .OpenDesktop)
+        }
+        window.PushColumn(0.72)
+        window.Empty()
+        window.EndRow()
+        return
+    }
+    window.Space(12.0)
+    window.Row(24.0, 1)
+    window.Label(
+        if window.DesktopControlled() {
+        "Controlling remote desktop. Press F8 to release."
+    } else {
+        "Click the desktop to control it."
+    },
+        .Muted,
+        false
+    )
+    window.Row(height - 230.0, 1)
+    if state.desktopFrame {
+        window.Image()
+        const inputs = collectUIDesktopInputs(&window)
+        match inputs {
+            Ok(events): {
+                if !events.IsEmpty() {
+                    dispatchUIDesktopInput(&state, $events)
+                } else {
+                    discard events
+                }
+            }
+            Err(error): {
+                discard error
+                state.status = "Desktop input is unavailable."
+            }
+        }
+    } else {
+        window.Label("Waiting for the first frame...", .Muted, true)
+    }
+}
+
+fn dispatchUIDesktopInput(
+    &state uiState,
+    $events own collections.List<desktop.InputEvent>
+) void {
+    const selected = uiCommandSender(&state)
+    match selected {
+        None: { discard events }
+        Some(sender): {
+            const sending = spawn sendUICommand(
+                $sender,
+                $ .DesktopInput(value = events)
+            )
+            discard $sending.wait()
+        }
+    }
+}
