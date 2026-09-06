@@ -1,0 +1,407 @@
+package remolo.desktop
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.concurrent
+import std.json
+
+extern c fn openRTCPeerNative(
+    &peer u64
+) i32 as remolo_rtc_peer_open
+
+extern c fn closeRTCPeerNative(
+    &peer u64
+) void as remolo_rtc_peer_close
+
+extern c fn releaseRTCPeerNative(
+    &peer u64
+) void as remolo_rtc_peer_release
+
+extern c fn retainRTCPeerNative(
+    peer u64
+) u64 as remolo_rtc_peer_retain
+
+extern c fn setRTCRemoteNative(
+    peer u64,
+    sdp String,
+    type String
+) i32 as remolo_rtc_peer_set_remote
+
+@blocking
+extern c fn localRTCDescriptionNative(
+    peer u64,
+    type String,
+    &sdp String
+) i32 as remolo_rtc_peer_local
+
+extern c fn openRTCChannelNative(
+    peer u64,
+    label String,
+    &channel u64
+) i32 as remolo_rtc_channel_open
+
+@blocking
+extern c fn acceptRTCChannelNative(
+    peer u64,
+    &channel u64
+) i32 as remolo_rtc_channel_accept
+
+@blocking
+extern c fn waitRTCChannelNative(
+    channel u64
+) i32 as remolo_rtc_channel_wait_open
+
+extern c fn splitRTCChannelNative(
+    &channel u64,
+    &reader u64,
+    &writer u64,
+    &controller u64
+) i32 as remolo_rtc_channel_split
+
+extern c fn releaseRTCChannelNative(
+    &channel u64
+) void as remolo_rtc_channel_release
+
+extern c fn closeRTCChannelNative(
+    &channel u64
+) void as remolo_rtc_channel_close
+
+@blocking
+extern c fn sendRTCChannelNative(
+    channel u64,
+    value u64
+) i32 as remolo_rtc_channel_send
+
+@blocking
+extern c fn receiveRTCChannelNative(
+    channel u64,
+    &value u64
+) i32 as remolo_rtc_channel_receive
+
+enum rtcError {
+    Unavailable
+    Invalid
+    Failed
+    Closed
+}
+
+@concurrent.Transferable()
+struct rtcPeer {
+    handle u64
+
+    fn Reference(self) own rtcPeerRef {
+        const handle = retainRTCPeerNative(self.handle)
+        if handle == 0 {
+            panic("WebRTC peer is closed")
+        }
+        own rtcPeerRef { handle = handle }
+    }
+
+    fn drop(&self) void {
+        closeRTCPeerNative(&self.handle)
+    }
+}
+
+@concurrent.Transferable()
+struct rtcPeerRef {
+    handle u64
+
+    fn drop(&self) void {
+        releaseRTCPeerNative(&self.handle)
+    }
+}
+
+@concurrent.Transferable()
+struct rtcChannel {
+    handle u64
+
+    fn Split($self) Result<rtcStream, rtcError> {
+        var active = self
+        var reader u64 = 0
+        var writer u64 = 0
+        var controller u64 = 0
+        const status = splitRTCChannelNative(
+            &active.handle,
+            &reader,
+            &writer,
+            &controller
+        )
+        if status != 0 return .Err(rtcErrorFor(status))
+        .Ok(rtcStream {
+            Reader = own rtcReader { handle = reader }
+            Writer = own rtcWriter { handle = writer }
+            Controller = own rtcController { handle = controller }
+        })
+    }
+
+    fn drop(&self) void {
+        releaseRTCChannelNative(&self.handle)
+    }
+}
+
+@concurrent.Transferable()
+struct rtcReader {
+    handle u64
+
+    fn drop(&self) void {
+        releaseRTCChannelNative(&self.handle)
+    }
+}
+
+@concurrent.Transferable()
+struct rtcWriter {
+    handle u64
+
+    fn drop(&self) void {
+        releaseRTCChannelNative(&self.handle)
+    }
+}
+
+@concurrent.Transferable()
+struct rtcController {
+    handle u64
+
+    fn Close(&self) bool {
+        if self.handle == 0 return false
+        closeRTCChannelNative(&self.handle)
+        true
+    }
+
+    fn drop(&self) void {
+        releaseRTCChannelNative(&self.handle)
+    }
+}
+
+struct rtcStream {
+    Reader own rtcReader
+    Writer own rtcWriter
+    Controller own rtcController
+}
+
+struct rtcReadOutcome {
+    Reader own rtcReader
+    Value Result<own bytes.Bytes, rtcError>
+}
+
+struct rtcWriteOutcome {
+    Writer own rtcWriter
+    Value Result<void, rtcError>
+}
+
+struct rtcSignal {
+    Kind String
+    Type String
+    SDP String
+}
+
+fn openRTCPeer() Result<own rtcPeer, rtcError> {
+    var handle u64 = 0
+    const status = openRTCPeerNative(&handle)
+    if status != 0 return .Err(rtcErrorFor(status))
+    .Ok(own rtcPeer { handle = handle })
+}
+
+fn setRTCRemote(
+    peer rtcPeer,
+    sdp String,
+    type String
+) Result<void, rtcError> {
+    const status = setRTCRemoteNative(peer.handle, sdp, type)
+    if status != 0 return .Err(rtcErrorFor(status))
+    .Ok
+}
+
+task localRTCDescription(
+    $peer own rtcPeerRef,
+    $type String
+) Result<String, rtcError> {
+    var sdp = ""
+    const status = localRTCDescriptionNative(peer.handle, type, &sdp)
+    if status != 0 return .Err(rtcErrorFor(status))
+    .Ok(sdp)
+}
+
+fn openRTCChannel(
+    peer rtcPeer,
+    $label String
+) Result<own rtcChannel, rtcError> {
+    var handle u64 = 0
+    const status = openRTCChannelNative(peer.handle, label, &handle)
+    if status != 0 return .Err(rtcErrorFor(status))
+    .Ok(own rtcChannel { handle = handle })
+}
+
+task acceptRTCChannel(
+    $peer own rtcPeerRef
+) Result<own rtcChannel, rtcError> {
+    var handle u64 = 0
+    const status = acceptRTCChannelNative(peer.handle, &handle)
+    if status != 0 return .Err(rtcErrorFor(status))
+    .Ok(own rtcChannel { handle = handle })
+}
+
+task waitRTCChannel(
+    $channel own rtcChannel
+) Result<own rtcChannel, rtcError> {
+    const status = waitRTCChannelNative(channel.handle)
+    if status != 0 return .Err(rtcErrorFor(status))
+    .Ok(channel)
+}
+
+task readRTC($reader own rtcReader) rtcReadOutcome {
+    var value u64 = 0
+    const status = receiveRTCChannelNative(reader.handle, &value)
+    if status != 0 {
+        return rtcReadOutcome {
+            Reader = reader
+            Value = .Err(rtcErrorFor(status))
+        }
+    }
+    const claimed = bytes.ClaimRuntimeHandle(value) else error {
+        discard error
+        return rtcReadOutcome { Reader = reader Value = .Err(.Failed) }
+    }
+    rtcReadOutcome { Reader = reader Value = .Ok(claimed) }
+}
+
+task writeRTC(
+    $writer own rtcWriter,
+    $value own bytes.Bytes
+) rtcWriteOutcome {
+    const status = sendRTCChannelNative(
+        writer.handle,
+        bytes.RuntimeHandle(value)
+    )
+    discard value
+    if status != 0 {
+        return rtcWriteOutcome {
+            Writer = writer
+            Value = .Err(rtcErrorFor(status))
+        }
+    }
+    rtcWriteOutcome { Writer = writer Value = .Ok }
+}
+
+fn EncodeRTCSignal(
+    $kind String,
+    $type String,
+    $sdp String
+) Result<own bytes.Bytes, Error> {
+    var description = json.NewObject()
+    desktopSetText(&description, "type", type) else error {
+        discard kind
+        discard sdp
+        return .Err(error)
+    }
+    desktopSetText(&description, "sdp", sdp) else error {
+        discard kind
+        return .Err(error)
+    }
+    var signal = json.NewObject()
+    desktopSetText(&signal, "kind", kind) else error {
+        discard description
+        return .Err(error)
+    }
+    desktopSet(&signal, "sdp", $ .Object(description)) else error {
+        return .Err(error)
+    }
+    desktopEncodeJSON($signal)
+}
+
+fn DecodeRTCSignal(
+    $value own bytes.Bytes
+) Result<rtcSignal, Error> {
+    const parsed = desktopParseObject(value) else error {
+        discard value
+        return .Err(error)
+    }
+    discard value
+    var signal = parsed
+    const kind = desktopRequiredText(&signal, "kind") else error {
+        return .Err(error)
+    }
+    const selected = signal.Take("sdp")
+    const description = match selected {
+        Some(value): match value {
+            Object(object): object
+            _: {
+                discard kind
+                return .Err(.Protocol)
+            }
+        }
+        None: {
+            discard kind
+            return .Err(.Protocol)
+        }
+    }
+    var object = description
+    const type = desktopRequiredText(&object, "type") else error {
+        discard kind
+        return .Err(error)
+    }
+    const sdp = desktopRequiredText(&object, "sdp") else error {
+        discard kind
+        discard type
+        return .Err(error)
+    }
+    .Ok(rtcSignal { Kind = kind Type = type SDP = sdp })
+}
+
+task sendRTCSignal(
+    $writer own mux.Writer,
+    $kind String,
+    $type String,
+    $sdp String
+) Result<own mux.Writer, Error> {
+    const payload = EncodeRTCSignal($kind, $type, $sdp) else error {
+        discard writer
+        return .Err(error)
+    }
+    const pending = spawn desktopSend($writer, .JSON, $payload)
+    const result = $pending.wait()
+    result
+}
+
+task readRTCSignal(
+    $reader own mux.Reader
+) Result<rtcSignalRead, Error> {
+    const pending = spawn mux.ReadFrame($reader)
+    const outcome = $pending.wait()
+    const mux.FrameReadOutcome { Reader Value } = outcome
+    const frame = Value else error {
+        discard error
+        discard Reader
+        return .Err(.Closed)
+    }
+    const protocol.Frame { Type Payload } = frame
+    if !jsonFrame(Type) {
+        discard Payload
+        discard Reader
+        return .Err(.Protocol)
+    }
+    const signal = DecodeRTCSignal($Payload) else error {
+        discard Reader
+        return .Err(error)
+    }
+    .Ok(rtcSignalRead { Reader = Reader Signal = signal })
+}
+
+struct rtcSignalRead {
+    Reader own mux.Reader
+    Signal rtcSignal
+}
+
+fn rtcErrorFor(status i32) rtcError {
+    if status == 1 return .Unavailable
+    if status == 2 return .Invalid
+    if status == 4 return .Closed
+    .Failed
+}
+
+fn desktopRTCError(error rtcError) Error {
+    match error {
+        Closed: .Closed
+        _: .InvalidMode
+    }
+}

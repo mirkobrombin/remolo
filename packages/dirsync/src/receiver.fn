@@ -1,0 +1,363 @@
+package remolo.dirsync
+
+import remolo.mux
+import std.bytes
+import std.collections
+import std.fs
+import std.text
+
+// fcs:ignore FCS6001 Sync keeps reader, writer, and root ownership in one flow.
+task runReceiver(
+    $initialReader own mux.Reader,
+    $initialWriter own mux.Writer,
+    $directory String,
+    delete bool,
+    dryRun bool
+) Result<Stats, Error> {
+    var reader = initialReader
+    var writer = initialWriter
+    const announcementReading = spawn readSyncMessage($reader)
+    const announcementRead = $announcementReading.wait()
+    const messageReadOutcome {
+        Reader as announcedReader
+        Value as announcementValue
+    } = announcementRead
+    reader = announcedReader
+    const announcement = announcementValue else error {
+        return .Err(error)
+    }
+    if announcement.Type == "error" return .Err(.Remote)
+    if announcement.Type != "manifest" return .Err(.Protocol)
+    const manifestReading = spawn readSyncStream($reader, manifestLimit())
+    const manifestRead = $manifestReading.wait()
+    const streamReadOutcome {
+        Reader as manifestReader
+        Value as manifestValue
+    } = manifestRead
+    reader = manifestReader
+    const manifestBytes = manifestValue else error {
+        return .Err(error)
+    }
+    const decoded = DecodeManifest(manifestBytes) else error {
+        return .Err(error)
+    }
+    var sender = decoded
+    const filesConsidered = nonNegativeCount(sender.CountFiles())
+    if dryRun {
+        const stats = dryRunStats(
+            &sender,
+            directory,
+            filesConsidered
+        ) else error {
+            return .Err(error)
+        }
+        const finishing = spawn finishReceiver($reader, $writer, stats)
+        const finished = $finishing.wait()
+        return finished
+    }
+    fs.CreateDirectory(directory) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    const openedRoot = fs.OpenRoot(directory) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    var root = openedRoot
+    const noExcludes [0]String = []
+    var excludes = NewExcluder(noExcludes)
+    const builtLocal = BuildManifest(directory, &excludes, true) else error {
+        discard root
+        return .Err(error)
+    }
+    var local = builtLocal
+    var processed = newManifest()
+    var stats = Stats {
+        FilesConsidered = filesConsidered
+        FilesTransferred = 0
+        BytesTransferred = 0
+    }
+    while sender.Len() > 0 {
+        const entry = requiredEntry(sender.Take())
+        const existing = local.Find(entry.Path)
+        if isDirectory(entry.Kind) {
+            prepareDirectory(&root, &local, $existing, entry.Path, dryRun) else error {
+                return .Err(error)
+            }
+        } else {
+            if isSymbolicLink(entry.Kind) {
+                prepareSymbolicLink(
+                    &root,
+                    &local,
+                    $existing,
+                    entry,
+                    dryRun
+                ) else error {
+                    return .Err(error)
+                }
+            } else {
+                const changed = fileChanged(existing, entry)
+                if changed {
+                    stats.FilesTransferred += 1
+                    if dryRun {
+                        stats.BytesTransferred += entry.Size
+                    } else {
+                        const prepared = prepareFileBase(
+                            &root,
+                            &local,
+                            $existing,
+                            entry.Path
+                        ) else error {
+                            return .Err(error)
+                        }
+                        const transfer = spawn requestFile(
+                            $reader,
+                            $writer,
+                            $root,
+                            $text.Copy(directory),
+                            $copyEntry(entry),
+                            prepared
+                        )
+                        const transferred = $transfer.wait()
+                        const success = transferred else error {
+                            return .Err(error)
+                        }
+                        const receiveFileSuccess {
+                            Reader as restoredReader
+                            Writer as restoredWriter
+                            Root as restoredRoot
+                            LiteralBytes
+                        } = success
+                        reader = restoredReader
+                        writer = restoredWriter
+                        root = restoredRoot
+                        const totalBytes = addTransferBytes(
+                            stats.BytesTransferred,
+                            LiteralBytes
+                        ) else error {
+                            return .Err(error)
+                        }
+                        stats.BytesTransferred = totalBytes
+                    }
+                }
+            }
+        }
+        processed.add($entry)
+    }
+    discard sender
+    processed.sort()
+    sender = processed
+    if delete && !dryRun {
+        removeExtras(&root, &local, &sender) else error {
+            return .Err(error)
+        }
+    }
+    if !dryRun {
+        applyDirectoryMetadata(&root, &sender) else error {
+            return .Err(error)
+        }
+    }
+    discard root.Close()
+    discard root
+    const finishing = spawn finishReceiver($reader, $writer, stats)
+    const finished = $finishing.wait()
+    finished
+}
+
+struct receiveFileSuccess {
+    Reader own mux.Reader
+    Writer own mux.Writer
+    Root own fs.RootWriter
+    LiteralBytes u64
+}
+
+task requestFile(
+    $initialReader own mux.Reader,
+    $initialWriter own mux.Writer,
+    $initialRoot own fs.RootWriter,
+    $directory String,
+    $entry Entry,
+    baseInfo fileBase
+) Result<receiveFileSuccess, Error> {
+    var reader = initialReader
+    var writer = initialWriter
+    var root = initialRoot
+    var need = newSyncMessage("need")
+    need.Path = text.Copy(entry.Path)
+    need.HasBase = baseInfo.Available
+    const requesting = spawn writeSyncMessage($writer, $need)
+    const requested = $requesting.wait()
+    const requestWriter = requested else error { return .Err(error) }
+    writer = requestWriter
+    var base = bytes.FromText("")
+    if baseInfo.Available {
+        const openedTree = fs.OpenTree(directory, 1000000, 32768) else error {
+            discard error
+            return .Err(.Filesystem)
+        }
+        var tree = openedTree
+        const content = tree.ReadFile(entry.Path, baseInfo.Size) else error {
+            discard error
+            discard tree
+            return .Err(.Filesystem)
+        }
+        discard tree.Close()
+        discard tree
+        const previous = replace base with content
+        discard previous
+        const signature = BuildSignature(base, BlockSize()) else error {
+            return .Err(error)
+        }
+        const encoded = EncodeSignature($signature) else error {
+            return .Err(error)
+        }
+        const SignatureEncoding { Signature Data } = encoded
+        discard Signature
+        const streaming = spawn writeSyncStream($writer, $Data)
+        const streamed = $streaming.wait()
+        const signatureWriter = streamed else error { return .Err(error) }
+        writer = signatureWriter
+    }
+    const responseReading = spawn readSyncMessage($reader)
+    const responseRead = $responseReading.wait()
+    const messageReadOutcome {
+        Reader as responseReader
+        Value as responseValue
+    } = responseRead
+    reader = responseReader
+    const response = responseValue else error { return .Err(error) }
+    if response.Type == "error" return .Err(.Remote)
+    if response.Type != "delta" || response.Path != entry.Path ||
+        response.Size != entry.Size {
+        return .Err(.Protocol)
+    }
+    const deltaReading = spawn readSyncStream(
+        $reader,
+        deltaStreamLimit(entry.Size)
+    )
+    const deltaRead = $deltaReading.wait()
+    const streamReadOutcome { Reader as deltaReader Value } = deltaRead
+    reader = deltaReader
+    const delta = Value else error { return .Err(error) }
+    const rebuilt = ApplyDelta(base, delta, entry.Size, BlockSize()) else error {
+        return .Err(error)
+    }
+    root.WriteFile(entry.Path, rebuilt, entry.Permissions) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    root.SetModified(entry.Path, entry.Modified) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    const literalBytes = deltaLiteralBytes(delta) else error {
+        return .Err(error)
+    }
+    .Ok(receiveFileSuccess {
+        Reader = reader
+        Writer = writer
+        Root = root
+        LiteralBytes = literalBytes
+    })
+}
+
+fn fileChanged(existing Option<Entry>, source Entry) bool {
+    match existing {
+        None: true
+        Some(value): {
+            !isFile(value.Kind) || value.SHA256 != source.SHA256
+        }
+    }
+}
+
+fn manifestLimit() u64 {
+    256 * 1024 * 1024
+}
+
+fn deltaStreamLimit(size u64) u64 {
+    size + ((size / maxBlockData()) + 2) * 5 + 1
+}
+
+task finishReceiver(
+    $reader own mux.Reader,
+    $initialWriter own mux.Writer,
+    stats Stats
+) Result<Stats, Error> {
+    discard reader
+    var done = newSyncMessage("done")
+    const doneWriting = spawn writeSyncMessage($initialWriter, $done)
+    const doneWritten = $doneWriting.wait()
+    const completedWriter = doneWritten else error {
+        return .Err(error)
+    }
+    var complete = newSyncMessage("complete")
+    complete.Stats = stats
+    complete.HasStats = true
+    const completeWriting = spawn writeSyncMessage($completedWriter, $complete)
+    const completeWritten = $completeWriting.wait()
+    const finalWriter = completeWritten else error {
+        return .Err(error)
+    }
+    const closing = spawn mux.CloseWriter($finalWriter)
+    const closed = $closing.wait()
+    closed else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    .Ok(stats)
+}
+
+fn dryRunStats(
+    &sender Manifest,
+    directory String,
+    filesConsidered u64
+) Result<Stats, Error> {
+    var local = newManifest()
+    const kind = fs.Kind(directory) else error {
+        discard error
+        discard local
+        return .Err(.Filesystem)
+    }
+    match kind {
+        Directory: {
+            const noExcludes [0]String = []
+            var excludes = NewExcluder(noExcludes)
+            const built = BuildManifest(directory, &excludes, true) else error {
+                discard local
+                return .Err(error)
+            }
+            const empty = replace local with built
+            discard empty
+        }
+        Missing: {}
+        _: {
+            discard local
+            return .Err(.Filesystem)
+        }
+    }
+    var pending = replace sender.entries with collections.NewList<Entry>()
+    var restored = collections.NewList<Entry>()
+    var transferred u64 = 0
+    var bytesTransferred u64 = 0
+    while !pending.IsEmpty() {
+        const entry = requiredEntry(pending.PopFront())
+        if isFile(entry.Kind) && fileChanged(local.Find(entry.Path), entry) {
+            transferred += 1
+            const totalBytes = addTransferBytes(
+                bytesTransferred,
+                entry.Size
+            ) else error {
+                return .Err(error)
+            }
+            bytesTransferred = totalBytes
+        }
+        restored.PushFront($entry)
+    }
+    discard pending
+    sender.entries = collections.Sort($restored, compareEntries)
+    .Ok(Stats {
+        FilesConsidered = filesConsidered
+        FilesTransferred = transferred
+        BytesTransferred = bytesTransferred
+    })
+}

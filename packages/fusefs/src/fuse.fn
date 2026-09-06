@@ -1,0 +1,528 @@
+package remolo.fusefs
+
+import remolo.mux
+import remolo.rpc
+import std.bytes
+import std.text
+
+enum Error {
+    Unavailable
+    Remote
+    Protocol
+}
+
+struct Event {
+    Operation u32
+    Path String
+    Destination String
+    Offset u64
+    Size u64
+    Mode u32
+    Flags u32
+    Data Option<own bytes.Bytes>
+}
+
+struct Mount {
+    native u64
+
+    fn drop(&self) void {
+        discard closeNative(&self.native)
+    }
+}
+
+@blocking
+extern c fn openNative(mountpoint String) u64 as remolo_fuse_open
+
+@blocking
+extern c fn nextNative(
+    handle u64,
+    &operation u32,
+    &path String,
+    &destination String,
+    &offset u64,
+    &size u64,
+    &mode u32,
+    &flags u32,
+    &data u64
+) i32 as remolo_fuse_next
+
+extern c fn addDirectoryEntryNative(
+    handle u64,
+    name String,
+    mode u32
+) i32 as remolo_fuse_add_directory_entry
+
+extern c fn replyErrorNative(
+    handle u64,
+    error i32
+) i32 as remolo_fuse_reply_error
+
+extern c fn replyOKNative(handle u64) i32 as remolo_fuse_reply_ok
+
+extern c fn replyAttributeNative(
+    handle u64,
+    mode u32,
+    size u64,
+    modified u64
+) i32 as remolo_fuse_reply_attribute
+
+extern c fn replyReadNative(
+    handle u64,
+    data u64
+) i32 as remolo_fuse_reply_read
+
+extern c fn replyWriteNative(
+    handle u64,
+    count u64
+) i32 as remolo_fuse_reply_write
+
+extern c fn closeNative(&handle u64) i32 as remolo_fuse_close
+
+task Serve(
+    $connection mux.Handle,
+    $mountpoint String,
+    readOnly bool
+) Result<void, Error> {
+    const native = openNative(mountpoint)
+    if native == 0 return .Err(.Unavailable)
+    var mount = Mount { native = native }
+    var running = true
+    while running {
+        const reading = spawn nextEvent(mount.native)
+        const result = $reading.wait()
+        const next = result else error {
+            discard mount
+            return .Err(error)
+        }
+        const event = match next {
+            None: {
+                running = false
+                continue
+            }
+            Some(found): found
+        }
+        const serving = spawn serveEvent(
+            mount.native,
+            connection.Clone(),
+            $event,
+            readOnly
+        )
+        const served = $serving.wait()
+        match served {
+            Ok: {}
+            Err(error): {
+                discard error
+                if replyErrorNative(mount.native, 5) != 0 {
+                    discard mount
+                    return .Err(.Protocol)
+                }
+            }
+        }
+    }
+    discard mount
+    .Ok
+}
+
+task nextEvent(handle u64) Result<Option<own Event>, Error> {
+    var operation u32 = 0
+    var path = ""
+    var destination = ""
+    var offset u64 = 0
+    var size u64 = 0
+    var mode u32 = 0
+    var flags u32 = 0
+    var data u64 = 0
+    const status = nextNative(
+        handle,
+        &operation,
+        &path,
+        &destination,
+        &offset,
+        &size,
+        &mode,
+        &flags,
+        &data
+    )
+    if status == 0 return .Ok(.None)
+    if status != 1 return .Err(.Unavailable)
+    var value Option<own bytes.Bytes> = .None
+    if data != 0 {
+        const claimed = bytes.ClaimRuntimeHandle(data) else error {
+            discard error
+            return .Err(.Protocol)
+        }
+        value = .Some(claimed)
+    }
+    .Ok(.Some(own Event {
+        Operation = operation
+        Path = path
+        Destination = destination
+        Offset = offset
+        Size = size
+        Mode = mode
+        Flags = flags
+        Data = value
+    }))
+}
+
+task serveEvent(
+    native u64,
+    $connection mux.Handle,
+    $event own Event,
+    readOnly bool
+) Result<void, Error> {
+    const operation = event.Operation
+    const flags = event.Flags
+    if operation <= 4 {
+        if readOnly && operation == 3 && flags != 0 {
+            discard connection
+            discard event
+            return replyError(native, 30)
+        }
+        const serving = spawn serveLookupEvent(native, $connection, $event)
+        const result = $serving.wait()
+        return result
+    }
+    if readOnly {
+        discard connection
+        discard event
+        return replyError(native, 30)
+    }
+    const serving = spawn serveMutationEvent(native, $connection, $event)
+    const result = $serving.wait()
+    result
+}
+
+task serveLookupEvent(
+    native u64,
+    $connection mux.Handle,
+    $event own Event
+) Result<void, Error> {
+    const Event {
+        Operation
+        Path
+        Destination
+        Offset
+        Size
+        Mode
+        Flags
+        Data
+    } = event
+    if Operation == 1 {
+        discard Destination
+        discard Data
+        const serving = spawn serveAttribute(native, $connection, $Path)
+        const result = $serving.wait()
+        return result
+    }
+    if Operation == 2 {
+        discard Destination
+        discard Data
+        const serving = spawn serveDirectory(native, $connection, $Path)
+        const result = $serving.wait()
+        return result
+    }
+    if Operation == 3 {
+        discard connection
+        discard Path
+        discard Destination
+        discard Data
+        return replyOK(native)
+    }
+    if Operation == 4 {
+        discard Destination
+        discard Data
+        const serving = spawn serveRead(native, $connection, $Path, Offset, Size)
+        const result = $serving.wait()
+        return result
+    }
+    discard connection
+    discard Path
+    discard Destination
+    discard Data
+    replyError(native, 38)
+}
+
+task serveMutationEvent(
+    native u64,
+    $connection mux.Handle,
+    $event own Event
+) Result<void, Error> {
+    const Event {
+        Operation
+        Path
+        Destination
+        Offset
+        Size
+        Mode
+        Flags
+        Data
+    } = event
+    if Operation == 5 {
+        discard Destination
+        const serving = spawn serveWrite(native, $connection, $Path, Offset, $Data)
+        const result = $serving.wait()
+        return result
+    }
+    if Operation == 6 {
+        discard Destination
+        discard Data
+        const serving = spawn serveTruncate(native, $connection, $Path, Size)
+        const result = $serving.wait()
+        return result
+    }
+    if Operation == 7 {
+        discard Destination
+        discard Data
+        const serving = spawn serveCreate(native, $connection, $Path, Mode)
+        const result = $serving.wait()
+        return result
+    }
+    if Operation == 8 {
+        discard Destination
+        discard Data
+        const serving = spawn serveMakeDirectory(native, $connection, $Path, Mode)
+        const result = $serving.wait()
+        return result
+    }
+    if Operation == 9 || Operation == 10 {
+        discard Destination
+        discard Data
+        const serving = spawn serveRemove(native, $connection, $Path)
+        const result = $serving.wait()
+        return result
+    }
+    if Operation == 11 {
+        discard Data
+        const serving = spawn serveRename(native, $connection, $Path, $Destination)
+        const result = $serving.wait()
+        return result
+    }
+    discard connection
+    discard Path
+    discard Destination
+    discard Data
+    replyError(native, 38)
+}
+
+task serveAttribute(
+    native u64,
+    $connection mux.Handle,
+    $path String
+) Result<void, Error> {
+    const requesting = spawn rpc.Stat($connection, $path)
+    const result = $requesting.wait()
+    const value = result else error { return replyRPCError(native, $error) }
+    const status = replyAttributeNative(
+        native,
+        modeBits(value.Mode, value.IsDir),
+        value.Size,
+        value.ModTime
+    )
+    if status != 0 return .Err(.Protocol)
+    .Ok
+}
+
+task serveDirectory(
+    native u64,
+    $connection mux.Handle,
+    $path String
+) Result<void, Error> {
+    const requesting = spawn rpc.List($connection, $path)
+    const result = $requesting.wait()
+    const values = result else error { return replyRPCError(native, $error) }
+    if addDirectoryEntryNative(native, ".", 16384 | 493) != 0 {
+        discard values
+        return .Err(.Protocol)
+    }
+    if addDirectoryEntryNative(native, "..", 16384 | 493) != 0 {
+        discard values
+        return .Err(.Protocol)
+    }
+    var entries = values
+    var adding = true
+    while !entries.IsEmpty() && adding {
+        const entry = directoryEntry(entries.PopFront())
+        if addDirectoryEntryNative(
+            native,
+            entry.Name,
+            modeBits(entry.Mode, entry.IsDir)
+        ) != 0 {
+            adding = false
+        }
+    }
+    discard entries
+    replyOK(native)
+}
+
+task serveRead(
+    native u64,
+    $connection mux.Handle,
+    $path String,
+    offset u64,
+    size u64
+) Result<void, Error> {
+    const requesting = spawn rpc.ReadAt($connection, $path, offset, size)
+    const result = $requesting.wait()
+    const value = result else error { return replyRPCError(native, $error) }
+    const rpc.ReadResult { Data EOF } = value
+    discard EOF
+    const status = replyReadNative(native, bytes.RuntimeHandle(Data))
+    discard Data
+    if status != 0 return .Err(.Protocol)
+    .Ok
+}
+
+task serveWrite(
+    native u64,
+    $connection mux.Handle,
+    $path String,
+    offset u64,
+    $data Option<own bytes.Bytes>
+) Result<void, Error> {
+    const value = match data {
+        Some(found): found
+        None: { return replyError(native, 22) }
+    }
+    const requesting = spawn rpc.WriteAt($connection, $path, offset, $value)
+    const result = $requesting.wait()
+    const count = result else error { return replyRPCError(native, $error) }
+    if replyWriteNative(native, count) != 0 return .Err(.Protocol)
+    .Ok
+}
+
+task serveTruncate(
+    native u64,
+    $connection mux.Handle,
+    $path String,
+    size u64
+) Result<void, Error> {
+    const requesting = spawn rpc.Truncate($connection, $path, size)
+    const result = $requesting.wait()
+    result else error { return replyRPCError(native, $error) }
+    replyOK(native)
+}
+
+task serveCreate(
+    native u64,
+    $connection mux.Handle,
+    $path String,
+    mode u32
+) Result<void, Error> {
+    const requesting = spawn rpc.Create($connection, $path, mode)
+    const result = $requesting.wait()
+    result else error { return replyRPCError(native, $error) }
+    replyOK(native)
+}
+
+task serveMakeDirectory(
+    native u64,
+    $connection mux.Handle,
+    $path String,
+    mode u32
+) Result<void, Error> {
+    const requesting = spawn rpc.MakeDirectory($connection, $path, mode)
+    const result = $requesting.wait()
+    result else error { return replyRPCError(native, $error) }
+    replyOK(native)
+}
+
+task serveRemove(
+    native u64,
+    $connection mux.Handle,
+    $path String
+) Result<void, Error> {
+    const requesting = spawn rpc.Remove($connection, $path)
+    const result = $requesting.wait()
+    result else error { return replyRPCError(native, $error) }
+    replyOK(native)
+}
+
+task serveRename(
+    native u64,
+    $connection mux.Handle,
+    $source String,
+    $destination String
+) Result<void, Error> {
+    const requesting = spawn rpc.Rename($connection, $source, $destination)
+    const result = $requesting.wait()
+    result else error { return replyRPCError(native, $error) }
+    replyOK(native)
+}
+
+fn replyRPCError(native u64, $error rpc.Error) Result<void, Error> {
+    replyError(native, errorNumber($error))
+}
+
+fn replyError(native u64, error i32) Result<void, Error> {
+    if replyErrorNative(native, error) == 0 return .Ok
+    .Err(.Protocol)
+}
+
+fn replyOK(native u64) Result<void, Error> {
+    if replyOKNative(native) == 0 return .Ok
+    .Err(.Protocol)
+}
+
+fn errorNumber($error rpc.Error) i32 {
+    match error {
+        NotFound: 2
+        Permission: 13
+        AlreadyExists: 17
+        NotDirectory: 20
+        IsDirectory: 21
+        NotEmpty: 39
+        Remote(message): remoteErrorNumber(message)
+        _: 5
+    }
+}
+
+fn remoteErrorNumber(message String) i32 {
+    if text.Contains(message, "no such file") ||
+        text.Contains(message, "not exist") {
+        return 2
+    }
+    if text.Contains(message, "permission denied") ||
+        text.Contains(message, "read-only") {
+        return 13
+    }
+    if text.Contains(message, "file exists") return 17
+    if text.Contains(message, "not a directory") return 20
+    if text.Contains(message, "is a directory") return 21
+    if text.Contains(message, "not empty") return 39
+    5
+}
+
+fn directoryEntry($value Option<rpc.DirEntry>) rpc.DirEntry {
+    match value {
+        Some(found): found
+        None: { panic("FUSE directory entry invariant failed") }
+    }
+}
+
+fn modeBits(value String, directory bool) u32 {
+    var mode u32 = if directory { 16384 } else { 32768 }
+    var index u64 = 0
+    while index < 9 && index + 1 < text.ByteLen(value) {
+        const symbol = text.ByteAt(value, index + 1) else error {
+            discard error
+            return mode
+        }
+        if symbol != 45 { mode = mode | permissionBit(index) }
+        index += 1
+    }
+    mode
+}
+
+fn permissionBit(index u64) u32 {
+    if index == 0 return 256
+    if index == 1 return 128
+    if index == 2 return 64
+    if index == 3 return 32
+    if index == 4 return 16
+    if index == 5 return 8
+    if index == 6 return 4
+    if index == 7 return 2
+    if index == 8 return 1
+    0
+}

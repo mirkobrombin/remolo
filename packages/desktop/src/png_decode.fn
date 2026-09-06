@@ -1,0 +1,144 @@
+package remolo.desktop
+
+import std.bytes
+import std.text
+
+struct pixelFrame {
+    width u64
+    height u64
+    pixels own bytes.Bytes
+}
+
+fn decodePNG(value bytes.Bytes) Result<own pixelFrame, Error> {
+    const length = pngLength(value)
+    if length < 57 || !pngSignatureValid(value) return .Err(.InvalidFrame)
+    if pngU32At(value, 8) != 13 || !pngType(value, 12, "IHDR") {
+        return .Err(.InvalidFrame)
+    }
+    const width = pngU32At(value, 16)
+    const height = pngU32At(value, 20)
+    if pngAt(value, 24) != 8 || pngAt(value, 25) != 6 ||
+        pngAt(value, 26) != 0 || pngAt(value, 27) != 0 || pngAt(value, 28) != 0 {
+        return .Err(.InvalidFrame)
+    }
+    const compressedLength = pngU32At(value, 33)
+    if !pngType(value, 37, "IDAT") || compressedLength > length - 57 {
+        return .Err(.InvalidFrame)
+    }
+    const compressedEnd u64 = 41 + compressedLength
+    if compressedEnd + 16 != length || pngU32At(value, compressedEnd + 4) != 0 ||
+        !pngType(value, compressedEnd + 8, "IEND") {
+        return .Err(.InvalidFrame)
+    }
+    const compressed = value.Slice(41, compressedEnd) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const filtered = decodeStoredZlib(compressed) else error { return .Err(error) }
+    const pixels = decodeFilteredRows(width, height, filtered) else error {
+        return .Err(error)
+    }
+    .Ok(own pixelFrame { width = width height = height pixels = pixels })
+}
+
+fn decodeStoredZlib(value bytes.Bytes) Result<own bytes.Bytes, Error> {
+    const length = pngLength(value)
+    if length < 6 || pngAt(value, 0) != 120 || pngAt(value, 1) != 1 {
+        return .Err(.InvalidFrame)
+    }
+    const opened = bytes.NewBuilder(16777216) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    var offset u64 = 2
+    var final = false
+    while !final {
+        if offset + 5 > length - 4 return .Err(.InvalidFrame)
+        const header = pngAt(value, offset)
+        if (header & 254) != 0 return .Err(.InvalidFrame)
+        final = (header & 1) == 1
+        const blockLength = pngAt(value, offset + 1) | pngAt(value, offset + 2) << 8
+        const inverse = pngAt(value, offset + 3) | pngAt(value, offset + 4) << 8
+        if inverse != 65535 - blockLength return .Err(.InvalidFrame)
+        offset += 5
+        if blockLength > length - 4 - offset return .Err(.InvalidFrame)
+        pngCopyRange(&output, value, offset, blockLength) else error {
+            return .Err(error)
+        }
+        offset += blockLength
+    }
+    if offset != length - 4 return .Err(.InvalidFrame)
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if pngAdler32(result) != pngU32At(value, length - 4) {
+        discard result
+        return .Err(.InvalidFrame)
+    }
+    .Ok(result)
+}
+
+fn decodeFilteredRows(
+    width u64,
+    height u64,
+    value bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    if width == 0 || height == 0 || width > 4194304 ||
+        height > 18446744073709551615 / width {
+        return .Err(.InvalidFrame)
+    }
+    const rowLength = width * 4
+    if rowLength == 18446744073709551615 ||
+        height > 18446744073709551615 / (rowLength + 1) ||
+        pngLength(value) != height * (rowLength + 1) {
+        return .Err(.InvalidFrame)
+    }
+    const opened = bytes.NewBuilder(width * height * 4) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    var row u64 = 0
+    while row < height {
+        const offset = row * (rowLength + 1)
+        if pngAt(value, offset) != 0 return .Err(.InvalidFrame)
+        pngCopyRange(&output, value, offset + 1, rowLength) else error {
+            return .Err(error)
+        }
+        row += 1
+    }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn pngSignatureValid(value bytes.Bytes) bool {
+    pngAt(value, 0) == 137 && pngAt(value, 1) == 80 &&
+        pngAt(value, 2) == 78 && pngAt(value, 3) == 71 &&
+        pngAt(value, 4) == 13 && pngAt(value, 5) == 10 &&
+        pngAt(value, 6) == 26 && pngAt(value, 7) == 10
+}
+
+fn pngType(value bytes.Bytes, offset u64, expected String) bool {
+    pngAt(value, offset) == textByte(expected, 0) &&
+        pngAt(value, offset + 1) == textByte(expected, 1) &&
+        pngAt(value, offset + 2) == textByte(expected, 2) &&
+        pngAt(value, offset + 3) == textByte(expected, 3)
+}
+
+fn pngU32At(value bytes.Bytes, offset u64) u64 {
+    pngAt(value, offset) << 24 | pngAt(value, offset + 1) << 16 |
+        pngAt(value, offset + 2) << 8 | pngAt(value, offset + 3)
+}
+
+fn textByte(value String, offset u64) u64 {
+    const result = text.ByteAt(value, offset) else error {
+        discard error
+        panic("PNG chunk type invariant failed")
+    }
+    result
+}

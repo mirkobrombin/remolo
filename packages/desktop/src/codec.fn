@@ -1,0 +1,293 @@
+package remolo.desktop
+
+import std.bytes
+import std.desktop as platformDesktop
+
+struct diffBody {
+    count u64
+    value own bytes.Bytes
+}
+
+fn EncodeFrame(
+    &encoder Encoder,
+    $source platformDesktop.Frame
+) Result<own bytes.Bytes, Error> {
+    const frame = normalizeFrame($source) else error { return .Err(error) }
+    const platformDesktop.Frame { Width Height Pixels } = frame
+    encoder.sequence += 1
+    match encoder.mode {
+        Screenshot: encodeFull(encoder.sequence, Width, Height, Pixels)
+        Diff: encodeNextDiff(&encoder, Width, Height, $Pixels)
+        WebRTC: {
+            discard Pixels
+            .Err(.InvalidMode)
+        }
+    }
+}
+
+fn DecodeFullFrame(source bytes.Bytes) Result<own EncodedFrame, Error> {
+    const length = frameLength(source)
+    if length < 17 || frameByte(source, 0) != 1 return .Err(.InvalidFrame)
+    const width = frameU32(source, 1)
+    const height = frameU32(source, 5)
+    const sequence = frameU32(source, 9)
+    const imageLength = frameU32(source, 13)
+    if imageLength > length - 17 return .Err(.InvalidFrame)
+    if imageLength != length - 17 return .Err(.InvalidFrame)
+    const image = source.Slice(17, length) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(own EncodedFrame {
+        Sequence = sequence
+        Width = width
+        Height = height
+        Image = image
+    })
+}
+
+fn normalizeFrame(
+    $source platformDesktop.Frame
+) Result<platformDesktop.Frame, Error> {
+    const platformDesktop.Frame { Width Height Pixels } = source
+    const length = frameLength(Pixels)
+    if !validPixels(Width, Height, length) {
+        discard Pixels
+        return .Err(.InvalidFrame)
+    }
+    var scale u64 = 1
+    var width = Width
+    var height = Height
+    while width * height * 4 > 8388608 || width > 65535 || height > 65535 {
+        if scale > 65536 {
+            discard Pixels
+            return .Err(.InvalidFrame)
+        }
+        scale *= 2
+        width = (Width + scale - 1) / scale
+        height = (Height + scale - 1) / scale
+    }
+    if scale == 1 {
+        return .Ok(platformDesktop.Frame {
+            Width = Width
+            Height = Height
+            Pixels = Pixels
+        })
+    }
+    const scaled = scalePixels(Width, width, height, scale, Pixels) else error {
+        discard Pixels
+        return .Err(error)
+    }
+    discard Pixels
+    .Ok(platformDesktop.Frame {
+        Width = width
+        Height = height
+        Pixels = scaled
+    })
+}
+
+fn validPixels(width u64, height u64, length u64) bool {
+    if width == 0 || height == 0 return false
+    if width > 18446744073709551615 / height return false
+    const count = width * height
+    if count > 4611686018427387903 return false
+    length == count * 4
+}
+
+fn scalePixels(
+    sourceWidth u64,
+    width u64,
+    height u64,
+    scale u64,
+    source bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const opened = bytes.NewBuilder(width * height * 4) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    var y u64 = 0
+    while y < height {
+        var x u64 = 0
+        while x < width {
+            const offset = ((y * scale) * sourceWidth + x * scale) * 4
+            frameCopy(&output, source, offset, 4) else error {
+                return .Err(error)
+            }
+            x += 1
+        }
+        y += 1
+    }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn encodeNextDiff(
+    &encoder Encoder,
+    width u64,
+    height u64,
+    $pixels own bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const next = pixels.Copy() else error {
+        discard error
+        discard pixels
+        return .Err(.Storage)
+    }
+    const baseline = replace encoder.previous with .None
+    const changedSize = encoder.width != width || encoder.height != height
+    encoder.width = width
+    encoder.height = height
+    encoder.previous = .Some(next)
+    match baseline {
+        None: encodeFull(encoder.sequence, width, height, pixels)
+        Some(previous): {
+            if changedSize {
+                discard previous
+                return encodeFull(encoder.sequence, width, height, pixels)
+            }
+            encodeDiff(encoder.sequence, width, height, previous, pixels)
+        }
+    }
+}
+
+fn encodeFull(
+    sequence u64,
+    width u64,
+    height u64,
+    pixels bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const image = EncodePNG(width, height, pixels) else error {
+        return .Err(error)
+    }
+    const imageLength = frameLength(image)
+    const opened = bytes.NewBuilder(imageLength + 17) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    frameHeader(&output, 1, width, height, sequence) else error {
+        return .Err(error)
+    }
+    frameU32Write(&output, imageLength) else error { return .Err(error) }
+    output.Write(image) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn encodeDiff(
+    sequence u64,
+    width u64,
+    height u64,
+    previous bytes.Bytes,
+    pixels bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const body = changedTiles(width, height, previous, pixels) else error {
+        return .Err(error)
+    }
+    const diffBody { count value } = body
+    const bodyLength = frameLength(value)
+    const opened = bytes.NewBuilder(bodyLength + 17) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    frameHeader(&output, 2, width, height, sequence) else error {
+        return .Err(error)
+    }
+    frameU32Write(&output, count) else error { return .Err(error) }
+    output.Write(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn frameHeader(
+    &output bytes.Builder,
+    kind u64,
+    width u64,
+    height u64,
+    sequence u64
+) Result<void, Error> {
+    frameWrite(&output, kind) else error { return .Err(error) }
+    frameU32Write(&output, width) else error { return .Err(error) }
+    frameU32Write(&output, height) else error { return .Err(error) }
+    frameU32Write(&output, sequence)
+}
+
+fn frameU16Write(&output bytes.Builder, value u64) Result<void, Error> {
+    if value > 65535 return .Err(.InvalidFrame)
+    frameWrite(&output, value >> 8 & 255) else error { return .Err(error) }
+    frameWrite(&output, value & 255)
+}
+
+fn frameU32Write(&output bytes.Builder, value u64) Result<void, Error> {
+    if value > 4294967295 return .Err(.InvalidFrame)
+    frameWrite(&output, value >> 24 & 255) else error { return .Err(error) }
+    frameWrite(&output, value >> 16 & 255) else error { return .Err(error) }
+    frameWrite(&output, value >> 8 & 255) else error { return .Err(error) }
+    frameWrite(&output, value & 255)
+}
+
+fn frameU32(value bytes.Bytes, offset u64) u64 {
+    frameByte(value, offset) << 24 |
+        frameByte(value, offset + 1) << 16 |
+        frameByte(value, offset + 2) << 8 |
+        frameByte(value, offset + 3)
+}
+
+fn frameCopy(
+    &output bytes.Builder,
+    source bytes.Bytes,
+    start u64,
+    length u64
+) Result<void, Error> {
+    var offset u64 = 0
+    while offset < length {
+        frameWrite(&output, frameByte(source, start + offset)) else error {
+            return .Err(error)
+        }
+        offset += 1
+    }
+    .Ok
+}
+
+fn frameWrite(&output bytes.Builder, value u64) Result<void, Error> {
+    output.WriteByte(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn frameLength(value bytes.Bytes) u64 {
+    const length = value.Len() else {
+        panic("desktop frame bytes are closed")
+    }
+    length
+}
+
+fn frameByte(value bytes.Bytes, offset u64) u64 {
+    const result = value.At(offset) else {
+        panic("desktop frame byte is missing")
+    }
+    result
+}
+
+fn frameMinimum(left u64, right u64) u64 {
+    if left < right return left
+    right
+}

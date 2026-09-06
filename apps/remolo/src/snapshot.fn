@@ -1,0 +1,166 @@
+package remolo.cli
+
+import remolo.desktop
+import remolo.session
+import std.bytes
+import std.format
+import std.fs
+import std.parse
+import std.path
+import std.text
+
+struct snapshotOptions {
+    count u64
+    output String
+    mode desktop.Mode
+}
+
+fn runSnapshot(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("snapshot requires a token"))
+    const options = parseSnapshotOptions(args) else error { return .Err(error) }
+    const snapshotOptions { count output mode } = options
+    fs.CreateDirectory(output) else error {
+        discard error
+        return .Err(failed("could not create the snapshot directory"))
+    }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const opening = spawn desktop.OpenMode(client.Handle(), mode, 10)
+    const opened = $opening.wait() else error {
+        discard error
+        session.CloseClient($client)
+        return .Err(failed("could not open the remote desktop"))
+    }
+    const desktop.RemoteDesktop { Reader Writer Controller Hello } = opened
+    discard Writer
+    discard Hello
+    const captured = spawn captureSnapshots($Reader, count, $output)
+    const result = $captured.wait()
+    const closing = spawn desktop.Close($Controller)
+    discard $closing.wait()
+    session.CloseClient($client)
+    result else error { return .Err(error) }
+    .Ok(0)
+}
+
+task captureSnapshots(
+    $reader own desktop.Reader,
+    count u64,
+    $output String
+) Result<void, failure> {
+    var source = reader
+    var captured u64 = 0
+    while captured < count {
+        const reading = spawn desktop.Read($source)
+        const outcome = $reading.wait()
+        const desktop.ReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error {
+            discard error
+            discard source
+            return .Err(failed("desktop stream ended before all snapshots arrived"))
+        }
+        const frame = match event {
+            Exit: {
+                discard source
+                return .Err(failed("desktop stream ended before all snapshots arrived"))
+            }
+            Frame(value): value
+        }
+        const desktop.EncodedFrame { Sequence Width Height Image } = frame
+        discard Sequence
+        const fileName = "frame-" + snapshotIndex(captured) + ".png"
+        const destination = path.Join(output, fileName)
+        const displayedDestination = text.Copy(destination)
+        const writing = spawn writeSnapshot($destination, $Image)
+        const writeResult = $writing.wait()
+        writeResult else error {
+            discard source
+            return .Err(error)
+        }
+        captured += 1
+        writeStdoutText(
+            "remolo: frame " + format.U64(captured) + "/" + format.U64(count) +
+            " (" + format.U64(Width) + "x" + format.U64(Height) + ") saved to " +
+            displayedDestination + "\n"
+        ) else error {
+            discard source
+            return .Err(error)
+        }
+    }
+    discard source
+    writeStdoutText(
+        "remolo: captured " + format.U64(captured) + " frame(s) in " + output + "/\n"
+    ) else error { return .Err(error) }
+    .Ok
+}
+
+task writeSnapshot(
+    $destination String,
+    $image own bytes.Bytes
+) Result<void, failure> {
+    const opening = spawn fs.OpenFile($destination, .Truncate)
+    const openResult = $opening.wait()
+    const file = openResult else error {
+        discard error
+        discard image
+        return .Err(failed("could not create a snapshot file"))
+    }
+    const writing = spawn fs.WriteFileChunk($file, $image)
+    const writeResult = $writing.wait()
+    const fs.FileOutcome { File Value } = writeResult
+    Value else error {
+        discard error
+        discard File
+        return .Err(failed("could not write a snapshot file"))
+    }
+    var active = File
+    const closed = active.Close() else error {
+        discard error
+        discard active
+        return .Err(failed("could not close a snapshot file"))
+    }
+    discard closed
+    discard active
+    .Ok
+}
+
+fn parseSnapshotOptions(args [String]) Result<own snapshotOptions, failure> {
+    var options = own snapshotOptions {
+        count = 1
+        output = "remolo-frames"
+        mode = .Screenshot
+    }
+    var index usize = 2
+    while index < len(args) {
+        const name = argument(args, index)
+        if name == "--diff" {
+            options.mode = .Diff
+            index += 1
+            continue
+        }
+        if name != "--num" && name != "-n" && name != "--out" && name != "-o" {
+            return .Err(invalid("unknown snapshot option: " + name))
+        }
+        const value = optionValue(args, index, name) else error {
+            return .Err(error)
+        }
+        if name == "--num" || name == "-n" {
+            const count = parse.U64(value) else error {
+                discard error
+                return .Err(invalid("--num requires an unsigned integer"))
+            }
+            if count == 0 return .Err(invalid("--num must be positive"))
+            options.count = count
+        } else {
+            options.output = value
+        }
+        index += 2
+    }
+    .Ok(options)
+}
+
+fn snapshotIndex(value u64) String {
+    if value < 10 return "00" + format.U64(value)
+    if value < 100 return "0" + format.U64(value)
+    format.U64(value)
+}

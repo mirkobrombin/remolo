@@ -1,0 +1,146 @@
+package remolo.cli
+
+import remolo.protocol
+import remolo.session
+import remolo.token
+import std.format
+import std.platform
+import std.system
+import std.text
+import std.time
+
+fn hostCapabilities() protocol.Capabilities {
+    const info = system.Snapshot() else error {
+        discard error
+        return fallbackHostCapabilities()
+    }
+    const system.Info { Hostname Architecture LogicalCPUs } = info
+    discard LogicalCPUs
+    protocol.Capabilities {
+        OS = platform.Name(platform.Current())
+        Arch = Architecture
+        PTY = true
+        Desktop = true
+        Exec = true
+        File = true
+        Hostname = Hostname
+        Version = "1.0.0"
+    }
+}
+
+fn fallbackHostCapabilities() protocol.Capabilities {
+    protocol.Capabilities {
+        OS = platform.Name(platform.Current())
+        Arch = "unknown"
+        PTY = true
+        Desktop = true
+        Exec = true
+        File = true
+        Hostname = ""
+        Version = "1.0.0"
+    }
+}
+
+fn runHost(args [String]) Result<i32, failure> {
+    const options = parseHostOptions(args) else error {
+        return .Err(error)
+    }
+    const hostOptions {
+        bindAddress
+        advertiseAddress
+        port as requestedPort
+        ttl
+        identityPath
+        fileRoot
+        rendezvous
+        includeLoopback
+        mdns
+        stun
+        relay
+        capabilities
+        commands
+        readOnly
+        once
+        approve
+    } = options
+    const now = time.Now().Unix()
+    if ttl > 18446744073709551615 - now {
+        return .Err(invalid("--ttl exceeds the timestamp range"))
+    }
+    const displayedAddress = if text.IsEmpty(advertiseAddress) {
+        "local interfaces"
+    } else {
+        text.Copy(advertiseAddress)
+    }
+    const listening = spawn session.Listen($session.HostOptions {
+        BindAddress = bindAddress
+        AdvertiseAddress = advertiseAddress
+        Port = requestedPort
+        IdentityPath = identityPath
+        Capabilities = hostCapabilities()
+        Expiry = now + ttl
+        Rendezvous = rendezvous
+        IncludeLoopback = includeLoopback
+        MDNS = mdns
+        STUN = stun
+        Relay = relay
+    })
+    const opened = $listening.wait()
+    const active = opened else error {
+        discard error
+        return .Err(failed("could not start the host"))
+    }
+    const session.ListeningHost { Host Token } = active
+    var host = Host
+    const Relay = host.TakeRelay()
+    const policy = session.NewPolicy(
+        capabilities,
+        commands,
+        !readOnly,
+        approve
+    )
+    const relayServing Option<Task<Result<void, session.Error>>> = match Relay {
+        None: .None
+        Some(relayHost): .Some(spawn session.ServeRelayHostWithPolicy(
+                $relayHost,
+                $text.Copy(fileRoot),
+                session.NewPolicy(
+                    policy.AllowedKinds,
+                    policy.AllowedCommands,
+                    policy.AllowWrite,
+                    policy.Approve
+                )
+            ))
+    }
+    const port = host.Port()
+    const encoded = token.Encode($Token) else error {
+        discard error
+        discard host
+        discard relayServing
+        return .Err(failed("could not encode the session token"))
+    }
+    writeStdoutText(
+        "remolo host active, listening on TCP port " +
+        format.U64(port) + "\n\nSession token:\n   " + encoded +
+        "\n\nAdvertised endpoint: " +
+        displayedAddress + " on port " + format.U64(port) +
+        "\nAuthorized use only.\nWaiting for connections...\n"
+    ) else error {
+        discard host
+        discard relayServing
+        return .Err(error)
+    }
+    const serving = spawn session.ServeHostWithPolicy(
+        $host,
+        $fileRoot,
+        $policy,
+        once
+    )
+    const result = $serving.wait()
+    discard relayServing
+    result else error {
+        discard error
+        return .Err(failed("host stopped after a session error"))
+    }
+    .Ok(0)
+}

@@ -1,0 +1,463 @@
+package remolo.tunnel
+
+import remolo.mux
+import std.bytes
+import std.format
+import std.net
+import std.text
+
+struct socksSession {
+    reader own net.TcpReader
+    writer own net.TcpWriter
+    target String
+}
+
+struct byteRead {
+    reader own net.TcpReader
+    value own bytes.Bytes
+}
+
+struct addressRead {
+    reader own net.TcpReader
+    host String
+}
+
+task serveSocksConnection(
+    $connection own net.TcpConnection,
+    $handle mux.Handle
+) void {
+    const split = connection.SplitControlled() else error {
+        discard error
+        discard handle
+        return
+    }
+    const net.ControlledStream { Reader Writer Controller } = split
+    const handshaking = spawn socksHandshake($Reader, $Writer)
+    const handshake = $handshaking.wait()
+    const established = handshake else error {
+        discard error
+        discard handle
+        discard Controller
+        return
+    }
+    const socksSession { reader writer target } = established
+    const opening = spawn openForward($handle, $target)
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        discard reader
+        discard Controller
+        const failing = spawn writeSocksReply($writer, 1)
+        const failed = $failing.wait()
+        discard failed
+        return
+    }
+    const replying = spawn writeSocksReply($writer, 0)
+    const reply = $replying.wait()
+    const ready = reply else error {
+        discard error
+        discard reader
+        discard stream
+        discard Controller
+        return
+    }
+    const control = stream.Control()
+    const mux.Stream {
+        ID
+        Reader as muxReader
+        Writer as muxWriter
+    } = stream
+    discard ID
+    const splicing = spawn spliceHalves(
+        $reader,
+        $ready,
+        $muxReader,
+        $muxWriter,
+        $Controller,
+        $control
+    )
+    const result = $splicing.wait()
+    discard result
+}
+
+task socksHandshake(
+    $reader own net.TcpReader,
+    $writer own net.TcpWriter
+) Result<socksSession, Error> {
+    const readingHeader = spawn readBytes($reader, 2)
+    const headerResult = $readingHeader.wait()
+    const headerRead = headerResult else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    const byteRead { reader as afterHeader value as header } = headerRead
+    if byteAt(header, 0) != 5 {
+        discard afterHeader
+        discard writer
+        return .Err(.UnsupportedAuthentication)
+    }
+    const methodCount = byteAt(header, 1)
+    const readingMethods = spawn readBytes($afterHeader, methodCount)
+    const methodsResult = $readingMethods.wait()
+    const methodsRead = methodsResult else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    const byteRead {
+        reader as afterMethods
+        value as offeredMethods
+    } = methodsRead
+    if !hasByte(offeredMethods, 0) {
+        discard afterMethods
+        const rejecting = spawn writeMethodReply($writer, 255)
+        const rejected = $rejecting.wait()
+        discard rejected
+        return .Err(.UnsupportedAuthentication)
+    }
+    const accepting = spawn writeMethodReply($writer, 0)
+    const methodReply = $accepting.wait()
+    const afterMethodReply = methodReply else error {
+        discard error
+        discard afterMethods
+        return .Err(.Stream)
+    }
+    const readingRequest = spawn readBytes($afterMethods, 4)
+    const requestResult = $readingRequest.wait()
+    const requestRead = requestResult else error {
+        discard error
+        discard afterMethodReply
+        return .Err(.Stream)
+    }
+    const byteRead { reader as afterRequest value as request } = requestRead
+    if byteAt(request, 0) != 5 || byteAt(request, 2) != 0 {
+        discard afterRequest
+        discard afterMethodReply
+        return .Err(.UnsupportedCommand)
+    }
+    if byteAt(request, 1) != 1 {
+        discard afterRequest
+        const rejecting = spawn writeSocksReply($afterMethodReply, 7)
+        const rejected = $rejecting.wait()
+        discard rejected
+        return .Err(.UnsupportedCommand)
+    }
+    const readingAddress = spawn readSocksAddress(
+        $afterRequest,
+        byteAt(request, 3)
+    )
+    const addressResult = $readingAddress.wait()
+    const address = addressResult else error {
+        discard error
+        const rejecting = spawn writeSocksReply($afterMethodReply, 8)
+        const rejected = $rejecting.wait()
+        discard rejected
+        return .Err(.UnsupportedAddress)
+    }
+    const addressRead { reader as afterAddress host } = address
+    const readingPort = spawn readBytes($afterAddress, 2)
+    const portResult = $readingPort.wait()
+    const portRead = portResult else error {
+        discard error
+        discard host
+        discard afterMethodReply
+        return .Err(.Stream)
+    }
+    const byteRead { reader as finalReader value as portBytes } = portRead
+    const portValue = (byteAt(portBytes, 0) << 8) | byteAt(portBytes, 1)
+    if portValue == 0 {
+        discard finalReader
+        discard host
+        const rejecting = spawn writeSocksReply($afterMethodReply, 8)
+        const rejected = $rejecting.wait()
+        discard rejected
+        return .Err(.InvalidAddress)
+    }
+    const port = u16.From(portValue) else error {
+        discard error
+        discard finalReader
+        discard host
+        discard afterMethodReply
+        return .Err(.InvalidAddress)
+    }
+    const endpointText = endpointAddress(host, port)
+    const endpoint = net.ParseEndpoint(endpointText) else error {
+        discard error
+        discard finalReader
+        discard afterMethodReply
+        return .Err(.InvalidAddress)
+    }
+    .Ok(socksSession {
+        reader = finalReader
+        writer = afterMethodReply
+        target = endpoint.Address()
+    })
+}
+
+task readSocksAddress(
+    $reader own net.TcpReader,
+    kind u64
+) Result<addressRead, Error> {
+    if kind == 1 {
+        const pending = spawn readIPv4($reader)
+        const result = $pending.wait()
+        return result
+    }
+    if kind == 4 {
+        const pending = spawn readIPv6($reader)
+        const result = $pending.wait()
+        return result
+    }
+    if kind != 3 {
+        discard reader
+        return .Err(.UnsupportedAddress)
+    }
+    const readingLength = spawn readBytes($reader, 1)
+    const lengthResult = $readingLength.wait()
+    const lengthRead = lengthResult else error {
+        discard error
+        return .Err(.Stream)
+    }
+    const byteRead { reader as afterLength value as encodedLength } =
+        lengthRead
+    const length = byteAt(encodedLength, 0)
+    if length == 0 {
+        discard afterLength
+        return .Err(.UnsupportedAddress)
+    }
+    const readingName = spawn readBytes($afterLength, length)
+    const nameResult = $readingName.wait()
+    const nameRead = nameResult else error {
+        discard error
+        return .Err(.Stream)
+    }
+    const byteRead { reader as finalReader value as encodedName } = nameRead
+    if hasByte(encodedName, 0) {
+        discard finalReader
+        return .Err(.UnsupportedAddress)
+    }
+    const host = encodedName.Text() else error {
+        discard error
+        discard finalReader
+        return .Err(.UnsupportedAddress)
+    }
+    if text.IsEmpty(host) || text.Contains(host, ":") ||
+        text.Contains(host, "[") || text.Contains(host, "]") {
+        discard finalReader
+        discard host
+        return .Err(.UnsupportedAddress)
+    }
+    .Ok(addressRead { reader = finalReader host = host })
+}
+
+task readIPv4($reader own net.TcpReader) Result<addressRead, Error> {
+    const pending = spawn readBytes($reader, 4)
+    const result = $pending.wait()
+    const read = result else error {
+        discard error
+        return .Err(.Stream)
+    }
+    const byteRead { reader as restored value } = read
+    const host = format.U64(byteAt(value, 0)) + "." +
+        format.U64(byteAt(value, 1)) + "." +
+        format.U64(byteAt(value, 2)) + "." +
+        format.U64(byteAt(value, 3))
+    .Ok(addressRead { reader = restored host = host })
+}
+
+task readIPv6($reader own net.TcpReader) Result<addressRead, Error> {
+    const pending = spawn readBytes($reader, 16)
+    const result = $pending.wait()
+    const read = result else error {
+        discard error
+        return .Err(.Stream)
+    }
+    const byteRead { reader as restored value } = read
+    var builder = text.NewBuilder()
+    var offset u64 = 0
+    while offset < 16 {
+        if offset > 0 { writeText(&builder, ":") }
+        const group = (byteAt(value, offset) << 8) |
+            byteAt(value, offset + 1)
+        writeHexGroup(&builder, group)
+        offset += 2
+    }
+    const host = builder.Finish() else error {
+        discard error
+        discard restored
+        return .Err(.UnsupportedAddress)
+    }
+    .Ok(addressRead { reader = restored host = host })
+}
+
+task readBytes(
+    $reader own net.TcpReader,
+    length u64
+) Result<byteRead, Error> {
+    const pending = spawn net.ReadExactBytes($reader, length)
+    const outcome = $pending.wait()
+    const net.ReadBytesOutcome { Reader Value } = outcome
+    match Value {
+        Ok(value): .Ok(byteRead { reader = Reader value = value })
+        Err(error): {
+            discard error
+            discard Reader
+            .Err(.Stream)
+        }
+    }
+}
+
+task writeMethodReply(
+    $writer own net.TcpWriter,
+    method u64
+) Result<own net.TcpWriter, Error> {
+    const opened = bytes.NewBuilder(2) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    var reply = opened
+    reply.WriteByte(5) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    reply.WriteByte(method) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    const value = reply.Finish() else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    const writing = spawn writeBytes($writer, $value)
+    const result = $writing.wait()
+    result
+}
+
+task writeSocksReply(
+    $writer own net.TcpWriter,
+    status u64
+) Result<own net.TcpWriter, Error> {
+    const opened = bytes.NewBuilder(10) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    var reply = opened
+    reply.WriteByte(5) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    reply.WriteByte(status) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    reply.WriteByte(0) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    reply.WriteByte(1) else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    var index u64 = 4
+    while index < 10 {
+        reply.WriteByte(0) else error {
+            discard error
+            discard writer
+            return .Err(.Stream)
+        }
+        index += 1
+    }
+    const value = reply.Finish() else error {
+        discard error
+        discard writer
+        return .Err(.Stream)
+    }
+    const writing = spawn writeBytes($writer, $value)
+    const result = $writing.wait()
+    result
+}
+
+task writeBytes(
+    $writer own net.TcpWriter,
+    $value own bytes.Bytes
+) Result<own net.TcpWriter, Error> {
+    const pending = spawn net.WriteAllBytes($writer, $value)
+    const outcome = $pending.wait()
+    const net.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Ok(Writer)
+        Err(error): {
+            discard error
+            discard Writer
+            .Err(.Stream)
+        }
+    }
+}
+
+fn endpointAddress(host String, port u16) String {
+    if text.Contains(host, ":") {
+        return "[" + host + "]:" + format.U16(port)
+    }
+    host + ":" + format.U16(port)
+}
+
+fn hasByte(value bytes.Bytes, expected u64) bool {
+    const length = value.Len() else error {
+        discard error
+        return false
+    }
+    var offset u64 = 0
+    while offset < length {
+        if byteAt(value, offset) == expected return true
+        offset += 1
+    }
+    false
+}
+
+fn byteAt(value bytes.Bytes, offset u64) u64 {
+    const result = value.At(offset) else error {
+        discard error
+        panic("SOCKS byte boundary invariant failed")
+    }
+    result
+}
+
+fn writeHexGroup(&builder text.Builder, value u64) void {
+    if value >= 4096 { writeHexDigit(&builder, (value >> 12) & 15) }
+    if value >= 256 { writeHexDigit(&builder, (value >> 8) & 15) }
+    if value >= 16 { writeHexDigit(&builder, (value >> 4) & 15) }
+    writeHexDigit(&builder, value & 15)
+}
+
+fn writeHexDigit(&builder text.Builder, value u64) void {
+    const decimalBase u64 = 48
+    const letterBase u64 = 87
+    const codePoint = if value < 10 {
+        decimalBase + value
+    } else {
+        letterBase + value
+    }
+    const written = builder.WriteCodePoint(codePoint) else error {
+        discard error
+        panic("SOCKS hexadecimal formatting invariant failed")
+    }
+    discard written
+}
+
+fn writeText(&builder text.Builder, value String) void {
+    const written = builder.Write(value) else error {
+        discard error
+        panic("SOCKS text formatting invariant failed")
+    }
+    discard written
+}

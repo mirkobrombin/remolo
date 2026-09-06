@@ -1,0 +1,86 @@
+package remolo.rpc
+
+import remolo.mux
+import std.bytes
+import std.collections
+import std.json
+
+enum Error {
+    Storage
+    Protocol
+    Transport
+    Remote(message String)
+    InvalidRequest
+    File
+    Execution
+    System
+    Authentication
+    NotFound
+    AlreadyExists
+    Permission
+    NotEmpty
+    NotDirectory
+    IsDirectory
+}
+
+struct SysInfo {
+    OS String
+    Arch String
+    Hostname String
+    NumCPU u64
+    Uptime u64
+}
+
+struct DirEntry {
+    Name String
+    Size u64
+    IsDir bool
+    Mode String
+}
+
+struct StatResult {
+    Name String
+    Size u64
+    IsDir bool
+    Mode String
+    ModTime u64
+}
+
+struct ExecResult {
+    Stdout String
+    Stderr String
+    Code i32
+}
+
+struct ReadResult {
+    Data own bytes.Bytes
+    EOF bool
+}
+
+struct Client {
+    reader own mux.Reader
+    writer own mux.Writer
+    nextID u64
+}
+
+struct CallOutcome {
+    Client own Client
+    Value Result<json.Value, Error>
+}
+
+struct request {
+    id u64
+    method String
+    params Option<json.Value>
+}
+
+struct response {
+    id u64
+    result Option<json.Value>
+    error String
+}
+
+struct entryResult {
+    values own collections.List<DirEntry>
+    found bool
+}

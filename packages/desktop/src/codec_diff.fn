@@ -1,0 +1,152 @@
+package remolo.desktop
+
+import remolo.protocol
+import std.bytes
+
+fn changedTiles(
+    width u64,
+    height u64,
+    previous bytes.Bytes,
+    pixels bytes.Bytes
+) Result<diffBody, Error> {
+    const capacity = protocol.MaxFramePayload() - 17
+    const opened = bytes.NewBuilder(capacity) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var body = opened
+    var count u64 = 0
+    var y u64 = 0
+    while y < height {
+        const tileHeight = frameMinimum(64, height - y)
+        const changed = encodeChangedRow(
+            &body,
+            width,
+            y,
+            tileHeight,
+            previous,
+            pixels
+        ) else error {
+            return .Err(error)
+        }
+        count += changed
+        y += 64
+    }
+    const result = body.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(diffBody { count = count value = result })
+}
+
+fn encodeChangedRow(
+    &output bytes.Builder,
+    width u64,
+    y u64,
+    tileHeight u64,
+    previous bytes.Bytes,
+    pixels bytes.Bytes
+) Result<u64, Error> {
+    var count u64 = 0
+    var x u64 = 0
+    while x < width {
+        const tileWidth = frameMinimum(64, width - x)
+        if !sameTile(width, x, y, tileWidth, tileHeight, previous, pixels) {
+            encodeTile(
+                &output,
+                width,
+                x,
+                y,
+                tileWidth,
+                tileHeight,
+                pixels
+            ) else error {
+                return .Err(error)
+            }
+            count += 1
+        }
+        x += 64
+    }
+    .Ok(count)
+}
+
+fn encodeTile(
+    &output bytes.Builder,
+    sourceWidth u64,
+    x u64,
+    y u64,
+    width u64,
+    height u64,
+    pixels bytes.Bytes
+) Result<void, Error> {
+    const tile = copyTile(sourceWidth, x, y, width, height, pixels) else error {
+        return .Err(error)
+    }
+    const image = EncodePNG(width, height, tile) else error {
+        return .Err(error)
+    }
+    frameU16Write(&output, x) else error { return .Err(error) }
+    frameU16Write(&output, y) else error { return .Err(error) }
+    frameU16Write(&output, width) else error { return .Err(error) }
+    frameU16Write(&output, height) else error { return .Err(error) }
+    frameU32Write(&output, frameLength(image)) else error {
+        return .Err(error)
+    }
+    output.Write(image) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn copyTile(
+    sourceWidth u64,
+    x u64,
+    y u64,
+    width u64,
+    height u64,
+    pixels bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const opened = bytes.NewBuilder(width * height * 4) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    var row u64 = 0
+    while row < height {
+        const offset = ((y + row) * sourceWidth + x) * 4
+        frameCopy(&output, pixels, offset, width * 4) else error {
+            return .Err(error)
+        }
+        row += 1
+    }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn sameTile(
+    sourceWidth u64,
+    x u64,
+    y u64,
+    width u64,
+    height u64,
+    previous bytes.Bytes,
+    pixels bytes.Bytes
+) bool {
+    var row u64 = 0
+    while row < height {
+        var column u64 = 0
+        while column < width * 4 {
+            const offset = ((y + row) * sourceWidth + x) * 4 + column
+            if frameByte(previous, offset) != frameByte(pixels, offset) {
+                return false
+            }
+            column += 1
+        }
+        row += 1
+    }
+    true
+}

@@ -1,0 +1,299 @@
+package remolo.cli
+
+import foundation.worker
+import remolo.session
+import remolo.tunnel
+import std.format
+import std.net
+import std.text
+
+struct forwardOptions {
+    local String
+    socks String
+}
+
+struct localSpec {
+    address String
+    port u64
+    target String
+}
+
+enum forwardReport {
+    Succeeded
+    Failed
+}
+
+fn runForward(args [String]) Result<i32, failure> {
+    const options = parseForwardOptions(args) else error { return .Err(error) }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const handle = client.Handle()
+    const Channel { sender receiver } = channel<forwardReport>(2)
+    const forwards = worker.NewSupervisor()
+    var running u64 = 0
+    if !text.IsEmpty(options.local) {
+        const spec = parseLocalSpec(options.local) else error {
+            discard handle
+            discard sender
+            discard receiver
+            session.CloseClient($client)
+            return .Err(error)
+        }
+        const localSpec { address port target } = spec
+        const displayedAddress = text.Copy(address)
+        const displayedTarget = text.Copy(target)
+        const forward = tunnel.ListenLocal(
+            $handle.Clone(),
+            $address,
+            port,
+            $target
+        ) else error {
+            discard error
+            discard handle
+            discard sender
+            discard receiver
+            session.CloseClient($client)
+            return .Err(failed("could not start local forwarding"))
+        }
+        writeStdoutText(
+            "remolo: -L " + displayedAddress + ":" + format.U64(forward.Port()) +
+            " -> " + displayedTarget + "\n"
+        ) else error {
+            discard forward
+            discard handle
+            discard sender
+            discard receiver
+            session.CloseClient($client)
+            return .Err(error)
+        }
+        forwards.Start(spawn reportLocalForward($forward, sender.clone()))
+        running += 1
+    }
+    if !text.IsEmpty(options.socks) {
+        const endpoint = socksEndpoint(options.socks) else error {
+            discard handle
+            discard sender
+            discard receiver
+            session.CloseClient($client)
+            return .Err(error)
+        }
+        const net.Endpoint { Host Port } = endpoint
+        const displayedHost = text.Copy(Host)
+        const forward = tunnel.ListenSocks(
+            $handle.Clone(),
+            $Host,
+            u64.From(Port)
+        ) else error {
+            discard error
+            discard handle
+            discard sender
+            discard receiver
+            session.CloseClient($client)
+            return .Err(failed("could not start SOCKS forwarding"))
+        }
+        writeStdoutText(
+            "remolo: -D SOCKS5 on " + displayedHost + ":" +
+            format.U64(forward.Port()) + "\n"
+        ) else error {
+            discard forward
+            discard handle
+            discard sender
+            discard receiver
+            session.CloseClient($client)
+            return .Err(error)
+        }
+        forwards.Start(spawn reportSocksForward($forward, sender.clone()))
+        running += 1
+    }
+    discard handle
+    discard sender
+    if running == 0 {
+        discard receiver
+        session.CloseClient($client)
+        return .Err(invalid("forward requires -L or -D"))
+    }
+    const awaiting = spawn awaitForward($receiver, $client)
+    const result = $awaiting.wait()
+    const stopping = forwards.CancelTask()
+    discard $stopping.wait()
+    result
+}
+
+task awaitForward(
+    $receiver Receiver<forwardReport>,
+    $client own session.Client
+) Result<i32, failure> {
+    var inbox = receiver
+    select {
+        const report = inbox.receive(): {
+            discard inbox
+            session.CloseClient($client)
+            match report {
+                Succeeded: { return .Ok(0) }
+                Failed: { return .Err(failed("forwarding failed")) }
+            }
+        }
+        else error: {
+            discard error
+            discard inbox
+            session.CloseClient($client)
+            return .Err(failed("forwarding stopped"))
+        }
+    }
+}
+
+fn parseForwardOptions(args [String]) Result<forwardOptions, failure> {
+    if len(args) < 2 return .Err(invalid("forward requires a token"))
+    var options = forwardOptions { local = "" socks = "" }
+    var index usize = 2
+    while index < len(args) {
+        const name = argument(args, index)
+        if name != "-L" && name != "--local" && name != "-D" && name != "--socks" {
+            return .Err(invalid("unknown forward option: " + name))
+        }
+        const value = optionValue(args, index, name) else error {
+            return .Err(error)
+        }
+        if name == "-L" || name == "--local" {
+            if !text.IsEmpty(options.local) return .Err(invalid("-L may be specified once"))
+            options.local = value
+        } else {
+            if !text.IsEmpty(options.socks) return .Err(invalid("-D may be specified once"))
+            options.socks = value
+        }
+        index += 2
+    }
+    .Ok(options)
+}
+
+fn parseLocalSpec(value String) Result<localSpec, failure> {
+    const first = text.Find(value, ":")
+    const firstOffset = match first {
+        Some(found): found
+        None: { return .Err(invalid("-L requires [BIND:]PORT:HOST:PORT")) }
+    }
+    const tail = sliceText(value, firstOffset + 1, text.ByteLen(value)) else error {
+        return .Err(error)
+    }
+    const second = text.Find(tail, ":")
+    const secondOffset = match second {
+        Some(found): firstOffset + found + 1
+        None: { return .Err(invalid("-L requires [BIND:]PORT:HOST:PORT")) }
+    }
+    const afterSecond = sliceText(value, secondOffset + 1, text.ByteLen(value)) else error {
+        return .Err(error)
+    }
+    const third = text.Find(afterSecond, ":")
+    match third {
+        None: localSpecFromThree(value, firstOffset, secondOffset)
+        Some(found): localSpecFromFour(value, firstOffset, secondOffset, secondOffset + found + 1)
+    }
+}
+
+fn localSpecFromThree(
+    value String,
+    first u64,
+    second u64
+) Result<localSpec, failure> {
+    const portText = sliceText(value, 0, first) else error { return .Err(error) }
+    const target = sliceText(value, first + 1, text.ByteLen(value)) else error {
+        return .Err(error)
+    }
+    const port = parsePort(portText, "-L") else error { return .Err(error) }
+    const endpoint = net.ParseEndpoint(target) else error {
+        discard error
+        return .Err(invalid("-L target requires host:port"))
+    }
+    discard endpoint
+    discard second
+    .Ok(localSpec { address = "127.0.0.1" port = port target = target })
+}
+
+fn localSpecFromFour(
+    value String,
+    first u64,
+    second u64,
+    third u64
+) Result<localSpec, failure> {
+    const address = sliceText(value, 0, first) else error { return .Err(error) }
+    const portText = sliceText(value, first + 1, second) else error {
+        return .Err(error)
+    }
+    const target = sliceText(value, second + 1, text.ByteLen(value)) else error {
+        return .Err(error)
+    }
+    const port = parsePort(portText, "-L") else error { return .Err(error) }
+    const endpoint = net.ParseEndpoint(target) else error {
+        discard error
+        return .Err(invalid("-L target requires host:port"))
+    }
+    discard endpoint
+    discard third
+    .Ok(localSpec { address = address port = port target = target })
+}
+
+fn socksEndpoint(value String) Result<net.Endpoint, failure> {
+    const selected = if text.Contains(value, ":") {
+        text.Copy(value)
+    } else {
+        "127.0.0.1:" + value
+    }
+    const endpoint = net.ParseEndpoint(selected) else error {
+        discard error
+        return .Err(invalid("-D requires [BIND:]PORT"))
+    }
+    .Ok(endpoint)
+}
+
+fn parsePort(value String, option String) Result<u64, failure> {
+    const endpoint = net.ParseEndpoint("127.0.0.1:" + value) else error {
+        discard error
+        return .Err(invalid(option + " requires a valid port"))
+    }
+    .Ok(u64.From(endpoint.Port))
+}
+
+fn sliceText(value String, start u64, end u64) Result<String, failure> {
+    const selected = text.Slice(value, start, end) else error {
+        discard error
+        return .Err(invalid("invalid forward address"))
+    }
+    .Ok(selected)
+}
+
+task reportLocalForward(
+    $forward own tunnel.LocalForward,
+    $results Sender<forwardReport>
+) void {
+    const serving = spawn tunnel.ServeLocal($forward)
+    const result = $serving.wait()
+    const report forwardReport = match result {
+        Ok: .Succeeded
+        Err(error): {
+            discard error
+            .Failed
+        }
+    }
+    select {
+        results.send(report): {}
+        else error: { discard error }
+    }
+}
+
+task reportSocksForward(
+    $forward own tunnel.SocksForward,
+    $results Sender<forwardReport>
+) void {
+    const serving = spawn tunnel.ServeSocks($forward)
+    const result = $serving.wait()
+    const report forwardReport = match result {
+        Ok: .Succeeded
+        Err(error): {
+            discard error
+            .Failed
+        }
+    }
+    select {
+        results.send(report): {}
+        else error: { discard error }
+    }
+}

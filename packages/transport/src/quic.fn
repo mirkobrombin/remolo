@@ -1,0 +1,100 @@
+package remolo.transport
+
+import foundation.auth
+import foundation.tls
+import std.bytes
+import std.concurrent
+
+struct QUICListener {
+    inner own tls.OpenSSLQUICListener
+
+    fn Port(self) u64 {
+        self.inner.Port
+    }
+
+    fn Control(self) Result<own QUICListenerController, Error> {
+        const controller = self.inner.Control() else error {
+            return .Err(secureError(error))
+        }
+        .Ok(own QUICListenerController { inner = controller })
+    }
+
+    fn Close(&self) bool {
+        self.inner.Close()
+    }
+}
+
+@concurrent.Transferable()
+struct QUICListenerController {
+    inner own tls.OpenSSLQUICListenerController
+
+    fn Clone(self) own QUICListenerController {
+        own QUICListenerController { inner = self.inner.Clone() }
+    }
+
+    fn Close(&self) bool {
+        self.inner.Close()
+    }
+}
+
+struct QUICAcceptOutcome {
+    Listener own QUICListener
+    Value Result<own tls.OpenSSLQUICConnection, Error>
+}
+
+fn ListenQUIC(
+    $address String,
+    port u64,
+    privateKeyPEM bytes.Bytes
+) Result<own QUICListener, Error> {
+    const certificate = auth.OpenSSLEd25519Certificate(privateKeyPEM) else error {
+        discard error
+        return .Err(.InvalidFrame)
+    }
+    const listener = tls.OpenSSLQUICListen(
+        $address,
+        port,
+        certificate,
+        privateKeyPEM,
+        $"remolo/1"
+    ) else error {
+        return .Err(secureError(error))
+    }
+    .Ok(own QUICListener { inner = listener })
+}
+
+task DialQUIC(
+    $host String,
+    port u64,
+    $hostRawPublicKey own bytes.Bytes
+) Result<own tls.OpenSSLQUICConnection, Error> {
+    const pending = spawn tls.OpenSSLQUICDialPinned(
+        $host,
+        port,
+        $hostRawPublicKey,
+        $"remolo/1"
+    )
+    const connected = $pending.wait()
+    match connected {
+        Ok(connection): .Ok(connection)
+        Err(error): .Err(secureError(error))
+    }
+}
+
+task AcceptQUIC($listener own QUICListener) QUICAcceptOutcome {
+    const QUICListener { inner } = listener
+    const pending = spawn tls.OpenSSLQUICAccept($inner)
+    const accepted = $pending.wait()
+    const tls.OpenSSLQUICAcceptOutcome { Listener Value } = accepted
+    const restored = own QUICListener { inner = Listener }
+    match Value {
+        Ok(connection): QUICAcceptOutcome {
+            Listener = restored
+            Value = .Ok(connection)
+        }
+        Err(error): QUICAcceptOutcome {
+            Listener = restored
+            Value = .Err(secureError(error))
+        }
+    }
+}

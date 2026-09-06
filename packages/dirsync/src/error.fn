@@ -1,0 +1,13 @@
+package remolo.dirsync
+
+enum Error {
+    Filesystem
+    Encoding
+    InvalidManifest
+    InvalidSignature
+    InvalidDelta
+    TooLarge
+    Protocol
+    ReadOnly
+    Remote
+}

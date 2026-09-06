@@ -10,7 +10,7 @@
 
 On the machine you want to reach:
 
-```
+```console
 $ remolo host
 remolo host active, listening on UDP port 49213
 
@@ -22,92 +22,49 @@ Share this token. It expires in 24h0m0s. (use --ttl to change)
 
 On yours:
 
-```
+```console
 $ remolo connect REMOLO1-MR0G20-...-KC
-remolo: resolving host... [direct 10.0.0.42:49213 ✓ RTT 0.4ms] connected via direct 10.0.0.42:49213
+remolo: resolving host... [direct 10.0.0.42:49213, RTT 0.4ms] connected
 host:~$ _
 ```
 
-That is the whole setup. No account, no VPN, no port forwarding, no config file,
-no IP to look up, nothing to install on a server.
+That is the whole setup. No account, VPN, port forwarding, configuration file, public IP, or
+server installation is required.
 
-## Install
+## Commands
 
-```
-curl -fsSL https://raw.githubusercontent.com/mirkobrombin/remolo/master/install.sh | sh
-```
+- `remolo connect <token>` opens an interactive shell. `--resume` survives network changes.
+- `remolo exec <token> -- <cmd>` runs one command with its real exit code and stderr.
+- `remolo put` and `remolo get` transfer files with resume and checksum verification.
+- `remolo sync <token> <local> <remote>` transfers only changed file blocks.
+- `remolo mount <token> <dir>` mounts the remote filesystem locally.
+- `remolo forward <token> -L 8080:localhost:80` forwards TCP. `-D` opens a SOCKS5 proxy.
+- `remolo desktop <token>` opens the remote screen, mouse, and keyboard in a browser.
+- `remolo webterm <token>` opens a terminal in a browser.
 
-Linux and macOS, amd64 and arm64. On Linux this also installs a `systemd --user`
-service so the machine stays reachable after a reboot; set `REMOLO_NO_SERVICE=1`
-if you just want the binary. On Windows, grab the `.exe` from
-[releases](https://github.com/mirkobrombin/remolo/releases). Or
-`go install github.com/mirkobrombin/remolo/cmd/remolo@latest`.
+Concurrent commands reuse the existing encrypted connection. Enrollment replaces copied tokens
+with a persistent client key and a local alias. Groups run one command across several enrolled
+hosts.
 
-There is no server component. Both sides are the same binary.
+## Connection paths
 
-## The same token does more than a shell
+Remolo races every address carried by the token and keeps the first authenticated connection. If a
+direct path is unavailable, it tries local discovery, rendezvous, relay, an existing SSH server,
+then an explicitly supplied endpoint. The selected path is always visible to the user.
 
-- `remolo connect <token>` - interactive shell; `--resume` survives network changes
-- `remolo exec <token> -- <cmd>` - one-shot command, with real exit codes and stderr
-- `remolo put` / `remolo get` - file transfer, resumable and checksummed
-- `remolo sync <token> <local> <remote>` - rsync-style sync, moves only what changed
-- `remolo mount <token> <dir>` - the remote filesystem as a local folder
-- `remolo forward <token> -L 8080:localhost:80` - port forwarding, and SOCKS5 with `-D`
-- `remolo desktop <token>` - the remote screen in your browser, mouse and keyboard included
-- `remolo webterm <token>` - a terminal in your browser
-
-Open as many as you like at once. The second command reuses the connection the
-first one made, so it starts instantly.
-
-Tired of pasting tokens? `remolo enroll <token> --as work` registers your key on
-that host, and from then on `remolo connect work` is enough.
-
-Running a fleet? `remolo group set web a b c`, then `remolo exec @web -- uptime`
-fans out in parallel.
-
-## When the direct path is blocked
-
-The token carries every address the host has, so remolo tries them all at once
-and keeps the first that answers. If none do, it works its way down: mDNS on the
-local network, then a rendezvous broker, then a relay, then a tunnel through an
-existing sshd. It always prints which rung won.
-
-The two rungs that need a public address are yours to host: `remolo-rendezvous`
-and `remolo-relay` ship as separate binaries, and neither can read your traffic.
-The relay only ever moves ciphertext.
+`remolo-rendezvous` and `remolo-relay` are separate self-hosted binaries. The relay moves encrypted
+bytes and cannot read session traffic.
 
 ## Security
 
-Sessions are end-to-end encrypted with TLS 1.3. The client pins the host's key
-from the token, so nobody can impersonate the host even on a hostile network,
-and the host verifies the client really holds the token's secret.
+Sessions use TLS 1.3 with the host key pinned from the connection token. A challenge-response proves
+that the client holds the token secret. Tokens expire after 24 hours by default and can be
+single-use, read-only, channel-scoped, command-scoped, rooted to one directory, or subject to local
+approval.
 
-**Treat the token like a password.** Whoever has it gets a shell as you, with
-your environment. Tokens expire (24h by default, `--ttl` to shorten) and `--once`
-makes one single-use. You can also hand out a narrower one: `--ro` for read-only,
-`--cap` to allow only certain channels, `--cmd` to allow only certain commands,
-`--file-root` to confine it to one directory. `--approve` asks you before letting
-anyone in.
-
-remolo is for machines you own or have explicit consent to control.
-[docs/security.md](docs/security.md) has the threat model and the known limits.
-
-## Docs
-
-- [Operator guide](docs/operator.md) - same LAN, across subnets, across the internet behind NAT
-- [Security model](docs/security.md) - what protects a session, and what does not
-- [Architecture](docs/architecture.md) - how it is put together
-- [Benchmarks](docs/benchmarks.md) - a harness to measure it on your own network
-
-## Build
-
-```
-make build   # single binary, no cgo
-make test
-```
-
-Go 1.25+. No cgo, no runtime dependencies.
+Treat a connection token like a password. Remolo is for machines you own or have explicit consent
+to control.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Remolo is licensed under either the Apache License 2.0 or the MIT License, at your option.

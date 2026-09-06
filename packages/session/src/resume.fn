@@ -1,0 +1,721 @@
+package remolo.session
+
+import foundation.worker
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.collections
+import std.concurrent
+import std.process
+import std.text
+
+@concurrent.Transferable()
+struct ResumeHandle {
+    requests Sender<resumeRequest>
+
+    fn Clone(self) ResumeHandle {
+        ResumeHandle { requests = self.requests.clone() }
+    }
+}
+
+struct ResumeRegistry {
+    handle ResumeHandle
+    supervisor own worker.Supervisor
+
+    fn Handle(self) ResumeHandle {
+        self.handle.Clone()
+    }
+
+    fn Shutdown(&self) void {
+        const supervisor = replace self.supervisor with worker.NewSupervisor()
+        supervisor.Cancel()
+    }
+}
+
+fn cloneResumeHandle(value ResumeHandle) ResumeHandle {
+    value.Clone()
+}
+
+struct resumeAttach {
+    id String
+    descriptor protocol.Open
+    stream mux.Stream
+}
+
+enum resumeRequest {
+    Attach(value own resumeAttach)
+    Remove(id String)
+}
+
+struct resumeEntry {
+    id String
+    events Sender<resumeEvent>
+}
+
+struct resumeState {
+    sessions own collections.List<own resumeEntry>
+    workers own worker.Supervisor
+}
+
+struct attachedStream {
+    generation u64
+    writer own mux.Writer
+}
+
+struct scrollback {
+    chunks own collections.List<own bytes.Bytes>
+    size u64
+}
+
+enum resumeEvent {
+    Attach(stream mux.Stream)
+    Input(value own bytes.Bytes)
+    Resize(value protocol.Resize)
+    Detached(generation u64)
+    Output(value own bytes.Bytes)
+    Exit(code i32)
+}
+
+struct resumeRuntime {
+    attachment Option<own attachedStream>
+    generation u64
+    ring scrollback
+    processWriter Option<own process.PTYWriter>
+    processController own process.PTYController
+    pumps own worker.Supervisor
+}
+
+fn NewResumeRegistry() own ResumeRegistry {
+    const Channel { sender receiver } = channel<resumeRequest>(64)
+    const supervisor = worker.NewSupervisor()
+    supervisor.Start(spawn serveResumeRegistry(
+            $receiver,
+            sender.clone()
+        ))
+    own ResumeRegistry {
+        handle = ResumeHandle { requests = sender }
+        supervisor = supervisor
+    }
+}
+
+task ServeResumablePTY(
+    $channel mux.AcceptedChannel,
+    $handle ResumeHandle
+) Result<void, Error> {
+    const mux.AcceptedChannel { Open Stream } = channel
+    if text.IsEmpty(Open.ResumeID) {
+        discard Stream
+        discard handle
+        return .Err(.Protocol)
+    }
+    const id = text.Copy(Open.ResumeID)
+    var requests = handle.requests.clone()
+    select {
+        requests.send(.Attach(value = own resumeAttach {
+            id = id
+            descriptor = Open
+            stream = Stream
+        })): {
+            discard requests
+            discard handle
+            return .Ok
+        }
+        else error: {
+            discard error
+            discard requests
+            discard handle
+            return .Err(.Execution)
+        }
+    }
+}
+
+task serveResumeRegistry(
+    $receiver Receiver<resumeRequest>,
+    $requests Sender<resumeRequest>
+) void {
+    var inbox = receiver
+    var state = own resumeState {
+        sessions = collections.NewList<own resumeEntry>()
+        workers = worker.NewSupervisor()
+    }
+    while true {
+        select {
+            const request = inbox.receive(): {
+                applyResumeRequest(&state, $request, requests.clone())
+            }
+            else error: {
+                discard error
+                const resumeState { sessions workers } = state
+                const stopping = workers.CancelTask()
+                discard $stopping.wait()
+                discard sessions
+                discard inbox
+                discard requests
+                return
+            }
+        }
+    }
+}
+
+fn applyResumeRequest(
+    &state resumeState,
+    $request resumeRequest,
+    $requests Sender<resumeRequest>
+) void {
+    match request {
+        Attach(value): attachResume(&state, $value, $requests)
+        Remove(id): {
+            discard requests
+            removeResume(&state, id)
+        }
+    }
+}
+
+fn attachResume(
+    &state resumeState,
+    $request own resumeAttach,
+    $requests Sender<resumeRequest>
+) void {
+    const resumeAttach { id descriptor stream } = request
+    const existing = resumeEvents(&state, id)
+    match existing {
+        Some(events): {
+            discard descriptor
+            discard requests
+            state.workers.Start(spawn sendResumeEvent(
+                    $events,
+                    $ .Attach(stream = stream)
+                ))
+        }
+        None: startResume(
+            &state,
+            $id,
+            $descriptor,
+            $stream,
+            $requests
+        )
+    }
+}
+
+task sendResumeEvent(
+    $events Sender<resumeEvent>,
+    $event resumeEvent
+) void {
+    discard events.send(event)
+}
+
+fn startResume(
+    &state resumeState,
+    $id String,
+    $descriptor protocol.Open,
+    $stream mux.Stream,
+    $requests Sender<resumeRequest>
+) void {
+    const Channel { sender receiver } = channel<resumeEvent>(128)
+    state.sessions.PushFront($own resumeEntry {
+        id = text.Copy(id)
+        events = sender.clone()
+    })
+    state.workers.Start(spawn runResumeSession(
+            $id,
+            $descriptor,
+            $stream,
+            $sender,
+            $receiver,
+            $requests
+        ))
+}
+
+fn resumeEvents(
+    &state resumeState,
+    id String
+) Option<Sender<resumeEvent>> {
+    var pending = replace state.sessions with collections.NewList<own resumeEntry>()
+    var remaining = collections.NewList<own resumeEntry>()
+    var result Option<Sender<resumeEvent>> = .None
+    while !pending.IsEmpty() {
+        const entry = resumeEntryValue(pending.PopFront())
+        if entry.id == id {
+            result = .Some(entry.events.clone())
+        }
+        remaining.PushFront($entry)
+    }
+    discard pending
+    state.sessions = reverseResumeEntries($remaining)
+    result
+}
+
+fn removeResume(&state resumeState, id String) void {
+    var pending = replace state.sessions with collections.NewList<own resumeEntry>()
+    var remaining = collections.NewList<own resumeEntry>()
+    while !pending.IsEmpty() {
+        const entry = resumeEntryValue(pending.PopFront())
+        if entry.id == id {
+            discard entry
+        } else {
+            remaining.PushFront($entry)
+        }
+    }
+    discard pending
+    state.sessions = reverseResumeEntries($remaining)
+}
+
+task runResumeSession(
+    $id String,
+    $descriptor protocol.Open,
+    $stream mux.Stream,
+    $events Sender<resumeEvent>,
+    $receiver Receiver<resumeEvent>,
+    $requests Sender<resumeRequest>
+) void {
+    const prepared = prepareProcessPTY($descriptor) else error {
+        discard error
+        discard stream
+        discard events
+        discard receiver
+        discard requests.send(.Remove(id = id))
+        return
+    }
+    const starting = spawn process.StartPTY($prepared)
+    const started = $starting.wait()
+    const active = started else error {
+        discard error
+        discard stream
+        discard events
+        discard receiver
+        discard requests.send(.Remove(id = id))
+        return
+    }
+    const process.PTY {
+        Reader
+        Writer
+        Controller
+        Waiter
+    } = active
+    const pumps = worker.NewSupervisor()
+    pumps.Start(spawn pumpResumeOutput($Reader, events.clone()))
+    pumps.Start(spawn waitResumeProcess($Waiter, events.clone()))
+    var inbox = receiver
+    var runtime = own resumeRuntime {
+        attachment = .None
+        generation = 0
+        ring = scrollback {
+            chunks = collections.NewList<own bytes.Bytes>()
+            size = 0
+        }
+        processWriter = .Some(Writer)
+        processController = Controller
+        pumps = pumps
+    }
+    attachResumeStream(
+        &runtime,
+        $stream,
+        events.clone()
+    )
+    var running = true
+    while running {
+        if hasAttachment(runtime.attachment) {
+            const received = inbox.receive()
+            match received {
+                Ok(event): {
+                    running = applyResumeEvent(
+                        &runtime,
+                        $event,
+                        events.clone()
+                    )
+                }
+                Err(error): {
+                    discard error
+                    running = false
+                }
+            }
+        } else {
+            select {
+                const event = inbox.receive(): {
+                    running = applyResumeEvent(
+                        &runtime,
+                        $event,
+                        events.clone()
+                    )
+                }
+                timeout 600.seconds: {
+                    discard runtime.processController.Abort()
+                    running = false
+                }
+                else error: {
+                    discard error
+                    running = false
+                }
+            }
+        }
+    }
+    const resumeRuntime {
+        attachment
+        generation
+        ring
+        processWriter
+        processController
+        pumps as activePumps
+    } = runtime
+    const stopping = activePumps.CancelTask()
+    discard $stopping.wait()
+    discard attachment
+    discard generation
+    discard ring
+    discard processWriter
+    var activeController = processController
+    discard activeController.Abort()
+    discard activeController
+    discard inbox
+    discard events
+    discard requests.send(.Remove(id = id))
+}
+
+fn applyResumeEvent(
+    &runtime resumeRuntime,
+    $event resumeEvent,
+    $events Sender<resumeEvent>
+) bool {
+    match event {
+        Attach(stream): {
+            attachResumeStream(
+                &runtime,
+                $stream,
+                $events
+            )
+            true
+        }
+        Input(value): {
+            discard events
+            writeResumeInput(&runtime, $value)
+            true
+        }
+        Resize(value): {
+            discard events
+            discard runtime.processController.Resize(value.Cols, value.Rows)
+            true
+        }
+        Detached(value): {
+            discard events
+            if value == runtime.generation {
+                const previous = replace runtime.attachment with .None
+                discard previous
+            }
+            true
+        }
+        Output(value): {
+            discard events
+            publishResumeOutput(&runtime, $value)
+            true
+        }
+        Exit(code): {
+            discard events
+            publishResumeExit(&runtime, code)
+            false
+        }
+    }
+}
+
+fn attachResumeStream(
+    &runtime resumeRuntime,
+    $stream mux.Stream,
+    $events Sender<resumeEvent>
+) void {
+    const previous = replace runtime.attachment with .None
+    discard previous
+    runtime.generation = runtime.generation + 1
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const replay = replayScrollback($Writer, &runtime.ring)
+    runtime.pumps.Start(spawn pumpResumeInput(
+            $Reader,
+            runtime.generation,
+            $events
+        ))
+    runtime.attachment = .Some(own attachedStream {
+        generation = runtime.generation
+        writer = replay
+    })
+}
+
+task pumpResumeInput(
+    $reader own mux.Reader,
+    generation u64,
+    $events Sender<resumeEvent>
+) void {
+    var source = reader
+    var reading = true
+    while reading {
+        const pending = spawn mux.ReadFrame($source)
+        const outcome = $pending.wait()
+        const mux.FrameReadOutcome { Reader Value } = outcome
+        source = Reader
+        const frame = Value else error {
+            discard error
+            reading = false
+            continue
+        }
+        const protocol.Frame { Type Payload } = frame
+        if dataFrame(Type) {
+            discard events.send(.Input(value = Payload))
+            continue
+        }
+        if resizeFrame(Type) {
+            const resize = protocol.DecodeResize(Payload) else error {
+                discard error
+                continue
+            }
+            discard events.send(.Resize(value = resize))
+            continue
+        }
+        discard Payload
+        if eofFrame(Type) { reading = false }
+    }
+    discard source
+    discard events.send(.Detached(generation = generation))
+}
+
+task pumpResumeOutput(
+    $reader own process.PTYReader,
+    $events Sender<resumeEvent>
+) void {
+    var source = reader
+    var reading = true
+    while reading {
+        const pending = spawn process.ReadPTY($source, 32768)
+        const outcome = $pending.wait()
+        const process.PTYReadOutcome { Reader Value } = outcome
+        source = Reader
+        const chunk = Value else error {
+            discard error
+            reading = false
+            continue
+        }
+        match chunk {
+            Some(value): { discard events.send(.Output(value = value)) }
+            None: { reading = false }
+        }
+    }
+    discard source
+    discard events
+}
+
+task waitResumeProcess(
+    $waiter own process.PTYWaiter,
+    $events Sender<resumeEvent>
+) void {
+    const waiting = spawn process.WaitPTY($waiter)
+    const result = $waiting.wait()
+    const code = match result {
+        Ok(value): value
+        Err(error): {
+            discard error
+            - 1
+        }
+    }
+    discard events.send(.Exit(code = code))
+}
+
+fn writeResumeInput(
+    &runtime resumeRuntime,
+    $value own bytes.Bytes
+) void {
+    const selected = replace runtime.processWriter with .None
+    const current = match selected {
+        Some(found): found
+        None: {
+            discard value
+            return
+        }
+    }
+    const writing = spawn process.WritePTY($current, $value)
+    const outcome = $writing.wait()
+    const process.PTYWriteOutcome { Writer Value } = outcome
+    runtime.processWriter = .Some(Writer)
+    discard Value
+}
+
+fn publishResumeOutput(
+    &runtime resumeRuntime,
+    $value own bytes.Bytes
+) void {
+    const retained = value.Copy() else error {
+        discard error
+        discard value
+        return
+    }
+    appendScrollback(&runtime.ring, $retained)
+    const selected = replace runtime.attachment with .None
+    match selected {
+        None: { discard value }
+        Some(active): {
+            runtime.attachment = writeResumeOutput($active, $value)
+        }
+    }
+}
+
+fn writeResumeOutput(
+    $active own attachedStream,
+    $value own bytes.Bytes
+) Option<own attachedStream> {
+    const attachedStream { generation writer } = active
+    const sending = spawn mux.WriteFrame($writer, .Data, $value)
+    const outcome = $sending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Some(own attachedStream {
+            generation = generation
+            writer = Writer
+        })
+        Err(error): {
+            discard error
+            discard Writer
+            .None
+        }
+    }
+}
+
+fn publishResumeExit(
+    &runtime resumeRuntime,
+    code i32
+) void {
+    const selected = replace runtime.attachment with .None
+    match selected {
+        None: {}
+        Some(active): {
+            const payload = protocol.EncodeExit(protocol.Exit {
+                Code = code
+                Error = ""
+            }) else error {
+                discard error
+                discard active
+                return
+            }
+            const attachedStream { generation writer } = active
+            discard generation
+            const sending = spawn mux.WriteFrame($writer, .Exit, $payload)
+            const outcome = $sending.wait()
+            const mux.WriteOutcome { Writer Value } = outcome
+            discard Value
+            const closing = spawn mux.CloseWriter($Writer)
+            discard $closing.wait()
+        }
+    }
+}
+
+fn appendScrollback(
+    &ring scrollback,
+    $value own bytes.Bytes
+) void {
+    const length = value.Len() else error {
+        discard error
+        discard value
+        return
+    }
+    ring.chunks.PushFront($value)
+    ring.size = ring.size + length
+    while ring.size > 262144 {
+        removeOldestScrollback(&ring)
+    }
+}
+
+fn removeOldestScrollback(&ring scrollback) void {
+    var pending = replace ring.chunks with collections.NewList<own bytes.Bytes>()
+    var reversed = collections.NewList<own bytes.Bytes>()
+    while !pending.IsEmpty() {
+        reversed.PushFront($ownedBytes(pending.PopFront()))
+    }
+    const oldest = reversed.PopFront()
+    match oldest {
+        Some(value): {
+            const measured = value.Len()
+            const length = match measured {
+                Ok(found): found
+                Err(error): {
+                    discard error
+                    0
+                }
+            }
+            if ring.size >= length { ring.size = ring.size - length }
+            discard value
+        }
+        None: { ring.size = 0 }
+    }
+    while !reversed.IsEmpty() {
+        pending.PushFront($ownedBytes(reversed.PopFront()))
+    }
+    ring.chunks = pending
+}
+
+fn replayScrollback(
+    $writer own mux.Writer,
+    &ring scrollback
+) own mux.Writer {
+    var active = writer
+    var newest = replace ring.chunks with collections.NewList<own bytes.Bytes>()
+    var ordered = collections.NewList<own bytes.Bytes>()
+    while !newest.IsEmpty() {
+        ordered.PushFront($ownedBytes(newest.PopFront()))
+    }
+    var restored = collections.NewList<own bytes.Bytes>()
+    while !ordered.IsEmpty() {
+        const chunk = ownedBytes(ordered.PopFront())
+        const wire = chunk.Copy() else error {
+            discard error
+            restored.PushFront($chunk)
+            continue
+        }
+        const sending = spawn mux.WriteFrame($active, .Data, $wire)
+        const outcome = $sending.wait()
+        const mux.WriteOutcome { Writer Value } = outcome
+        active = Writer
+        restored.PushFront($chunk)
+        Value else error {
+            discard error
+            while !ordered.IsEmpty() {
+                restored.PushFront($ownedBytes(ordered.PopFront()))
+            }
+            ring.chunks = restored
+            return active
+        }
+    }
+    ring.chunks = restored
+    active
+}
+
+fn reverseResumeEntries(
+    $values own collections.List<own resumeEntry>
+) own collections.List<own resumeEntry> {
+    var pending = values
+    var result = collections.NewList<own resumeEntry>()
+    while !pending.IsEmpty() {
+        result.PushFront($resumeEntryValue(pending.PopFront()))
+    }
+    result
+}
+
+fn resumeEntryValue($value Option<own resumeEntry>) own resumeEntry {
+    match value {
+        Some(entry): entry
+        None: panic("resume registry invariant failed")
+    }
+}
+
+fn ownedBytes(
+    $value Option<own bytes.Bytes>
+) own bytes.Bytes {
+    match value {
+        Some(found): found
+        None: panic("scrollback invariant failed")
+    }
+}
+
+fn hasAttachment(value Option<own attachedStream>) bool {
+    match value {
+        Some(active): {
+            discard active
+            true
+        }
+        None: false
+    }
+}

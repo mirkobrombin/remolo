@@ -1,0 +1,37 @@
+package remolo.rendezvous_server
+
+import foundation.web
+import remolo.rendezvous
+
+fn errorResponse(error rendezvous.Error) web.Response {
+    match error {
+        InvalidRequest: web.Text(400, "invalid request\n")
+        NotFound: web.Text(404, "not found\n")
+        Storage: web.Text(500, "internal error\n")
+        Transport: web.Text(500, "internal error\n")
+    }
+}
+
+@web.Route(.POST, "/register")
+// Publishes candidates for a session.
+fn Register(
+    @web.Body() body String,
+    @web.Inject() state RendezvousState
+) web.Response {
+    match state.Register(body) {
+        Ok: web.Empty(204)
+        Err(error): errorResponse(error)
+    }
+}
+
+@web.Route(.GET, "/lookup")
+// Returns the candidates published for a session.
+fn Lookup(
+    @web.Query("session_id") sessionID String,
+    @web.Inject() state RendezvousState
+) web.Response {
+    match state.Lookup(sessionID) {
+        Ok(body): web.Json(200, $body)
+        Err(error): errorResponse(error)
+    }
+}

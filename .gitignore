@@ -1,8 +1,4 @@
-/remolo
-/dist/
-*.test
-*.out
-.DS_Store
-
-# Local notes, never committed.
-*.local.md
+/.foundation/
+**/.foundation/
+/build/
+**/build/

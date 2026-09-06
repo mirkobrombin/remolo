@@ -1,0 +1,108 @@
+package remolo.transport
+
+import std.bytes
+
+task acceptOne($listener own Listener) AcceptOutcome {
+    const pending = spawn Accept($listener)
+    const accepted = $pending.wait()
+    accepted
+}
+
+test "direct TCP channels carry Remolo frames" {
+    const opened = Listen($"127.0.0.1", 0) else { fail("listen failed") }
+    const port = opened.Port()
+    const accepting = spawn acceptOne($opened)
+    const dialing = spawn Dial($"127.0.0.1", port)
+    const client = $dialing.wait() else { fail("dial failed") }
+    const accepted = $accepting.wait()
+    const AcceptOutcome { Listener Value } = accepted
+    const server = Value else { fail("accept failed") }
+    const Stream {
+        Reader as clientReader
+        Writer as clientWriter
+        Peer as clientPeer
+    } = client
+    const Stream {
+        Reader as serverReader
+        Writer as serverWriter
+        Peer as serverPeer
+    } = server
+    expect(clientPeer == "127.0.0.1")
+    expect(serverPeer == "127.0.0.1")
+    const writing = spawn WriteFrame(
+        $clientWriter,
+        .Data,
+        $bytes.FromText("hello over TCP")
+    )
+    const reading = spawn ReadFrame($serverReader)
+    const written = $writing.wait()
+    const read = $reading.wait()
+    const WriteOutcome { Writer Value as writeValue } = written
+    const ReadOutcome { Reader Value as readValue } = read
+    match writeValue {
+        Ok: {}
+        Err(error): {
+            discard error
+            fail("frame write failed")
+        }
+    }
+    const frame = readValue else { fail("frame read failed") }
+    match frame.Type {
+        Data: {}
+        _: fail("frame type changed")
+    }
+    const payload = frame.Payload.Text() else { fail("payload text failed") }
+    expect(payload == "hello over TCP")
+    discard clientReader
+    discard Reader
+    discard Writer
+    discard serverWriter
+    discard Listener
+}
+
+test "direct TCP rejects oversized frame headers before allocation" {
+    const opened = Listen($"127.0.0.1", 0) else { fail("listen failed") }
+    const port = opened.Port()
+    const accepting = spawn acceptOne($opened)
+    const dialing = spawn Dial($"127.0.0.1", port)
+    const client = $dialing.wait() else { fail("dial failed") }
+    const accepted = $accepting.wait()
+    const AcceptOutcome { Listener Value } = accepted
+    const server = Value else { fail("accept failed") }
+    const Stream { Reader Writer Peer } = client
+    discard Peer
+    const Stream {
+        Reader as serverReader
+        Writer as serverWriter
+        Peer as serverPeer
+    } = server
+    discard serverPeer
+    const openedHeader = bytes.NewBuilder(5) else { fail("header failed") }
+    var header = openedHeader
+    header.WriteByte(1) else { fail("header byte failed") }
+    header.WriteByte(1) else { fail("header byte failed") }
+    header.WriteByte(0) else { fail("header byte failed") }
+    header.WriteByte(0) else { fail("header byte failed") }
+    header.WriteByte(1) else { fail("header byte failed") }
+    const encoded = header.Finish() else { fail("header finish failed") }
+    const rawWriting = spawn WriteRaw($Writer, $encoded)
+    const reading = spawn ReadFrame($serverReader)
+    const rawWritten = $rawWriting.wait()
+    discard rawWritten
+    const read = $reading.wait()
+    const ReadOutcome { Reader as restored Value as result } = read
+    match result {
+        Ok(value): {
+            discard value
+            fail("oversized frame was accepted")
+        }
+        Err(error): match error {
+            PayloadTooLarge: {}
+            _: fail("wrong oversized frame error")
+        }
+    }
+    discard Reader
+    discard restored
+    discard serverWriter
+    discard Listener
+}

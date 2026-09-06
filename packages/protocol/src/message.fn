@@ -1,0 +1,674 @@
+package remolo.protocol
+
+import std.bytes
+import std.collections
+import std.format
+import std.json
+import std.parse
+import std.text
+
+enum Kind {
+    Control
+    PTY
+    Exec
+    Desktop
+    File
+    RPC
+    Forward
+    Sync
+    Agent
+}
+
+enum MessageError {
+    Storage
+    InvalidJSON
+    InvalidFrame
+    InvalidField
+    MissingKind
+    InvalidKind
+}
+
+struct Environment {
+    Name String
+    Value String
+}
+
+struct Open {
+    Kind Kind
+    Cols u16
+    Rows u16
+    Command own collections.List<String>
+    Env own collections.List<Environment>
+    Term String
+    Dir String
+    Target String
+    ResumeID String
+}
+
+struct Resize {
+    Cols u16
+    Rows u16
+}
+
+struct Signal {
+    Name String
+}
+
+struct Exit {
+    Code i32
+    Error String
+}
+
+struct Capabilities {
+    OS String
+    Arch String
+    PTY bool
+    Desktop bool
+    Exec bool
+    File bool
+    Hostname String
+    Version String
+}
+
+fn CopyCapabilities(value Capabilities) Capabilities {
+    Capabilities {
+        OS = text.Copy(value.OS)
+        Arch = text.Copy(value.Arch)
+        PTY = value.PTY
+        Desktop = value.Desktop
+        Exec = value.Exec
+        File = value.File
+        Hostname = text.Copy(value.Hostname)
+        Version = text.Copy(value.Version)
+    }
+}
+
+fn EncodeCapabilities(
+    value Capabilities
+) Result<own bytes.Bytes, MessageError> {
+    var object = json.NewObject()
+    setText(&object, "os", value.OS) else error { return .Err(error) }
+    setText(&object, "arch", value.Arch) else error { return .Err(error) }
+    setBool(&object, "pty", value.PTY) else error { return .Err(error) }
+    setBool(&object, "desktop", value.Desktop) else error {
+        return .Err(error)
+    }
+    setBool(&object, "exec", value.Exec) else error { return .Err(error) }
+    setBool(&object, "file", value.File) else error { return .Err(error) }
+    setText(&object, "hostname", value.Hostname) else error {
+        return .Err(error)
+    }
+    setText(&object, "version", value.Version) else error {
+        return .Err(error)
+    }
+    encodeJSON($object)
+}
+
+fn DecodeCapabilities(
+    source bytes.Bytes
+) Result<Capabilities, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const os = requiredText(&object, "os") else error { return .Err(error) }
+    const arch = requiredText(&object, "arch") else error {
+        return .Err(error)
+    }
+    const pty = requiredBool(&object, "pty") else error {
+        return .Err(error)
+    }
+    const desktop = requiredBool(&object, "desktop") else error {
+        return .Err(error)
+    }
+    const exec = requiredBool(&object, "exec") else error {
+        return .Err(error)
+    }
+    const file = requiredBool(&object, "file") else error {
+        return .Err(error)
+    }
+    const hostname = requiredText(&object, "hostname") else error {
+        return .Err(error)
+    }
+    const version = requiredText(&object, "version") else error {
+        return .Err(error)
+    }
+    .Ok(Capabilities {
+        OS = os
+        Arch = arch
+        PTY = pty
+        Desktop = desktop
+        Exec = exec
+        File = file
+        Hostname = hostname
+        Version = version
+    })
+}
+
+struct ControlMessage {
+    Type String
+}
+
+fn EncodeControlMessage(
+    $value ControlMessage
+) Result<own bytes.Bytes, MessageError> {
+    const ControlMessage { Type } = value
+    var object = json.NewObject()
+    setText(&object, "type", Type) else error { return .Err(error) }
+    encodeJSON($object)
+}
+
+fn DecodeControlMessage(
+    source bytes.Bytes
+) Result<ControlMessage, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const kind = requiredText(&object, "type") else error {
+        return .Err(error)
+    }
+    .Ok(ControlMessage { Type = kind })
+}
+
+fn NewOpen(kind Kind) Open {
+    Open {
+        Kind = kind
+        Cols = 0
+        Rows = 0
+        Command = collections.NewList<String>()
+        Env = collections.NewList<Environment>()
+        Term = ""
+        Dir = ""
+        Target = ""
+        ResumeID = ""
+    }
+}
+
+fn EncodeOpen($value Open) Result<own bytes.Bytes, MessageError> {
+    const Open {
+        Kind
+        Cols
+        Rows
+        Command
+        Env
+        Term
+        Dir
+        Target
+        ResumeID
+    } = value
+    var object = json.NewObject()
+    setText(&object, "kind", kindName(Kind)) else error {
+        return .Err(error)
+    }
+    setOptionalU16(&object, "cols", Cols) else error { return .Err(error) }
+    setOptionalU16(&object, "rows", Rows) else error { return .Err(error) }
+    setStringList(&object, "command", $Command) else error {
+        return .Err(error)
+    }
+    setEnvironment(&object, $Env) else error { return .Err(error) }
+    setOptionalText(&object, "term", Term) else error { return .Err(error) }
+    setOptionalText(&object, "dir", Dir) else error { return .Err(error) }
+    setOptionalText(&object, "target", Target) else error { return .Err(error) }
+    setOptionalText(&object, "resume", ResumeID) else error {
+        return .Err(error)
+    }
+    encodeJSON($object)
+}
+
+fn DecodeOpen(source bytes.Bytes) Result<Open, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const kindText = requiredText(&object, "kind") else error {
+        return .Err(error)
+    }
+    const kind = kindFor(kindText) else error { return .Err(error) }
+    const cols = optionalU16(&object, "cols") else error { return .Err(error) }
+    const rows = optionalU16(&object, "rows") else error { return .Err(error) }
+    const command = optionalStringList(&object, "command") else error {
+        return .Err(error)
+    }
+    const env = optionalEnvironment(&object) else error { return .Err(error) }
+    const term = optionalText(&object, "term") else error { return .Err(error) }
+    const dir = optionalText(&object, "dir") else error { return .Err(error) }
+    const target = optionalText(&object, "target") else error {
+        return .Err(error)
+    }
+    const resume = optionalText(&object, "resume") else error {
+        return .Err(error)
+    }
+    .Ok(Open {
+        Kind = kind
+        Cols = cols
+        Rows = rows
+        Command = command
+        Env = env
+        Term = term
+        Dir = dir
+        Target = target
+        ResumeID = resume
+    })
+}
+
+fn EncodeOpenFrame($value Open) Result<own bytes.Bytes, MessageError> {
+    const payload = EncodeOpen($value) else error { return .Err(error) }
+    const frame = EncodeFrame(.JSON, payload) else error {
+        discard error
+        return .Err(.InvalidFrame)
+    }
+    .Ok(frame)
+}
+
+fn DecodeOpenFrame(source bytes.Bytes) Result<Open, MessageError> {
+    const frame = DecodeFrame(source) else error {
+        discard error
+        return .Err(.InvalidFrame)
+    }
+    const Frame { Type Payload } = frame
+    match Type {
+        JSON: DecodeOpen(Payload)
+        _: .Err(.InvalidFrame)
+    }
+}
+
+fn EncodeResize(value Resize) Result<own bytes.Bytes, MessageError> {
+    var object = json.NewObject()
+    setU16(&object, "cols", value.Cols) else error { return .Err(error) }
+    setU16(&object, "rows", value.Rows) else error { return .Err(error) }
+    encodeJSON($object)
+}
+
+fn DecodeResize(source bytes.Bytes) Result<Resize, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const cols = requiredU16(&object, "cols") else error { return .Err(error) }
+    const rows = requiredU16(&object, "rows") else error { return .Err(error) }
+    .Ok(Resize { Cols = cols Rows = rows })
+}
+
+fn EncodeSignal(value Signal) Result<own bytes.Bytes, MessageError> {
+    var object = json.NewObject()
+    setText(&object, "name", value.Name) else error { return .Err(error) }
+    encodeJSON($object)
+}
+
+fn DecodeSignal(source bytes.Bytes) Result<Signal, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const name = requiredText(&object, "name") else error { return .Err(error) }
+    .Ok(Signal { Name = name })
+}
+
+fn EncodeExit(value Exit) Result<own bytes.Bytes, MessageError> {
+    var object = json.NewObject()
+    setNumber(&object, "code", format.I32(value.Code)) else error {
+        return .Err(error)
+    }
+    setOptionalText(&object, "err", value.Error) else error {
+        return .Err(error)
+    }
+    encodeJSON($object)
+}
+
+fn DecodeExit(source bytes.Bytes) Result<Exit, MessageError> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const code = requiredI32(&object, "code") else error { return .Err(error) }
+    const message = optionalText(&object, "err") else error {
+        return .Err(error)
+    }
+    .Ok(Exit { Code = code Error = message })
+}
+
+fn kindName(value Kind) String {
+    match value {
+        Control: "control"
+        PTY: "pty"
+        Exec: "exec"
+        Desktop: "desktop"
+        File: "file"
+        RPC: "rpc"
+        Forward: "forward"
+        Sync: "sync"
+        Agent: "agent"
+    }
+}
+
+fn kindFor(value String) Result<Kind, MessageError> {
+    if value == "control" return .Ok(.Control)
+    if value == "pty" return .Ok(.PTY)
+    if value == "exec" return .Ok(.Exec)
+    if value == "desktop" return .Ok(.Desktop)
+    if value == "file" return .Ok(.File)
+    if value == "rpc" return .Ok(.RPC)
+    if value == "forward" return .Ok(.Forward)
+    if value == "sync" return .Ok(.Sync)
+    if value == "agent" return .Ok(.Agent)
+    .Err(.InvalidKind)
+}
+
+fn encodeJSON($object own json.Object) Result<own bytes.Bytes, MessageError> {
+    const encoded = json.Stringify(.Object(object)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(bytes.FromText(encoded))
+}
+
+fn parseObject(source bytes.Bytes) Result<own json.Object, MessageError> {
+    const encoded = source.Text() else error {
+        discard error
+        return .Err(.InvalidJSON)
+    }
+    const parsed = json.Parse(encoded) else error {
+        discard error
+        return .Err(.InvalidJSON)
+    }
+    match parsed {
+        Object(object): .Ok(object)
+        _: .Err(.InvalidJSON)
+    }
+}
+
+fn setText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, MessageError> {
+    object.Set($text.Copy(key), $ .Text(text.Copy(value))) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setNumber(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, MessageError> {
+    object.Set($text.Copy(key), $ .Number(text.Copy(value))) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setBool(
+    &object json.Object,
+    key String,
+    value bool
+) Result<void, MessageError> {
+    object.Set($text.Copy(key), $ .Bool(value)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setU16(
+    &object json.Object,
+    key String,
+    value u16
+) Result<void, MessageError> {
+    setNumber(&object, key, format.U16(value))
+}
+
+fn setOptionalU16(
+    &object json.Object,
+    key String,
+    value u16
+) Result<void, MessageError> {
+    if value == 0 return .Ok
+    setU16(&object, key, value)
+}
+
+fn setOptionalText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, MessageError> {
+    if text.IsEmpty(value) return .Ok
+    setText(&object, key, value)
+}
+
+fn setStringList(
+    &object json.Object,
+    key String,
+    $values own collections.List<String>
+) Result<void, MessageError> {
+    var pending = values
+    if pending.IsEmpty() return .Ok
+    var array = json.NewArray()
+    while !pending.IsEmpty() {
+        const value = stringValue(pending.PopFront())
+        array.Add($ .Text(value))
+    }
+    object.Set($text.Copy(key), $ .Array(array)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setEnvironment(
+    &object json.Object,
+    $values own collections.List<Environment>
+) Result<void, MessageError> {
+    var pending = values
+    if pending.IsEmpty() return .Ok
+    var fields = json.NewObject()
+    while !pending.IsEmpty() {
+        const Environment { Name Value } = environmentValue(pending.PopFront())
+        fields.Set($Name, $ .Text(Value)) else error {
+            discard error
+            return .Err(.InvalidField)
+        }
+    }
+    object.Set($text.Copy("env"), $ .Object(fields)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn requiredText(
+    &object json.Object,
+    key String
+) Result<String, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: {
+            if key == "kind" return .Err(.MissingKind)
+            .Err(.InvalidField)
+        }
+        Some(value): jsonText($value)
+    }
+}
+
+fn optionalText(
+    &object json.Object,
+    key String
+) Result<String, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Ok("")
+        Some(value): jsonText($value)
+    }
+}
+
+fn jsonText($value json.Value) Result<String, MessageError> {
+    match value {
+        Text(found): .Ok(found)
+        _: .Err(.InvalidField)
+    }
+}
+
+fn optionalU16(
+    &object json.Object,
+    key String
+) Result<u16, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Ok(0)
+        Some(value): jsonU16($value)
+    }
+}
+
+fn requiredU16(
+    &object json.Object,
+    key String
+) Result<u16, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Err(.InvalidField)
+        Some(value): jsonU16($value)
+    }
+}
+
+fn jsonU16($value json.Value) Result<u16, MessageError> {
+    match value {
+        Number(found): {
+            const result = parse.U16(found) else error {
+                discard error
+                return .Err(.InvalidField)
+            }
+            .Ok(result)
+        }
+        _: .Err(.InvalidField)
+    }
+}
+
+fn requiredI32(
+    &object json.Object,
+    key String
+) Result<i32, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Err(.InvalidField)
+        Some(value): match value {
+            Number(found): {
+                const result = parse.I32(found) else error {
+                    discard error
+                    return .Err(.InvalidField)
+                }
+                .Ok(result)
+            }
+            _: .Err(.InvalidField)
+        }
+    }
+}
+
+fn requiredBool(
+    &object json.Object,
+    key String
+) Result<bool, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Err(.InvalidField)
+        Some(value): match value {
+            Bool(found): .Ok(found)
+            _: .Err(.InvalidField)
+        }
+    }
+}
+
+fn optionalStringList(
+    &object json.Object,
+    key String
+) Result<own collections.List<String>, MessageError> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Ok(collections.NewList<String>())
+        Some(value): match value {
+            Array(array): stringList($array)
+            _: .Err(.InvalidField)
+        }
+    }
+}
+
+fn stringList(
+    $source own json.Array
+) Result<own collections.List<String>, MessageError> {
+    var pending = source
+    var reversed = collections.NewList<String>()
+    while pending.Len() > 0 {
+        const value = jsonValue(pending.PopFront())
+        const found = jsonText($value) else error { return .Err(error) }
+        reversed.PushFront($found)
+    }
+    .Ok(reverseStrings($reversed))
+}
+
+fn optionalEnvironment(
+    &object json.Object
+) Result<own collections.List<Environment>, MessageError> {
+    const selected = object.Take("env")
+    match selected {
+        None: .Ok(collections.NewList<Environment>())
+        Some(value): match value {
+            Object(fields): environmentList($fields)
+            _: .Err(.InvalidField)
+        }
+    }
+}
+
+fn environmentList(
+    $source own json.Object
+) Result<own collections.List<Environment>, MessageError> {
+    var fields = source
+    var reversed = collections.NewList<Environment>()
+    while fields.Len() > 0 {
+        const key = optionString(fields.FirstKey())
+        const value = jsonValue(fields.Take(key))
+        const found = jsonText($value) else error { return .Err(error) }
+        reversed.PushFront(Environment { Name = key Value = found })
+    }
+    .Ok(reverseEnvironment($reversed))
+}
+
+fn reverseStrings(
+    $source own collections.List<String>
+) own collections.List<String> {
+    var pending = source
+    var result = collections.NewList<String>()
+    while !pending.IsEmpty() {
+        result.PushFront($stringValue(pending.PopFront()))
+    }
+    result
+}
+
+fn reverseEnvironment(
+    $source own collections.List<Environment>
+) own collections.List<Environment> {
+    var pending = source
+    var result = collections.NewList<Environment>()
+    while !pending.IsEmpty() {
+        result.PushFront($environmentValue(pending.PopFront()))
+    }
+    result
+}
+
+fn stringValue($value Option<String>) String {
+    match value {
+        None: panic("string list invariant failed")
+        Some(found): found
+    }
+}
+
+fn environmentValue($value Option<Environment>) Environment {
+    match value {
+        None: panic("environment list invariant failed")
+        Some(found): found
+    }
+}
+
+fn jsonValue($value Option<json.Value>) json.Value {
+    match value {
+        None: panic("JSON collection invariant failed")
+        Some(found): found
+    }
+}
+
+fn optionString($value Option<String>) String {
+    match value {
+        None: panic("JSON object invariant failed")
+        Some(found): found
+    }
+}

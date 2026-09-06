@@ -1,0 +1,21 @@
+package remolo.relay_server
+
+test "relay address accepts Go flag forms" {
+    const separated = parseOptions(["-addr", "127.0.0.1:9000"]) else error {
+        fail(error)
+    }
+    expect(separated.address == "127.0.0.1")
+    expect(separated.port == 9000)
+    const assigned = parseOptions(["--addr=:9001"]) else error {
+        fail(error)
+    }
+    expect(assigned.address == "0.0.0.0")
+    expect(assigned.port == 9001)
+}
+
+test "relay address defaults to the original port" {
+    const parsed = parseOptions(["--help"]) else error { fail(error) }
+    expect(parsed.address == "0.0.0.0")
+    expect(parsed.port == 8788)
+    expect(parsed.help)
+}

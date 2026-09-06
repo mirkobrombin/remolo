@@ -1,0 +1,218 @@
+package remolo.dirsync
+
+import std.bytes
+import std.collections
+import std.text
+
+enum EntryKind {
+    File
+    Directory
+    SymbolicLink
+}
+
+struct Entry {
+    Path String
+    Kind EntryKind
+    Size u64
+    Modified u64
+    Permissions u32
+    SHA256 String
+    Target String
+    DirectoryLink bool
+}
+
+struct Manifest {
+    entries own collections.List<Entry>
+    length i32
+
+    fn Len(self) i32 {
+        self.length
+    }
+
+    fn CountFiles(&self) i32 {
+        var source = replace self.entries with collections.NewList<Entry>()
+        var reversed = collections.NewList<Entry>()
+        var count i32 = 0
+        while !source.IsEmpty() {
+            const entry = requiredEntry(source.PopFront())
+            if isFile(entry.Kind) {
+                count += 1
+            }
+            reversed.PushFront($entry)
+        }
+        var restored = collections.NewList<Entry>()
+        while !reversed.IsEmpty() {
+            restored.PushFront(requiredEntry(reversed.PopFront()))
+        }
+        discard source
+        discard reversed
+        self.entries = restored
+        count
+    }
+
+    fn Find(&self, path String) Option<Entry> {
+        var source = replace self.entries with collections.NewList<Entry>()
+        var reversed = collections.NewList<Entry>()
+        var found Option<Entry> = .None
+        var selected = false
+        while !source.IsEmpty() {
+            const entry = requiredEntry(source.PopFront())
+            if !selected && text.Equal(entry.Path, path) {
+                found = .Some(copyEntry(entry))
+                selected = true
+            }
+            reversed.PushFront($entry)
+        }
+        var restored = collections.NewList<Entry>()
+        while !reversed.IsEmpty() {
+            restored.PushFront(requiredEntry(reversed.PopFront()))
+        }
+        discard source
+        discard reversed
+        self.entries = restored
+        found
+    }
+
+    fn Take(&self) Option<Entry> {
+        const value = self.entries.PopFront()
+        match value {
+            None: .None
+            Some(entry): {
+                self.length -= 1
+                .Some(entry)
+            }
+        }
+    }
+
+    fn add(&self, $entry Entry) void {
+        self.entries.PushFront($entry)
+        self.length += 1
+    }
+
+    fn sort(&self) void {
+        const current = replace self.entries with collections.NewList<Entry>()
+        self.entries = collections.Sort($current, compareEntries)
+    }
+}
+
+struct ManifestEncoding {
+    Manifest own Manifest
+    Data own bytes.Bytes
+}
+
+struct SignatureEncoding {
+    Signature own Signature
+    Data own bytes.Bytes
+}
+
+struct BlockSignature {
+    Index u64
+    Weak u64
+    StrongHigh u64
+    StrongLow u64
+}
+
+struct Signature {
+    BlockSize u64
+    blocks own collections.List<BlockSignature>
+    length i32
+
+    fn Len(self) i32 {
+        self.length
+    }
+
+    fn Take(&self) Option<BlockSignature> {
+        const value = self.blocks.PopFront()
+        match value {
+            None: .None
+            Some(block): {
+                self.length -= 1
+                .Some(block)
+            }
+        }
+    }
+
+    fn add(&self, block BlockSignature) void {
+        self.blocks.PushFront(block)
+        self.length += 1
+    }
+
+    fn reverse(&self) void {
+        var current = replace self.blocks with collections.NewList<BlockSignature>()
+        var restored = collections.NewList<BlockSignature>()
+        while !current.IsEmpty() {
+            restored.PushFront(requiredBlock(current.PopFront()))
+        }
+        discard current
+        self.blocks = restored
+    }
+}
+
+struct Delta {
+    Data own bytes.Bytes
+    LiteralBytes u64
+}
+
+fn newManifest() own Manifest {
+    own Manifest { entries = collections.NewList<Entry>() length = 0 }
+}
+
+fn newSignature(blockSize u64) own Signature {
+    own Signature {
+        BlockSize = blockSize
+        blocks = collections.NewList<BlockSignature>()
+        length = 0
+    }
+}
+
+fn requiredEntry($value Option<Entry>) Entry {
+    match value {
+        None: panic("dirsync entry invariant failed")
+        Some(entry): entry
+    }
+}
+
+fn requiredBlock($value Option<BlockSignature>) BlockSignature {
+    match value {
+        None: panic("dirsync block invariant failed")
+        Some(block): block
+    }
+}
+
+fn copyEntry(value Entry) Entry {
+    Entry {
+        Path = text.Copy(value.Path)
+        Kind = value.Kind
+        Size = value.Size
+        Modified = value.Modified
+        Permissions = value.Permissions
+        SHA256 = text.Copy(value.SHA256)
+        Target = text.Copy(value.Target)
+        DirectoryLink = value.DirectoryLink
+    }
+}
+
+fn compareEntries(left Entry, right Entry) i32 {
+    text.Compare(left.Path, right.Path)
+}
+
+fn isFile(value EntryKind) bool {
+    match value {
+        File: true
+        _: false
+    }
+}
+
+fn isDirectory(value EntryKind) bool {
+    match value {
+        Directory: true
+        _: false
+    }
+}
+
+fn isSymbolicLink(value EntryKind) bool {
+    match value {
+        SymbolicLink: true
+        _: false
+    }
+}

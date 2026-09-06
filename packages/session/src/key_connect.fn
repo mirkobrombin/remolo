@@ -1,0 +1,274 @@
+package remolo.session
+
+import remolo.identity
+import remolo.mux
+import remolo.protocol
+import remolo.token
+import remolo.transport
+import std.bytes
+import std.collections
+
+task ConnectKey(
+    $hostPublicKey own bytes.Bytes,
+    $candidates own collections.List<token.Candidate>,
+    $clientIdentity own identity.Identity
+) Result<own Client, Error> {
+    var pending = candidates
+    var failure Error = .NoCandidate
+    while !pending.IsEmpty() {
+        const candidate = candidateValue(pending.PopFront())
+        const token.Candidate { IP Port } = candidate
+        const transportKey = hostPublicKey.Copy() else error {
+            discard error
+            discard IP
+            discard pending
+            discard clientIdentity
+            return .Err(.Storage)
+        }
+        const clientKey = clientIdentity.PrivateKeyPEM.Copy() else error {
+            discard error
+            discard IP
+            discard pending
+            discard transportKey
+            discard clientIdentity
+            return .Err(.Storage)
+        }
+        const client = identity.FromPrivateKey($clientKey) else error {
+            discard error
+            discard IP
+            discard pending
+            discard transportKey
+            discard clientIdentity
+            return .Err(.Storage)
+        }
+        const dialing = spawn transport.DialSecure(
+            $IP,
+            u64.From(Port),
+            $transportKey
+        )
+        const dialed = $dialing.wait()
+        const secured = dialed else error {
+            discard error
+            discard client
+            continue
+        }
+        const authHostKey = hostPublicKey.Copy() else error {
+            discard error
+            discard secured
+            discard client
+            discard pending
+            discard clientIdentity
+            return .Err(.Storage)
+        }
+        const authenticating = spawn connectSecuredKey(
+            $secured,
+            $authHostKey,
+            $client
+        )
+        const result = $authenticating.wait()
+        match result {
+            Ok(value): {
+                discard pending
+                discard hostPublicKey
+                discard clientIdentity
+                return .Ok(value)
+            }
+            Err(error): { failure = error }
+        }
+    }
+    discard pending
+    discard hostPublicKey
+    discard clientIdentity
+    .Err(failure)
+}
+
+task connectSecuredKey(
+    $secured transport.SecureStream,
+    $hostPublicKey own bytes.Bytes,
+    $clientIdentity own identity.Identity
+) Result<own Client, Error> {
+    var session = mux.NewClient($secured)
+    const handle = session.Handle()
+    const opening = spawn mux.OpenChannel(
+        $handle.Clone(),
+        $protocol.NewOpen(.Control)
+    )
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        mux.Close($session)
+        discard hostPublicKey
+        discard clientIdentity
+        return .Err(.Multiplex)
+    }
+    const authenticating = spawn authenticateClientKey(
+        $stream,
+        $hostPublicKey,
+        $clientIdentity
+    )
+    const authenticated = $authenticating.wait()
+    const control = authenticated else error {
+        mux.Close($session)
+        return .Err(error)
+    }
+    const clientControl {
+        reader
+        writer
+        key
+        capabilities
+    } = control
+    .Ok(own Client {
+        session = session
+        handle = handle
+        controlReader = reader
+        controlWriter = writer
+        sessionKey = key
+        capabilities = capabilities
+        daemon = .None
+        route = .None
+        agent = .None
+    })
+}
+
+task authenticateClientKey(
+    $stream mux.Stream,
+    $hostPublicKey own bytes.Bytes,
+    $clientIdentity own identity.Identity
+) Result<clientControl, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const modePending = spawn writeRaw($Writer, $bytes.FromText("K"))
+    const modeResult = $modePending.wait()
+    const modeWriter = modeResult else error {
+        discard Reader
+        discard hostPublicKey
+        discard clientIdentity
+        return .Err(error)
+    }
+    const clientNonce = identity.GenerateAuthNonce() else error {
+        discard modeWriter
+        discard Reader
+        discard hostPublicKey
+        discard clientIdentity
+        return .Err(identityError(error))
+    }
+    const initial = joinKeyBytes(clientIdentity.RawPublicKey, clientNonce) else error {
+        discard modeWriter
+        discard Reader
+        discard hostPublicKey
+        discard clientIdentity
+        discard clientNonce
+        return .Err(error)
+    }
+    const initialPending = spawn writeRaw($modeWriter, $initial)
+    const writerResult = $initialPending.wait()
+    const activeWriter = writerResult else error {
+        discard Reader
+        discard hostPublicKey
+        discard clientIdentity
+        discard clientNonce
+        return .Err(error)
+    }
+    const responsePending = spawn readRaw($Reader, 96)
+    const responseResult = $responsePending.wait()
+    const response = responseResult else error {
+        discard activeWriter
+        discard hostPublicKey
+        discard clientIdentity
+        discard clientNonce
+        return .Err(error)
+    }
+    const rawRead { reader as activeReader value as responseValue } = response
+    const hostNonce = keySlice(responseValue, 0, 32) else error {
+        discard activeReader
+        discard activeWriter
+        discard hostPublicKey
+        discard clientIdentity
+        discard clientNonce
+        return .Err(error)
+    }
+    const hostSignature = keySlice(responseValue, 32, 96) else error {
+        discard activeReader
+        discard activeWriter
+        discard hostPublicKey
+        discard clientIdentity
+        discard clientNonce
+        discard hostNonce
+        return .Err(error)
+    }
+    const hostPEM = identity.PublicPEM(hostPublicKey) else error {
+        discard activeReader
+        discard activeWriter
+        discard hostPublicKey
+        discard clientIdentity
+        discard clientNonce
+        discard hostNonce
+        discard hostSignature
+        return .Err(identityError(error))
+    }
+    const proof = identity.ClientSignature(
+        clientIdentity,
+        hostPEM,
+        hostPublicKey,
+        clientNonce,
+        hostNonce,
+        hostSignature
+    ) else error {
+        discard activeReader
+        discard activeWriter
+        discard hostPublicKey
+        discard clientIdentity
+        discard clientNonce
+        discard hostNonce
+        return .Err(identityError(error))
+    }
+    const sessionKey = identity.SessionKey(
+        hostPublicKey,
+        clientIdentity.RawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        discard activeReader
+        discard activeWriter
+        discard hostPublicKey
+        discard clientIdentity
+        discard proof
+        return .Err(identityError(error))
+    }
+    discard hostPublicKey
+    discard clientIdentity
+    const proofPending = spawn writeRaw($activeWriter, $proof)
+    const proofResult = $proofPending.wait()
+    const proofWriter = proofResult else error {
+        discard activeReader
+        discard sessionKey
+        return .Err(error)
+    }
+    const capsPending = spawn mux.ReadFrame($activeReader)
+    const capsOutcome = $capsPending.wait()
+    const mux.FrameReadOutcome { Reader as restored Value } = capsOutcome
+    const frame = Value else error {
+        discard error
+        discard restored
+        discard proofWriter
+        discard sessionKey
+        return .Err(.Transport)
+    }
+    const protocol.Frame { Type Payload } = frame
+    const capabilities = match Type {
+        JSON: protocol.DecodeCapabilities(Payload)
+        _: .Err(.InvalidFrame)
+    } else error {
+        discard error
+        discard restored
+        discard proofWriter
+        discard sessionKey
+        return .Err(.Protocol)
+    }
+    .Ok(clientControl {
+        reader = restored
+        writer = proofWriter
+        key = sessionKey
+        capabilities = capabilities
+    })
+}

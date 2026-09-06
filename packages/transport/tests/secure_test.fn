@@ -1,0 +1,112 @@
+package remolo.transport
+
+import foundation.auth
+import std.bytes
+
+task acceptSecureOne($listener own SecureListener) SecureAcceptOutcome {
+    const pending = spawn AcceptSecure($listener)
+    const accepted = $pending.wait()
+    accepted
+}
+
+test "pinned TLS carries Remolo frames" {
+    const host = auth.GenerateOpenSSLEd25519() else { fail("identity failed") }
+    const listener = ListenSecure(
+        $"127.0.0.1",
+        0,
+        host.PrivateKeyPEM
+    ) else error { panic(secureFailure(error)) }
+    const port = listener.Port()
+    const pin = host.RawPublicKey.Copy() else { fail("pin copy failed") }
+    const accepting = spawn acceptSecureOne($listener)
+    const dialing = spawn DialSecure($"127.0.0.1", port, $pin)
+    const client = $dialing.wait() else { fail("secure dial failed") }
+    const accepted = $accepting.wait()
+    const SecureAcceptOutcome { Listener Value } = accepted
+    const server = Value else { fail("secure accept failed") }
+    const SecureStream {
+        Reader as clientReader
+        Writer as clientWriter
+        Controller as clientController
+        Peer as clientPeer
+    } = client
+    const SecureStream {
+        Reader as serverReader
+        Writer as serverWriter
+        Controller as serverController
+        Peer as serverPeer
+    } = server
+    expect(clientPeer == "127.0.0.1")
+    expect(serverPeer == "127.0.0.1")
+    const writing = spawn WriteSecureFrame(
+        $clientWriter,
+        .Data,
+        $bytes.FromText("hello over pinned TLS")
+    )
+    const reading = spawn ReadSecureFrame($serverReader)
+    const written = $writing.wait()
+    const read = $reading.wait()
+    const SecureWriteOutcome { Writer Value as writeValue } = written
+    const SecureReadOutcome { Reader Value as readValue } = read
+    match writeValue {
+        Ok: {}
+        Err(error): {
+            discard error
+            fail("secure frame write failed")
+        }
+    }
+    const frame = readValue else { fail("secure frame read failed") }
+    const payload = frame.Payload.Text() else { fail("secure payload failed") }
+    expect(payload == "hello over pinned TLS")
+    discard clientReader
+    discard clientController
+    discard Reader
+    discard Writer
+    discard serverWriter
+    discard serverController
+    discard Listener
+}
+
+test "pinned TLS rejects another host identity" {
+    const host = auth.GenerateOpenSSLEd25519() else { fail("host identity failed") }
+    const other = auth.GenerateOpenSSLEd25519() else { fail("other identity failed") }
+    const listener = ListenSecure(
+        $"127.0.0.1",
+        0,
+        host.PrivateKeyPEM
+    ) else error { panic(secureFailure(error)) }
+    const port = listener.Port()
+    const pin = other.RawPublicKey.Copy() else { fail("wrong pin copy failed") }
+    const accepting = spawn acceptSecureOne($listener)
+    const dialing = spawn DialSecure($"127.0.0.1", port, $pin)
+    const connected = $dialing.wait()
+    match connected {
+        Ok(stream): {
+            discard stream
+            fail("wrong pin was accepted")
+        }
+        Err(error): match error {
+            Refused: {}
+            _: fail("wrong pin returned wrong error")
+        }
+    }
+    const accepted = $accepting.wait()
+    const SecureAcceptOutcome { Listener Value } = accepted
+    discard Value
+    discard Listener
+}
+
+fn secureFailure(error Error) String {
+    match error {
+        InvalidAddress: "secure listen: invalid address"
+        ResolveFailed: "secure listen: resolve failed"
+        Refused: "secure listen: refused"
+        Closed: "secure listen: closed"
+        Cancelled: "secure listen: cancelled"
+        Timeout: "secure listen: timeout"
+        PayloadTooLarge: "secure listen: payload too large"
+        InvalidFrame: "secure listen: invalid frame"
+        AddressInUse: "secure listen: address in use"
+        Io: "secure listen: io"
+    }
+}

@@ -1,0 +1,184 @@
+package remolo.identity
+
+import foundation.auth
+import std.bytes
+import std.fs
+import std.path
+import std.text
+
+enum IdentityError {
+    InvalidKey
+    AuthenticationFailed
+    NotFound
+    Permission
+    Storage
+    EntropyUnavailable
+}
+
+struct Identity {
+    PrivateKeyPEM own bytes.Bytes
+    PublicKeyPEM own bytes.Bytes
+    RawPublicKey own bytes.Bytes
+
+    fn Sign(
+        self,
+        input bytes.Bytes
+    ) Result<own bytes.Bytes, IdentityError> {
+        var provider = auth.OpenSSLAsymmetricProvider {}
+        const signature = provider.Sign(
+            .EdDSA,
+            self.PrivateKeyPEM,
+            input
+        ) else error {
+            discard error
+            return .Err(.InvalidKey)
+        }
+        .Ok(signature)
+    }
+}
+
+fn Generate() Result<own Identity, IdentityError> {
+    const generated = auth.GenerateOpenSSLEd25519() else error {
+        discard error
+        return .Err(.EntropyUnavailable)
+    }
+    const auth.OpenSSLEd25519KeyPair {
+        PrivateKeyPEM
+        PublicKeyPEM
+        RawPublicKey
+    } = generated
+    .Ok(own Identity {
+        PrivateKeyPEM = PrivateKeyPEM
+        PublicKeyPEM = PublicKeyPEM
+        RawPublicKey = RawPublicKey
+    })
+}
+
+fn FromPrivateKey(
+    $privateKeyPEM own bytes.Bytes
+) Result<own Identity, IdentityError> {
+    const derived = auth.OpenSSLEd25519Public(privateKeyPEM) else error {
+        discard error
+        return .Err(.InvalidKey)
+    }
+    const auth.OpenSSLEd25519PublicKey {
+        PublicKeyPEM
+        RawPublicKey
+    } = derived
+    .Ok(own Identity {
+        PrivateKeyPEM = privateKeyPEM
+        PublicKeyPEM = PublicKeyPEM
+        RawPublicKey = RawPublicKey
+    })
+}
+
+fn PublicPEM(rawPublicKey bytes.Bytes) Result<own bytes.Bytes, IdentityError> {
+    const result = auth.OpenSSLEd25519PublicPEM(rawPublicKey) else error {
+        discard error
+        return .Err(.InvalidKey)
+    }
+    .Ok(result)
+}
+
+fn Verify(
+    publicKeyPEM bytes.Bytes,
+    input bytes.Bytes,
+    signature bytes.Bytes
+) Result<void, IdentityError> {
+    var provider = auth.OpenSSLAsymmetricProvider {}
+    provider.Verify(.EdDSA, publicKeyPEM, input, signature) else error {
+        return .Err(verificationError(error))
+    }
+    .Ok
+}
+
+task LoadOrCreate($destination String) Result<own Identity, IdentityError> {
+    const directory = path.Parent(destination)
+    const creating = spawn fs.CreatePrivateDirectory($directory)
+    const created = $creating.wait()
+    match created {
+        Ok: {}
+        Err(error): {
+            return .Err(fileError(error))
+        }
+    }
+    const reading = spawn fs.ReadPrivateTextLimited(text.Copy(destination), 65536)
+    const read = $reading.wait()
+    match read {
+        Ok(value): FromPrivateKey($bytes.FromText(value))
+        Err(error): {
+            const pending = spawn loadOrCreateMissing($destination, error)
+            const result = $pending.wait()
+            result
+        }
+    }
+}
+
+task loadOrCreateMissing(
+    $destination String,
+    error fs.Error
+) Result<own Identity, IdentityError> {
+    match error {
+        NotFound: {
+            const creating = spawn createIdentityAt($destination)
+            const created = $creating.wait()
+            created
+        }
+        Permission: .Err(.Permission)
+        InvalidPath: .Err(.Storage)
+        InvalidUtf8: .Err(.InvalidKey)
+        LineTooLong: .Err(.InvalidKey)
+        TooLarge: .Err(.InvalidKey)
+        InvalidInterval: .Err(.Storage)
+        ResourceLimit: .Err(.Storage)
+        Cancelled: .Err(.Storage)
+        Closed: .Err(.Storage)
+        Io: .Err(.Storage)
+    }
+}
+
+task createIdentityAt(
+    $destination String
+) Result<own Identity, IdentityError> {
+    const generated = Generate() else error { return .Err(error) }
+    const encoded = generated.PrivateKeyPEM.Text() else error {
+        discard error
+        return .Err(.InvalidKey)
+    }
+    const writing = spawn fs.WritePrivateTextAtomic(
+        $destination,
+        $encoded,
+        65536
+    )
+    const written = $writing.wait()
+    match written {
+        Ok: .Ok(generated)
+        Err(error): .Err(fileError(error))
+    }
+}
+
+fn verificationError(error auth.AsymmetricProviderError) IdentityError {
+    match error {
+        InvalidSignature: .AuthenticationFailed
+        InvalidPublicKey: .InvalidKey
+        InvalidPrivateKey: .InvalidKey
+        Unsupported: .Storage
+        Failed: .Storage
+    }
+}
+
+fn fileError(error fs.Error) IdentityError {
+    match error {
+        NotFound: .NotFound
+        Permission: .Permission
+        InvalidPath: .Storage
+        InvalidUtf8: .InvalidKey
+        LineTooLong: .InvalidKey
+        TooLarge: .Storage
+        InvalidInterval: .Storage
+        ResourceLimit: .Storage
+        Cancelled: .Storage
+        Closed: .Storage
+        Io: .Storage
+    }
+}

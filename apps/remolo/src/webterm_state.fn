@@ -1,0 +1,147 @@
+package remolo.cli
+
+import std.bytes
+
+enum outputRequest {
+    Append(value own bytes.Bytes)
+    Take(reply Sender<Option<own bytes.Bytes>>)
+}
+
+struct outputHandle {
+    sender Sender<outputRequest>
+
+    fn Clone(self) outputHandle {
+        outputHandle { sender = self.sender.clone() }
+    }
+}
+
+struct outputStore {
+    actor Task<void>
+    Handle outputHandle
+}
+
+fn newOutputStore() own outputStore {
+    const Channel { sender receiver } = channel<outputRequest>(64)
+    const actor = spawn serveOutput($receiver)
+    own outputStore {
+        actor = actor
+        Handle = outputHandle { sender = sender }
+    }
+}
+
+task appendOutput(
+    $handle outputHandle,
+    $value own bytes.Bytes
+) void {
+    const outputHandle { sender } = handle
+    var destination = sender
+    const delivered = destination.send(.Append(value = value))
+    match delivered {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
+task takeOutput(
+    $handle outputHandle
+) Option<own bytes.Bytes> {
+    const outputHandle { sender as endpoint } = handle
+    var destination = endpoint
+    const Channel { sender receiver } = channel<Option<own bytes.Bytes>>(0)
+    select {
+        destination.send(.Take(reply = sender)): {
+            const result = receiver.receive()
+            return match result {
+                Ok(value): value
+                Err(error): {
+                    discard error
+                    .None
+                }
+            }
+        }
+        else error: {
+            discard error
+            discard receiver
+            return .None
+        }
+    }
+}
+
+task serveOutput($receiver Receiver<outputRequest>) void {
+    var inbox = receiver
+    var pending Option<own bytes.Bytes> = .None
+    while true {
+        select {
+            const request = inbox.receive(): {
+                match request {
+                    Append(value): {
+                        pending = appendPending($pending, $value)
+                    }
+                    Take(reply): {
+                        const value = replace pending with .None
+                        discard reply.send($value)
+                    }
+                }
+            }
+            else error: {
+                discard error
+                return
+            }
+        }
+    }
+}
+
+fn appendPending(
+    $pending Option<own bytes.Bytes>,
+    $value own bytes.Bytes
+) Option<own bytes.Bytes> {
+    match pending {
+        None: .Some(value)
+        Some(current): appendBytes($current, $value)
+    }
+}
+
+fn appendBytes(
+    $current own bytes.Bytes,
+    $value own bytes.Bytes
+) Option<own bytes.Bytes> {
+    const currentLength = current.Len() else error {
+        discard error
+        discard current
+        return .Some(value)
+    }
+    const valueLength = value.Len() else error {
+        discard error
+        discard value
+        return .Some(current)
+    }
+    const limit u64 = 16777216
+    if valueLength > limit || currentLength > limit - valueLength {
+        discard current
+        return .Some(value)
+    }
+    const opened = bytes.NewBuilder(currentLength + valueLength) else error {
+        discard error
+        discard value
+        return .Some(current)
+    }
+    var builder = opened
+    builder.Write(current) else error {
+        discard error
+        discard value
+        return .Some(current)
+    }
+    builder.Write(value) else error {
+        discard error
+        discard value
+        return .Some(current)
+    }
+    const combined = builder.Finish() else error {
+        discard error
+        discard value
+        return .Some(current)
+    }
+    discard current
+    discard value
+    .Some(combined)
+}

@@ -1,0 +1,76 @@
+package remolo.codec
+
+import std.bytes
+
+test "CRC32C matches the Castagnoli check value" {
+    const checksum = CRC32C(bytes.FromText("123456789")) else error {
+        discard error
+        fail("checksum failed")
+    }
+    expect(checksum == 3808858755)
+}
+
+test "Crockford Base32 preserves arbitrary bytes" {
+    const source = bytes.FromText("foo")
+    const encoded = EncodeCrockford(source) else error {
+        discard error
+        fail("encoding failed")
+    }
+    expect(encoded == "CSQPY")
+    const decoded = DecodeCrockford("cs-qpy", 32) else error {
+        discard error
+        fail("decoding failed")
+    }
+    expect(bytes.ConstantTimeEqual(source, decoded))
+}
+
+test "Crockford Base32 folds ambiguous glyphs" {
+    const zero = DecodeCrockford("OO", 8) else error {
+        discard error
+        fail("zero glyph folding failed")
+    }
+    const one = DecodeCrockford("lO", 8) else error {
+        discard error
+        fail("one glyph folding failed")
+    }
+    const zeroByte = zero.At(0) else { fail("zero byte missing") }
+    const oneByte = one.At(0) else { fail("one byte missing") }
+    expect(zeroByte == 0)
+    expect(oneByte == 8)
+}
+
+test "Crockford Base32 rejects malformed input" {
+    match DecodeCrockford("!", 8) {
+        Ok(value): {
+            discard value
+            fail("invalid character was accepted")
+        }
+        Err(error): match error {
+            InvalidEncoding: {}
+            _: fail("wrong invalid character error")
+        }
+    }
+    match DecodeCrockford("0", 8) {
+        Ok(value): {
+            discard value
+            fail("impossible length was accepted")
+        }
+        Err(error): match error {
+            InvalidEncoding: {}
+            _: fail("wrong impossible length error")
+        }
+    }
+}
+
+test "Crockford Base32 enforces its output bound" {
+    match DecodeCrockford("CSQPY", 2) {
+        Ok(value): {
+            discard value
+            fail("oversized output was accepted")
+        }
+        Err(error): match error {
+            TooLarge: {}
+            _: fail("wrong output bound error")
+        }
+    }
+}

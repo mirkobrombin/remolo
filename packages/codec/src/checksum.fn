@@ -1,0 +1,34 @@
+package remolo.codec
+
+import std.bytes
+
+fn CRC32C(value bytes.Bytes) Result<u32, CodecError> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var checksum u32 = 4294967295
+    var offset u64 = 0
+    while offset < length {
+        const byte = value.At(offset) else error {
+            discard error
+            return .Err(.Storage)
+        }
+        const part = u32.From(byte) else error {
+            discard error
+            panic("byte conversion invariant failed")
+        }
+        checksum = checksum ^ part
+        var bit u8 = 0
+        while bit < 8 {
+            if (checksum & 1) == 1 {
+                checksum = checksum >> 1 ^ 2197175160
+            } else {
+                checksum = checksum >> 1
+            }
+            bit += 1
+        }
+        offset += 1
+    }
+    .Ok(~checksum)
+}

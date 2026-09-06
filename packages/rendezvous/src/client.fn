@@ -1,0 +1,130 @@
+package remolo.rendezvous
+
+import foundation.httpx
+import remolo.token
+import std.collections
+import std.text
+import std.time
+
+fn endpoint(baseURL String, path String) Result<String, Error> {
+    if text.IsEmpty(baseURL) return .Err(.InvalidRequest)
+    var end = text.ByteLen(baseURL)
+    while end > 0 {
+        const byte = text.ByteAt(baseURL, end - 1) else {
+            return .Err(.InvalidRequest)
+        }
+        if byte != 47 break
+        end -= 1
+    }
+    if end == 0 return .Err(.InvalidRequest)
+    const trimmed = text.Slice(baseURL, 0, end) else {
+        return .Err(.InvalidRequest)
+    }
+    .Ok(trimmed + path)
+}
+
+fn execute(
+    $request httpx.Request
+) Result<httpx.Response, Error> {
+    var builder = httpx.New<httpx.NetworkError>(httpx.Network())
+    const client = builder.Build()
+    const pending = client.Do($request)
+    const outcome = $pending.wait()
+    const httpx.DoOutcome { Client Value } = outcome
+    discard Client
+    match Value {
+        Ok(response): .Ok(response)
+        Err(error): {
+            discard error
+            .Err(.Transport)
+        }
+    }
+}
+
+// Publishes candidates for a session through the rendezvous HTTP protocol.
+fn Register(
+    baseURL String,
+    sessionID String,
+    candidates [token.Candidate]
+) Result<void, Error> {
+    const url = endpoint(baseURL, "/register") else error {
+        return .Err(error)
+    }
+    const body = encodeRegistration(sessionID, candidates) else error {
+        return .Err(error)
+    }
+    const created = httpx.NewRequest($"POST", $url, $body) else {
+        return .Err(.InvalidRequest)
+    }
+    var request = created
+    request.Timeout = time.Seconds(10)
+    request.SetHeader("Content-Type", "application/json") else {
+        return .Err(.InvalidRequest)
+    }
+    const response = execute($request) else error { return .Err(error) }
+    const httpx.Response { Status Headers Body } = response
+    discard Headers
+    discard Body
+    if Status == 200 || Status == 204 return .Ok
+    .Err(.Transport)
+}
+
+// Publishes a dynamically assembled candidate list for one session.
+fn RegisterCandidates(
+    baseURL String,
+    sessionID String,
+    $candidates own collections.List<token.Candidate>
+) Result<void, Error> {
+    const url = endpoint(baseURL, "/register") else error {
+        return .Err(error)
+    }
+    const body = encodeRegistrationCandidates(
+        sessionID,
+        $candidates
+    ) else error {
+        return .Err(error)
+    }
+    const created = httpx.NewRequest($"POST", $url, $body) else {
+        return .Err(.InvalidRequest)
+    }
+    var request = created
+    request.Timeout = time.Seconds(10)
+    request.SetHeader("Content-Type", "application/json") else {
+        return .Err(.InvalidRequest)
+    }
+    const response = execute($request) else error { return .Err(error) }
+    const httpx.Response { Status Headers Body } = response
+    discard Headers
+    discard Body
+    if Status == 200 || Status == 204 return .Ok
+    .Err(.Transport)
+}
+
+// Loads the candidates published for a session.
+fn Lookup(
+    baseURL String,
+    sessionID String
+) Result<own collections.List<token.Candidate>, Error> {
+    const base = endpoint(baseURL, "/lookup?session_id=") else error {
+        return .Err(error)
+    }
+    const created = httpx.NewRequest($"GET", $(base + sessionID), $"") else {
+        return .Err(.InvalidRequest)
+    }
+    var request = created
+    request.Timeout = time.Seconds(10)
+    const response = execute($request) else error { return .Err(error) }
+    const status = response.Status
+    if status == 404 {
+        discard response
+        return .Err(.NotFound)
+    }
+    if status != 200 {
+        discard response
+        return .Err(.Transport)
+    }
+    const body = response.TextBody() else {
+        return .Err(.InvalidRequest)
+    }
+    decodeLookup(body)
+}

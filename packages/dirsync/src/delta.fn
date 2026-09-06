@@ -1,0 +1,273 @@
+package remolo.dirsync
+
+import std.bytes
+
+fn BlockSize() u64 {
+    4096
+}
+
+fn BuildSignature(
+    source bytes.Bytes,
+    blockSize u64
+) Result<own Signature, Error> {
+    const size = normalizedBlockSize(blockSize)
+    if size > maxBlockData() return .Err(.InvalidSignature)
+    const length = source.Len() else error {
+        discard error
+        return .Err(.InvalidSignature)
+    }
+    var signature = newSignature(size)
+    var offset u64 = 0
+    var index u64 = 0
+    while offset < length {
+        var end = offset + size
+        if end > length {
+            end = length
+        }
+        const block = source.Slice(offset, end) else error {
+            discard error
+            discard signature
+            return .Err(.InvalidSignature)
+        }
+        const weak = weakSum(block) else error {
+            discard block
+            discard signature
+            return .Err(error)
+        }
+        const strong = strongHash(block) else error {
+            discard block
+            discard signature
+            return .Err(error)
+        }
+        discard block
+        signature.add(BlockSignature {
+            Index = index
+            Weak = weak
+            StrongHigh = strong.High
+            StrongLow = strong.Low
+        })
+        offset = end
+        index += 1
+    }
+    signature.reverse()
+    .Ok(signature)
+}
+
+fn WriteDelta(
+    source bytes.Bytes,
+    $value own Signature
+) Result<Delta, Error> {
+    var signature = value
+    const blockSize = normalizedBlockSize(signature.BlockSize)
+    if blockSize > maxBlockData() return .Err(.InvalidSignature)
+    var index = newWeakIndex()
+    while signature.Len() > 0 {
+        index.Insert(requiredBlock(signature.Take()))
+    }
+    discard signature
+    const length = source.Len() else error {
+        discard error
+        discard index
+        return .Err(.InvalidDelta)
+    }
+    const openedBuilder = bytes.NewBuilder(deltaLimit(length)) else error {
+        discard error
+        discard index
+        return .Err(.TooLarge)
+    }
+    var builder = openedBuilder
+    var literalBytes u64 = 0
+    var pending u64 = 0
+    var offset u64 = 0
+    var roll = rollingState { A = 0 B = 0 Ready = false }
+    while offset < length {
+        const end = offset + blockSize
+        if end > length {
+            offset = length
+            continue
+        }
+        if !roll.Ready {
+            const started = initialRoll(source, offset, end) else error {
+                discard builder
+                discard index
+                return .Err(error)
+            }
+            roll = started
+        }
+        const weak = (roll.B << 16) | roll.A
+        var matched Option<u64> = .None
+        if index.Has(weak) {
+            const strong = strongRange(source, offset, end) else error {
+                discard builder
+                discard index
+                return .Err(error)
+            }
+            matched = index.Find(weak, strong.High, strong.Low)
+        }
+        match matched {
+            Some(blockIndex): {
+                const written = writeLiteral(
+                    &builder,
+                    source,
+                    pending,
+                    offset
+                ) else error {
+                    discard builder
+                    discard index
+                    return .Err(error)
+                }
+                literalBytes += written
+                writeCopy(&builder, blockIndex) else error {
+                    discard builder
+                    discard index
+                    return .Err(error)
+                }
+                offset = end
+                pending = offset
+                roll.Ready = false
+            }
+            None: {
+                if end < length {
+                    roll = advanceRoll(
+                        roll,
+                        byteValue(source, offset),
+                        byteValue(source, end),
+                        blockSize
+                    )
+                } else {
+                    roll.Ready = false
+                }
+                offset += 1
+            }
+        }
+    }
+    const written = writeLiteral(
+        &builder,
+        source,
+        pending,
+        length
+    ) else error {
+        discard builder
+        discard index
+        return .Err(error)
+    }
+    literalBytes += written
+    builder.WriteByte(3) else error {
+        discard error
+        discard builder
+        discard index
+        return .Err(.TooLarge)
+    }
+    discard index
+    const data = builder.Finish() else error {
+        discard error
+        discard builder
+        return .Err(.InvalidDelta)
+    }
+    discard builder
+    .Ok(Delta { Data = data LiteralBytes = literalBytes })
+}
+
+// fcs:ignore FCS6001 Delta validation keeps opcode state and output bounds in one flow.
+fn ApplyDelta(
+    base bytes.Bytes,
+    delta bytes.Bytes,
+    expectedSize u64,
+    blockSize u64
+) Result<own bytes.Bytes, Error> {
+    const size = normalizedBlockSize(blockSize)
+    if size > maxBlockData() return .Err(.InvalidDelta)
+    const openedBuilder = bytes.NewBuilder(expectedSize) else error {
+        discard error
+        return .Err(.TooLarge)
+    }
+    var builder = openedBuilder
+    const baseLength = base.Len() else error {
+        discard error
+        discard builder
+        return .Err(.InvalidDelta)
+    }
+    const deltaLength = delta.Len() else error {
+        discard error
+        discard builder
+        return .Err(.InvalidDelta)
+    }
+    var offset u64 = 0
+    var outputLength u64 = 0
+    var complete = false
+    while offset < deltaLength && !complete {
+        const op = byteValue(delta, offset)
+        offset += 1
+        if op == 3 {
+            complete = true
+            continue
+        }
+        if op == 1 {
+            const length = readU32(delta, offset) else error {
+                return .Err(error)
+            }
+            offset += 4
+            if length > maxBlockData() || offset + length > deltaLength {
+                return .Err(.InvalidDelta)
+            }
+            if outputLength + length > expectedSize {
+                return .Err(.TooLarge)
+            }
+            const chunk = delta.Slice(offset, offset + length) else error {
+                discard error
+                return .Err(.InvalidDelta)
+            }
+            builder.Write(chunk) else error {
+                discard error
+                discard chunk
+                return .Err(.TooLarge)
+            }
+            discard chunk
+            outputLength += length
+            offset += length
+            continue
+        }
+        if op == 2 {
+            const blockIndex = readU32(delta, offset) else error {
+                return .Err(error)
+            }
+            offset += 4
+            const start = blockIndex * size
+            if start >= baseLength {
+                return .Err(.InvalidDelta)
+            }
+            var end = start + size
+            if end > baseLength {
+                end = baseLength
+            }
+            const length = end - start
+            if outputLength + length > expectedSize {
+                return .Err(.TooLarge)
+            }
+            const block = base.Slice(start, end) else error {
+                discard error
+                return .Err(.InvalidDelta)
+            }
+            builder.Write(block) else error {
+                discard error
+                discard block
+                return .Err(.TooLarge)
+            }
+            discard block
+            outputLength += length
+            continue
+        }
+        return .Err(.InvalidDelta)
+    }
+    if !complete || offset != deltaLength || outputLength != expectedSize {
+        discard builder
+        return .Err(.InvalidDelta)
+    }
+    const result = builder.Finish() else error {
+        discard error
+        discard builder
+        return .Err(.InvalidDelta)
+    }
+    discard builder
+    .Ok(result)
+}

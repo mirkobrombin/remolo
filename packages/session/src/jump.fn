@@ -1,0 +1,236 @@
+package remolo.session
+
+import foundation.worker
+import remolo.token
+import remolo.transport
+import remolo.tunnel
+import std.bytes
+import std.collections
+import std.net
+import std.process
+
+struct RouteOwner {
+    supervisor own worker.Supervisor
+    stop Sender<void>
+    controller Option<own net.TcpListenerController>
+    processController Option<own process.PTYController>
+
+    fn Stop(&self) void {
+        const selected = replace self.controller with .None
+        match selected {
+            Some(value): {
+                var controller = value
+                discard controller.Close()
+                discard controller
+            }
+            None: {}
+        }
+        const selectedProcess = replace self.processController with .None
+        match selectedProcess {
+            Some(value): {
+                var controller = value
+                discard controller.Abort()
+                discard controller
+            }
+            None: {}
+        }
+        const Channel { sender receiver } = channel<void>(1)
+        const stop = replace self.stop with sender
+        discard receiver
+        const signaling = spawn signalRouteStop($stop)
+        discard $signaling.wait()
+        const supervisor = replace self.supervisor with worker.NewSupervisor()
+        const stopping = supervisor.CancelTask()
+        discard $stopping.wait()
+    }
+
+    fn drop(&self) void {
+        self.Stop()
+    }
+}
+
+task signalRouteStop($stop Sender<void>) void {
+    discard stop.send()
+}
+
+task holdRouteClient(
+    $client own Client,
+    $stop Receiver<void>
+) void {
+    var stopping = stop
+    discard stopping.receive()
+    discard stopping
+    CloseClient($client)
+}
+
+task ConnectViaJump(
+    $target own token.Token,
+    $bastion own token.Token
+) Result<own Client, Error> {
+    if target.Expired() {
+        discard bastion
+        return .Err(.Expired)
+    }
+    const connecting = spawn Connect($bastion)
+    const connectionResult = $connecting.wait()
+    const jump = connectionResult else error {
+        discard target
+        return .Err(error)
+    }
+    const token.Token {
+        Version
+        HostPublicKey
+        PSK
+        Candidates
+        SessionID
+        Expiry
+        Rendezvous
+    } = target
+    discard Version
+    discard SessionID
+    discard Expiry
+    discard Rendezvous
+    const result = connectJumpCandidates(
+        $jump,
+        $Candidates,
+        $HostPublicKey,
+        $PSK
+    )
+    result
+}
+
+fn connectJumpCandidates(
+    $jump own Client,
+    $candidates own collections.List<token.Candidate>,
+    $hostPublicKey own bytes.Bytes,
+    $psk own bytes.Bytes
+) Result<own Client, Error> {
+    var pending = candidates
+    var bastion = jump
+    if pending.IsEmpty() {
+        CloseClient($bastion)
+        discard pending
+        discard hostPublicKey
+        discard psk
+        return .Err(.NoCandidate)
+    }
+    const candidate = candidateValue(pending.PopFront())
+    const token.Candidate { IP Port } = candidate
+    const endpoint = net.Endpoint { Host = IP Port = Port }
+    const target = endpoint.Address()
+    const forward = tunnel.ListenLocal(
+        bastion.Handle(),
+        $"127.0.0.1",
+        0,
+        $target
+    ) else error {
+        discard error
+        return connectJumpCandidates(
+            $bastion,
+            $pending,
+            $hostPublicKey,
+            $psk
+        )
+    }
+    const port = forward.Port()
+    const openedController = forward.Control() else error {
+        discard error
+        discard forward
+        return connectJumpCandidates(
+            $bastion,
+            $pending,
+            $hostPublicKey,
+            $psk
+        )
+    }
+    var controller = openedController
+    const supervisor = worker.NewSupervisor()
+    supervisor.Start(spawn serveLocalRoute($forward))
+    const transportKey = hostPublicKey.Copy() else error {
+        discard error
+        discard controller.Close()
+        const stopping = supervisor.CancelTask()
+        discard $stopping.wait()
+        CloseClient($bastion)
+        discard pending
+        discard psk
+        return .Err(.Storage)
+    }
+    const dialing = spawn transport.DialSecure(
+        $"127.0.0.1",
+        port,
+        $transportKey
+    )
+    const dialResult = $dialing.wait()
+    const secured = dialResult else error {
+        discard error
+        discard controller.Close()
+        const stopping = supervisor.CancelTask()
+        discard $stopping.wait()
+        return connectJumpCandidates(
+            $bastion,
+            $pending,
+            $hostPublicKey,
+            $psk
+        )
+    }
+    const authPSK = psk.Copy() else error {
+        discard error
+        discard secured
+        discard controller.Close()
+        const stopping = supervisor.CancelTask()
+        discard $stopping.wait()
+        CloseClient($bastion)
+        discard pending
+        return .Err(.Storage)
+    }
+    const authKey = hostPublicKey.Copy() else error {
+        discard error
+        discard secured
+        discard authPSK
+        discard controller.Close()
+        const stopping = supervisor.CancelTask()
+        discard $stopping.wait()
+        CloseClient($bastion)
+        discard pending
+        return .Err(.Storage)
+    }
+    const authenticating = spawn connectSecured(
+        $secured,
+        $authPSK,
+        $authKey
+    )
+    const connected = $authenticating.wait()
+    const client = connected else error {
+        discard error
+        discard controller.Close()
+        const stopping = supervisor.CancelTask()
+        discard $stopping.wait()
+        return connectJumpCandidates(
+            $bastion,
+            $pending,
+            $hostPublicKey,
+            $psk
+        )
+    }
+    const Channel { sender receiver } = channel<void>(1)
+    supervisor.Start(spawn holdRouteClient($bastion, $receiver))
+    const owner = own RouteOwner {
+        supervisor = supervisor
+        stop = sender
+        controller = .Some(controller)
+        processController = .None
+    }
+    var result = client
+    result.route = .Some(owner)
+    discard pending
+    discard hostPublicKey
+    discard psk
+    .Ok(result)
+}
+
+task serveLocalRoute($forward own tunnel.LocalForward) void {
+    const serving = spawn tunnel.ServeLocal($forward)
+    const result = $serving.wait()
+    discard result
+}

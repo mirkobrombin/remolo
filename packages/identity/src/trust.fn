@@ -1,0 +1,421 @@
+package remolo.identity
+
+import std.bytes
+import std.collections
+import std.env
+import std.fs
+import std.path
+import std.text
+
+struct AuthorizedEntry {
+    PublicKey own bytes.Bytes
+    Label String
+}
+
+struct Authorized {
+    Path String
+    Entries own collections.List<AuthorizedEntry>
+
+    fn Contains(&self, publicKey bytes.Bytes) bool {
+        var pending = replace self.Entries with collections.NewList<AuthorizedEntry>()
+        var restored = collections.NewList<AuthorizedEntry>()
+        var found = false
+        while !pending.IsEmpty() {
+            const current = authorizedValue(pending.PopFront())
+            if bytesEqual(current.PublicKey, publicKey) {
+                found = true
+            }
+            restored.PushFront($current)
+        }
+        discard pending
+        self.Entries = reverseAuthorized($restored)
+        found
+    }
+
+    fn TakeEntries(&self) own collections.List<AuthorizedEntry> {
+        const values = replace self.Entries with collections.NewList<AuthorizedEntry>()
+        collections.Sort($values, compareAuthorized)
+    }
+}
+
+fn DefaultHostKeyPath() String {
+    configPath("host.key")
+}
+
+fn DefaultClientKeyPath() String {
+    configPath("client.key")
+}
+
+fn DefaultAuthorizedPath() String {
+    configPath("authorized_clients")
+}
+
+fn DefaultKnownHostsPath() String {
+    configPath("known_hosts")
+}
+
+fn configPath(name String) String {
+    const configured = env.Get("XDG_CONFIG_HOME") else error {
+        discard error
+        return homePath(name)
+    }
+    match configured {
+        Some(root): path.Join(path.Join(root, "remolo"), name)
+        None: homePath(name)
+    }
+}
+
+fn homePath(name String) String {
+    const home = env.Home() else error {
+        discard error
+        return path.Join(path.Join(".config", "remolo"), name)
+    }
+    match home {
+        Some(root): path.Join(path.Join(path.Join(root, ".config"), "remolo"), name)
+        None: path.Join(path.Join(".config", "remolo"), name)
+    }
+}
+
+task LoadAuthorized($source String) Result<own Authorized, IdentityError> {
+    const storedPath = text.Copy(source)
+    const reading = spawn fs.ReadPrivateTextLimited($source, 1048576)
+    const result = $reading.wait()
+    match result {
+        Ok(value): parseAuthorized($storedPath, value)
+        Err(error): loadAuthorizedFailure($storedPath, error)
+    }
+}
+
+task AddAuthorized(
+    $source String,
+    $publicKey own bytes.Bytes,
+    $label String
+) Result<bool, IdentityError> {
+    const loading = spawn LoadAuthorized($text.Copy(source))
+    const loaded = $loading.wait()
+    const value = loaded else error {
+        discard publicKey
+        return .Err(error)
+    }
+    var authorized = value
+    if authorized.Contains(publicKey) {
+        discard publicKey
+        return .Ok(false)
+    }
+    authorized.Entries.PushFront($AuthorizedEntry {
+        PublicKey = publicKey
+        Label = label
+    })
+    const saving = spawn saveAuthorized($authorized, $source)
+    const saved = $saving.wait()
+    match saved {
+        Ok: .Ok(true)
+        Err(error): .Err(error)
+    }
+}
+
+task RemoveAuthorized(
+    $source String,
+    $fingerprint String
+) Result<String, IdentityError> {
+    const loading = spawn LoadAuthorized($text.Copy(source))
+    const loaded = $loading.wait()
+    const value = loaded else error { return .Err(error) }
+    var authorized = value
+    var pending = replace authorized.Entries with collections.NewList<AuthorizedEntry>()
+    var remaining = collections.NewList<AuthorizedEntry>()
+    var removed = ""
+    while !pending.IsEmpty() {
+        const current = authorizedValue(pending.PopFront())
+        const currentFingerprint = Fingerprint(current.PublicKey) else error {
+            discard error
+            remaining.PushFront($current)
+            continue
+        }
+        if text.IsEmpty(removed) && fingerprintMatches(fingerprint, currentFingerprint) {
+            removed = currentFingerprint
+            discard current
+        } else {
+            remaining.PushFront($current)
+        }
+    }
+    discard pending
+    authorized.Entries = reverseAuthorized($remaining)
+    if text.IsEmpty(removed) {
+        discard authorized
+        return .Err(.NotFound)
+    }
+    const saving = spawn saveAuthorized($authorized, $source)
+    const saved = $saving.wait()
+    match saved {
+        Ok: .Ok(removed)
+        Err(error): .Err(error)
+    }
+}
+
+fn Fingerprint(publicKey bytes.Bytes) Result<String, IdentityError> {
+    var digest = bytes.NewSha256()
+    digest.WriteBytes(publicKey) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const value = digest.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const encoded = bytes.EncodeBase64(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}
+
+fn parseAuthorized(
+    $source String,
+    document String
+) Result<own Authorized, IdentityError> {
+    var result = own Authorized {
+        Path = source
+        Entries = collections.NewList<AuthorizedEntry>()
+    }
+    const length = text.ByteLen(document)
+    var start u64 = 0
+    while start < length {
+        const end = lineEnd(document, start)
+        const line = textRange(document, start, end) else error {
+            return .Err(error)
+        }
+        parseAuthorizedLine(&result, line) else error {
+            return .Err(error)
+        }
+        start = end + 1
+    }
+    .Ok(result)
+}
+
+fn parseAuthorizedLine(
+    &authorized Authorized,
+    source String
+) Result<void, IdentityError> {
+    const start = skipSpace(source, 0)
+    const length = text.ByteLen(source)
+    if start >= length return .Ok
+    if textByte(source, start) == 35 return .Ok
+    const keyEnd = fieldEnd(source, start)
+    if keyEnd == start return .Err(.InvalidKey)
+    const encoded = textRange(source, start, keyEnd) else error {
+        return .Err(error)
+    }
+    const publicKey = bytes.DecodeBase64(encoded) else error {
+        discard error
+        return .Err(.InvalidKey)
+    }
+    const keyLength = publicKey.Len() else error {
+        discard error
+        return .Err(.InvalidKey)
+    }
+    if keyLength != 32 {
+        discard publicKey
+        return .Err(.InvalidKey)
+    }
+    const labelStart = skipSpace(source, keyEnd)
+    var label = ""
+    if labelStart < length {
+        const extracted = textRange(
+            source,
+            labelStart,
+            trimEnd(source, labelStart)
+        ) else error {
+            discard publicKey
+            return .Err(error)
+        }
+        label = extracted
+    }
+    authorized.Entries.PushFront($AuthorizedEntry {
+        PublicKey = publicKey
+        Label = label
+    })
+    .Ok
+}
+
+task saveAuthorized(
+    $authorized own Authorized,
+    $destination String
+) Result<void, IdentityError> {
+    const Authorized { Path Entries } = authorized
+    discard Path
+    var pending = collections.Sort($Entries, compareAuthorized)
+    var document = "# remolo authorized clients: one base64 Ed25519 public key per line\n"
+    while !pending.IsEmpty() {
+        const entry = authorizedValue(pending.PopFront())
+        const AuthorizedEntry { PublicKey Label } = entry
+        const encoded = bytes.EncodeBase64(PublicKey) else error {
+            discard error
+            return .Err(.Storage)
+        }
+        document = document + encoded
+        if !text.IsEmpty(Label) { document = document + " " + Label }
+        document = document + "\n"
+    }
+    const directory = path.Parent(destination)
+    const creating = spawn fs.CreatePrivateDirectory($directory)
+    const created = $creating.wait()
+    match created {
+        Ok: {}
+        Err(error): {
+            discard error
+            return .Err(.Storage)
+        }
+    }
+    const writing = spawn fs.WritePrivateTextAtomic(
+        $destination,
+        $document,
+        1048576
+    )
+    const result = $writing.wait()
+    match result {
+        Ok: .Ok
+        Err(error): {
+            discard error
+            .Err(.Storage)
+        }
+    }
+}
+
+fn loadAuthorizedFailure(
+    $source String,
+    error fs.Error
+) Result<own Authorized, IdentityError> {
+    match error {
+        NotFound: .Ok(own Authorized {
+            Path = source
+            Entries = collections.NewList<AuthorizedEntry>()
+        })
+        Permission: .Err(.Permission)
+        InvalidUtf8: .Err(.InvalidKey)
+        _: .Err(.Storage)
+    }
+}
+
+fn fingerprintMatches(expected String, actual String) bool {
+    if expected == actual return true
+    if text.ByteLen(expected) < 6 return false
+    text.StartsWith(actual, expected)
+}
+
+fn compareAuthorized(left AuthorizedEntry, right AuthorizedEntry) i32 {
+    const leftKey = bytes.EncodeBase64(left.PublicKey) else error {
+        discard error
+        return 0
+    }
+    const rightKey = bytes.EncodeBase64(right.PublicKey) else error {
+        discard error
+        return 0
+    }
+    text.Compare(leftKey, rightKey)
+}
+
+fn bytesEqual(left bytes.Bytes, right bytes.Bytes) bool {
+    const leftLength = left.Len() else error {
+        discard error
+        return false
+    }
+    const rightLength = right.Len() else error {
+        discard error
+        return false
+    }
+    if leftLength != rightLength return false
+    var index u64 = 0
+    while index < leftLength {
+        const leftByte = left.At(index) else error {
+            discard error
+            return false
+        }
+        const rightByte = right.At(index) else error {
+            discard error
+            return false
+        }
+        if leftByte != rightByte return false
+        index += 1
+    }
+    true
+}
+
+fn lineEnd(value String, start u64) u64 {
+    const length = text.ByteLen(value)
+    var offset = start
+    while offset < length && textByte(value, offset) != 10 {
+        offset += 1
+    }
+    offset
+}
+
+fn skipSpace(value String, start u64) u64 {
+    const length = text.ByteLen(value)
+    var offset = start
+    while offset < length && fieldSpace(textByte(value, offset)) {
+        offset += 1
+    }
+    offset
+}
+
+fn fieldEnd(value String, start u64) u64 {
+    const length = text.ByteLen(value)
+    var offset = start
+    while offset < length && !fieldSpace(textByte(value, offset)) {
+        offset += 1
+    }
+    offset
+}
+
+fn trimEnd(value String, start u64) u64 {
+    var offset = text.ByteLen(value)
+    while offset > start && fieldSpace(textByte(value, offset - 1)) {
+        offset -= 1
+    }
+    offset
+}
+
+fn fieldSpace(value u64) bool {
+    value == 32 || value == 9 || value == 13
+}
+
+fn textByte(value String, index u64) u64 {
+    const result = text.ByteAt(value, index) else error {
+        discard error
+        panic("trust text index is out of range")
+    }
+    result
+}
+
+fn textRange(
+    value String,
+    start u64,
+    end u64
+) Result<String, IdentityError> {
+    const result = text.Slice(value, start, end) else error {
+        discard error
+        return .Err(.InvalidKey)
+    }
+    .Ok(result)
+}
+
+fn authorizedValue(
+    $value Option<AuthorizedEntry>
+) AuthorizedEntry {
+    match value {
+        Some(found): found
+        None: { panic("authorized entry invariant failed") }
+    }
+}
+
+fn reverseAuthorized(
+    $values own collections.List<AuthorizedEntry>
+) own collections.List<AuthorizedEntry> {
+    var pending = values
+    var result = collections.NewList<AuthorizedEntry>()
+    while !pending.IsEmpty() {
+        result.PushFront($authorizedValue(pending.PopFront()))
+    }
+    result
+}

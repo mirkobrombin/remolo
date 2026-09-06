@@ -1,0 +1,190 @@
+package remolo.discovery
+
+import remolo.token
+import std.bytes
+import std.collections
+import std.net
+import std.text
+import std.time
+
+fn multicastAddress() String {
+    "224.0.0.251"
+}
+
+fn multicastPort() u64 {
+    5353
+}
+
+fn openMulticast() Result<own net.UdpSocket, Error> {
+    const socket = net.OpenDatagram($"0.0.0.0", multicastPort(), true) else {
+        return .Err(.Network)
+    }
+    var opened = socket
+    opened.JoinIPv4Multicast(multicastAddress()) else {
+        discard opened
+        return .Err(.Network)
+    }
+    .Ok(opened)
+}
+
+fn takeString($value Option<String>) String {
+    match value {
+        None: panic("discovery address invariant failed")
+        Some(address): address
+    }
+}
+
+task localIPv4() Result<String, Error> {
+    const listing = spawn net.LocalAddresses(false)
+    const waited = $listing.wait()
+    const result = waited else {
+        return .Err(.Network)
+    }
+    var addresses = result
+    while !addresses.IsEmpty() {
+        const address = takeString(addresses.PopFront())
+        if !text.Contains(address, ":") {
+            discard addresses
+            return .Ok(address)
+        }
+        discard address
+    }
+    .Err(.NoAddress)
+}
+
+task sendPacket(
+    $socket own net.UdpSocket,
+    $value own bytes.Bytes
+) Result<own net.UdpSocket, Error> {
+    const sending = spawn net.SendDatagram(
+        $socket,
+        $multicastAddress(),
+        multicastPort(),
+        $value
+    )
+    const outcome = $sending.wait()
+    const net.DatagramSendOutcome { Socket Value } = outcome
+    Value else {
+        discard Socket
+        return .Err(.Network)
+    }
+    .Ok(Socket)
+}
+
+// Announces one session through DNS-SD until its task is cancelled.
+task Advertise($session String, port u16) Result<void, Error> {
+    const finding = spawn localIPv4()
+    const found = $finding.wait()
+    const address = found else error { return .Err(error) }
+    const response = Response(session, address, port) else error {
+        return .Err(error)
+    }
+    discard address
+    const opened = openMulticast() else error { return .Err(error) }
+    var socket = opened
+    const announcement = response.Copy() else { return .Err(.InvalidPacket) }
+    const announcing = spawn sendPacket($socket, $announcement)
+    const announcementResult = $announcing.wait()
+    const announced = announcementResult else error { return .Err(error) }
+    socket = announced
+    while true {
+        const deadline = net.DeadlineAfter(time.Milliseconds(250)) else {
+            discard socket
+            return .Err(.Network)
+        }
+        const receiving = spawn net.ReceiveDatagramUntil(
+            $socket,
+            4096,
+            deadline
+        )
+        const received = $receiving.wait()
+        const net.DatagramReceiveOutcome {
+            Socket as returned
+            Value
+        } = received
+        socket = returned
+        const datagram = Value else error {
+            match error {
+                Timeout: { continue }
+                _: {
+                    discard socket
+                    return .Err(.Network)
+                }
+            }
+        }
+        const shouldReply = IsQuery(datagram.Data)
+        discard datagram
+        if !shouldReply continue
+        const reply = response.Copy() else {
+            discard socket
+            return .Err(.InvalidPacket)
+        }
+        const replying = spawn sendPacket($socket, $reply)
+        const replyResult = $replying.wait()
+        const replied = replyResult else error {
+            return .Err(error)
+        }
+        socket = replied
+    }
+    .Ok
+}
+
+// Browses the local segment for one authenticated session identifier.
+task Browse(
+    $session String,
+    window time.Duration
+) Result<own collections.List<token.Candidate>, Error> {
+    const opened = openMulticast() else error { return .Err(error) }
+    var socket = opened
+    const query = Query() else error {
+        discard socket
+        return .Err(error)
+    }
+    const querying = spawn sendPacket($socket, $query)
+    const queryResult = $querying.wait()
+    const queried = queryResult else error { return .Err(error) }
+    socket = queried
+    const deadline = net.DeadlineAfter(window) else {
+        discard socket
+        return .Err(.Network)
+    }
+    while true {
+        const receiving = spawn net.ReceiveDatagramUntil(
+            $socket,
+            4096,
+            deadline
+        )
+        const received = $receiving.wait()
+        const net.DatagramReceiveOutcome {
+            Socket as returned
+            Value
+        } = received
+        socket = returned
+        match Value {
+            Err(error): match error {
+                Timeout: {
+                    discard socket
+                    return .Ok(collections.NewList<token.Candidate>())
+                }
+                _: {
+                    discard socket
+                    return .Err(.Network)
+                }
+            }
+            Ok(datagram): {
+                const found = Candidate(datagram.Data, session)
+                discard datagram
+                match found {
+                    Err(error): { discard error }
+                    Ok(candidate): {
+                        var result = collections.NewList<token.Candidate>()
+                        result.PushFront($candidate)
+                        discard socket
+                        return .Ok(result)
+                    }
+                }
+            }
+        }
+    }
+    .Ok(collections.NewList<token.Candidate>())
+}

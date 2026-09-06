@@ -1,0 +1,154 @@
+package remolo.crypto
+
+import std.bytes
+
+fn sequence(start u64, count u64) own bytes.Bytes {
+    const opened = bytes.NewBuilder(count) else {
+        panic("sequence builder failed")
+    }
+    var builder = opened
+    var offset u64 = 0
+    while offset < count {
+        builder.WriteByte(start + offset) else {
+            panic("sequence byte failed")
+        }
+        offset += 1
+    }
+    const result = builder.Finish() else {
+        panic("sequence finish failed")
+    }
+    result
+}
+
+fn expectBase64(value bytes.Bytes, expected String) void {
+    const encoded = bytes.EncodeBase64(value) else {
+        fail("base64 encoding failed")
+    }
+    expect(encoded == expected)
+}
+
+fn flipFirst(value bytes.Bytes) own bytes.Bytes {
+    const length = value.Len() else { panic("value length failed") }
+    const opened = bytes.NewBuilder(length) else { panic("builder failed") }
+    var builder = opened
+    var index u64 = 0
+    while index < length {
+        const source = value.At(index) else { panic("value byte failed") }
+        var next = source
+        if index == 0 {
+            next = source ^ 1
+        }
+        builder.WriteByte(next) else { panic("write failed") }
+        index += 1
+    }
+    const result = builder.Finish() else { panic("finish failed") }
+    result
+}
+
+test "handshake matches the Go HMAC vectors" {
+    const psk = sequence(0, 32)
+    const hostPublicKey = sequence(32, 32)
+    const clientNonce = sequence(64, 32)
+    const hostNonce = sequence(96, 32)
+    const response = HostResponse(psk, hostPublicKey, clientNonce, hostNonce) else {
+        fail("host response failed")
+    }
+    const hostProof = response.Slice(32, 64) else { fail("host proof missing") }
+    expectBase64(hostProof, "LRctyOLiwfq1ZeBkK/hCMSaZbRJYtH7iu3h+v/9NIBo=")
+    const client = FinishClient(psk, hostPublicKey, clientNonce, response) else {
+        fail("client finish failed")
+    }
+    expectBase64(client.Proof, "5pJ6XrKrDPuXhNcn/YW2iWi0MZ+TsUD3O2TfuN4CO3g=")
+    expectBase64(client.SessionKey, "LkPDYaFzj6bf8iDtxrsRvP5TYkmYCI53ipmooe4r27I=")
+}
+
+test "both peers derive the same session key" {
+    const psk = sequence(0, 32)
+    const hostPublicKey = sequence(32, 32)
+    const clientNonce = sequence(64, 32)
+    const hostNonce = sequence(96, 32)
+    const response = HostResponse(psk, hostPublicKey, clientNonce, hostNonce) else {
+        fail("host response failed")
+    }
+    const client = FinishClient(psk, hostPublicKey, clientNonce, response) else {
+        fail("client finish failed")
+    }
+    const serverKey = FinishHost(
+        psk,
+        hostPublicKey,
+        clientNonce,
+        hostNonce,
+        client.Proof
+    ) else {
+        fail("server finish failed")
+    }
+    expect(bytes.ConstantTimeEqual(client.SessionKey, serverKey))
+}
+
+test "client rejects a changed host proof" {
+    const psk = sequence(0, 32)
+    const hostPublicKey = sequence(32, 32)
+    const clientNonce = sequence(64, 32)
+    const hostNonce = sequence(96, 32)
+    const response = HostResponse(psk, hostPublicKey, clientNonce, hostNonce) else {
+        fail("host response failed")
+    }
+    const changed = flipFirst(response)
+    match FinishClient(psk, hostPublicKey, clientNonce, changed) {
+        Ok(value): {
+            discard value
+            fail("changed proof was accepted")
+        }
+        Err(error): match error {
+            AuthenticationFailed: {}
+            _: fail("wrong changed proof error")
+        }
+    }
+}
+
+test "host rejects a proof made with another PSK" {
+    const psk = sequence(0, 32)
+    const otherPSK = sequence(1, 32)
+    const hostPublicKey = sequence(32, 32)
+    const clientNonce = sequence(64, 32)
+    const hostNonce = sequence(96, 32)
+    const response = HostResponse(psk, hostPublicKey, clientNonce, hostNonce) else {
+        fail("host response failed")
+    }
+    const client = FinishClient(otherPSK, hostPublicKey, clientNonce, response)
+    match client {
+        Ok(value): {
+            discard value
+            fail("mismatched PSK was accepted")
+        }
+        Err(error): match error {
+            AuthenticationFailed: {}
+            _: fail("wrong mismatched PSK error")
+        }
+    }
+}
+
+test "handshake rejects malformed credentials and messages" {
+    const short = sequence(0, 31)
+    const full = sequence(0, 32)
+    match HostResponse(short, full, full, full) {
+        Ok(value): {
+            discard value
+            fail("short PSK was accepted")
+        }
+        Err(error): match error {
+            InvalidCredential: {}
+            _: fail("wrong credential error")
+        }
+    }
+    match FinishClient(full, full, full, short) {
+        Ok(value): {
+            discard value
+            fail("short host response was accepted")
+        }
+        Err(error): match error {
+            InvalidMessage: {}
+            _: fail("wrong message error")
+        }
+    }
+}

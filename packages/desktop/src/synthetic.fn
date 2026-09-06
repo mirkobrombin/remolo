@@ -1,0 +1,81 @@
+package remolo.desktop
+
+import std.bytes
+import std.desktop as platformDesktop
+
+struct SyntheticCapturer {
+    width u64
+    height u64
+    sequence u64
+
+    fn Width(self) u64 {
+        self.width
+    }
+
+    fn Height(self) u64 {
+        self.height
+    }
+
+    fn Capture(&self) Result<platformDesktop.Frame, Error> {
+        const opened = bytes.NewBuilder(self.width * self.height * 4) else error {
+            discard error
+            return .Err(.Storage)
+        }
+        var pixels = opened
+        var y u64 = 0
+        while y < self.height {
+            syntheticRow(&pixels, self.width, y, self.sequence) else error {
+                return .Err(error)
+            }
+            y += 1
+        }
+        self.sequence += 1
+        const value = pixels.Finish() else error {
+            discard error
+            return .Err(.Storage)
+        }
+        .Ok(platformDesktop.Frame {
+            Width = self.width
+            Height = self.height
+            Pixels = value
+        })
+    }
+}
+
+fn NewSyntheticCapturer(width u64, height u64) own SyntheticCapturer {
+    own SyntheticCapturer { width = width height = height sequence = 0 }
+}
+
+fn syntheticRow(
+    &pixels bytes.Builder,
+    width u64,
+    y u64,
+    sequence u64
+) Result<void, Error> {
+    var x u64 = 0
+    while x < width {
+        syntheticByte(&pixels, (x + sequence * 3) % 256) else error {
+            return .Err(error)
+        }
+        syntheticByte(&pixels, (y + sequence * 2) % 256) else error {
+            return .Err(error)
+        }
+        syntheticByte(&pixels, (x + y + sequence * 5) % 256) else error {
+            return .Err(error)
+        }
+        syntheticByte(&pixels, 255) else error { return .Err(error) }
+        x += 1
+    }
+    .Ok
+}
+
+fn syntheticByte(
+    &pixels bytes.Builder,
+    value u64
+) Result<void, Error> {
+    pixels.WriteByte(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}

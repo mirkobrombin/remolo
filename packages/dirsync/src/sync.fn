@@ -1,0 +1,241 @@
+package remolo.dirsync
+
+import remolo.mux
+import std.fs
+import std.path
+import std.text
+
+task Push(
+    $stream mux.Stream,
+    $localDirectory String,
+    $remoteDirectory String,
+    $options own Options
+) Result<Stats, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    var hello = newSyncMessage("hello")
+    hello.Direction = "push"
+    hello.Root = text.Copy(remoteDirectory)
+    hello.Delete = options.Delete
+    hello.DryRun = options.DryRun
+    const announcing = spawn writeSyncMessage($Writer, $hello)
+    const announced = $announcing.wait()
+    const writer = announced else error {
+        discard Reader
+        return .Err(error)
+    }
+    const sending = spawn runSender(
+        $Reader,
+        $writer,
+        $localDirectory,
+        $options
+    )
+    const result = $sending.wait()
+    result
+}
+
+task Pull(
+    $stream mux.Stream,
+    $remoteDirectory String,
+    $localDirectory String,
+    $options own Options
+) Result<Stats, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    var hello = newSyncMessage("hello")
+    hello.Direction = "pull"
+    hello.Root = text.Copy(remoteDirectory)
+    hello.Delete = options.Delete
+    hello.DryRun = options.DryRun
+    const announcing = spawn writeSyncMessage($Writer, $hello)
+    const announced = $announcing.wait()
+    const writer = announced else error {
+        discard Reader
+        return .Err(error)
+    }
+    const Options { Delete DryRun Excludes } = options
+    discard Excludes
+    const receiving = spawn runReceiver(
+        $Reader,
+        $writer,
+        $localDirectory,
+        Delete,
+        DryRun
+    )
+    const result = $receiving.wait()
+    result
+}
+
+task Serve(
+    $stream mux.Stream,
+    $root String
+) Result<void, Error> {
+    const serving = spawn ServeWithPolicy($stream, $root, true)
+    const result = $serving.wait()
+    result
+}
+
+task ServeWithPolicy(
+    $stream mux.Stream,
+    $root String,
+    allowWrite bool
+) Result<void, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const reading = spawn readSyncMessage($Reader)
+    const read = $reading.wait()
+    const messageReadOutcome { Reader as restored Value } = read
+    const hello = Value else error {
+        discard restored
+        discard Writer
+        return .Err(error)
+    }
+    if hello.Type != "hello" {
+        discard restored
+        discard Writer
+        return .Err(.Protocol)
+    }
+    if hello.Direction == "push" {
+        if !allowWrite {
+            discard restored
+            const rejecting = spawn rejectSync($Writer, $"push not allowed")
+            $rejecting.wait()
+            return .Err(.ReadOnly)
+        }
+        const destination = syncPushDirectory(
+            root,
+            hello.Root,
+            hello.DryRun
+        ) else error {
+            discard restored
+            const rejecting = spawn rejectSync($Writer, $"invalid root")
+            $rejecting.wait()
+            return .Err(error)
+        }
+        const receiving = spawn runReceiver(
+            $restored,
+            $Writer,
+            $destination,
+            hello.Delete,
+            hello.DryRun
+        )
+        const result = $receiving.wait()
+        match result {
+            Ok(stats): {
+                discard stats
+                .Ok
+            }
+            Err(error): .Err(error)
+        }
+    } else {
+        if hello.Direction != "pull" {
+            discard restored
+            discard Writer
+            return .Err(.Protocol)
+        }
+        const source = resolveSyncDirectory(root, hello.Root, false) else error {
+            discard restored
+            const rejecting = spawn rejectSync($Writer, $"invalid root")
+            $rejecting.wait()
+            return .Err(error)
+        }
+        const noExcludes [0]String = []
+        var options = NewOptions(noExcludes)
+        options.Delete = hello.Delete
+        options.DryRun = hello.DryRun
+        const sending = spawn runSender(
+            $restored,
+            $Writer,
+            $source,
+            $options
+        )
+        const result = $sending.wait()
+        match result {
+            Ok(stats): {
+                discard stats
+                .Ok
+            }
+            Err(error): .Err(error)
+        }
+    }
+}
+
+task rejectSync($writer own mux.Writer, $message String) void {
+    var response = newSyncMessage("error")
+    response.RemoteError = text.Copy(message)
+    const writing = spawn writeSyncMessage($writer, $response)
+    const written = $writing.wait()
+    const finalWriter = written else error {
+        discard error
+        return
+    }
+    const closing = spawn mux.CloseWriter($finalWriter)
+    const closed = $closing.wait()
+    match closed {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
+fn resolveSyncDirectory(
+    root String,
+    requested String,
+    create bool
+) Result<String, Error> {
+    const canonicalRoot = fs.Canonicalize(root) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    if text.IsEmpty(requested) return .Ok(canonicalRoot)
+    if !validRelativePath(requested) return .Err(.Protocol)
+    if create {
+        const opened = fs.OpenRoot(canonicalRoot) else error {
+            discard error
+            return .Err(.Filesystem)
+        }
+        var writer = opened
+        writer.CreateDirectory(requested) else error {
+            discard error
+            discard writer
+            return .Err(.Filesystem)
+        }
+        discard writer.Close()
+        discard writer
+    }
+    const joined = path.Join(canonicalRoot, requested)
+    const canonical = fs.Canonicalize(joined) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    const relative = path.Relative(canonicalRoot, canonical) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    if relative != "." && !validRelativePath(relative) {
+        return .Err(.Protocol)
+    }
+    .Ok(canonical)
+}
+
+fn syncPushDirectory(
+    root String,
+    requested String,
+    dryRun bool
+) Result<String, Error> {
+    if !dryRun return resolveSyncDirectory(root, requested, true)
+    const canonicalRoot = fs.Canonicalize(root) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    if text.IsEmpty(requested) return .Ok(canonicalRoot)
+    if !validRelativePath(requested) return .Err(.Protocol)
+    const joined = path.Join(canonicalRoot, requested)
+    const kind = fs.Kind(joined) else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    match kind {
+        Missing: .Ok(joined)
+        _: resolveSyncDirectory(canonicalRoot, requested, false)
+    }
+}

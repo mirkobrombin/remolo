@@ -1,0 +1,285 @@
+package remolo.desktop
+
+import std.bytes
+
+fn EncodePNG(
+    width u64,
+    height u64,
+    pixels bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const pixelLength = pixels.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if !validPNGDimensions(width, height, pixelLength) {
+        return .Err(.InvalidFrame)
+    }
+    const filtered = pngFiltered(width, height, pixels) else error {
+        return .Err(error)
+    }
+    const compressed = pngStoredZlib(filtered) else error {
+        return .Err(error)
+    }
+    const limit = compressed.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const opened = bytes.NewBuilder(limit + 128) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    pngSignature(&output) else error { return .Err(error) }
+    const header = pngHeader(width, height) else error { return .Err(error) }
+    pngChunk(&output, "IHDR", header) else error { return .Err(error) }
+    pngChunk(&output, "IDAT", compressed) else error { return .Err(error) }
+    const empty = bytes.FromText("")
+    pngChunk(&output, "IEND", empty) else error { return .Err(error) }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn validPNGDimensions(width u64, height u64, length u64) bool {
+    if width == 0 || height == 0 return false
+    if width > 4294967295 || height > 4294967295 return false
+    if width > 4194304 return false
+    if height > 18446744073709551615 / width return false
+    const pixels = width * height
+    if pixels > 4611686018427387903 return false
+    length == pixels * 4
+}
+
+fn pngSignature(&output bytes.Builder) Result<void, Error> {
+    pngByte(&output, 137) else error { return .Err(error) }
+    pngByte(&output, 80) else error { return .Err(error) }
+    pngByte(&output, 78) else error { return .Err(error) }
+    pngByte(&output, 71) else error { return .Err(error) }
+    pngByte(&output, 13) else error { return .Err(error) }
+    pngByte(&output, 10) else error { return .Err(error) }
+    pngByte(&output, 26) else error { return .Err(error) }
+    pngByte(&output, 10)
+}
+
+fn pngHeader(width u64, height u64) Result<own bytes.Bytes, Error> {
+    const opened = bytes.NewBuilder(13) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var header = opened
+    pngU32(&header, width) else error { return .Err(error) }
+    pngU32(&header, height) else error { return .Err(error) }
+    pngByte(&header, 8) else error { return .Err(error) }
+    pngByte(&header, 6) else error { return .Err(error) }
+    pngByte(&header, 0) else error { return .Err(error) }
+    pngByte(&header, 0) else error { return .Err(error) }
+    pngByte(&header, 0) else error { return .Err(error) }
+    const result = header.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn pngFiltered(
+    width u64,
+    height u64,
+    pixels bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const rowLength = width * 4
+    const opened = bytes.NewBuilder(height * (rowLength + 1)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var filtered = opened
+    var row u64 = 0
+    while row < height {
+        pngByte(&filtered, 0) else error { return .Err(error) }
+        pngCopyRange(&filtered, pixels, row * rowLength, rowLength) else error {
+            return .Err(error)
+        }
+        row += 1
+    }
+    const result = filtered.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn pngStoredZlib(source bytes.Bytes) Result<own bytes.Bytes, Error> {
+    const length = source.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const blocks u64 = if length == 0 { 1 } else { (length + 65534) / 65535 }
+    const opened = bytes.NewBuilder(length + blocks * 5 + 6) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var output = opened
+    pngByte(&output, 120) else error { return .Err(error) }
+    pngByte(&output, 1) else error { return .Err(error) }
+    pngStoredBlocks(&output, source, length) else error { return .Err(error) }
+    pngU32(&output, pngAdler32(source)) else error { return .Err(error) }
+    const result = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn pngStoredBlocks(
+    &output bytes.Builder,
+    source bytes.Bytes,
+    length u64
+) Result<void, Error> {
+    var offset u64 = 0
+    if length == 0 {
+        pngStoredHeader(&output, 0, true) else error { return .Err(error) }
+        return .Ok
+    }
+    while offset < length {
+        const remaining = length - offset
+        const count u64 = if remaining > 65535 { 65535 } else { remaining }
+        pngStoredHeader(&output, count, count == remaining) else error {
+            return .Err(error)
+        }
+        pngCopyRange(&output, source, offset, count) else error {
+            return .Err(error)
+        }
+        offset += count
+    }
+    .Ok
+}
+
+fn pngStoredHeader(
+    &output bytes.Builder,
+    length u64,
+    final bool
+) Result<void, Error> {
+    pngByte(&output, if final { 1 } else { 0 }) else error {
+        return .Err(error)
+    }
+    pngByte(&output, length & 255) else error { return .Err(error) }
+    pngByte(&output, length >> 8) else error { return .Err(error) }
+    const maximum u64 = 65535
+    const inverse = maximum - length
+    pngByte(&output, inverse & 255) else error { return .Err(error) }
+    pngByte(&output, inverse >> 8)
+}
+
+fn pngChunk(
+    &output bytes.Builder,
+    kind String,
+    data bytes.Bytes
+) Result<void, Error> {
+    const typeBytes = bytes.FromText(kind)
+    const dataLength = data.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const opened = bytes.NewBuilder(dataLength + 4) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var combined = opened
+    combined.Write(typeBytes) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    combined.Write(data) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const payload = combined.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    pngU32(&output, dataLength) else error { return .Err(error) }
+    output.Write(payload) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    pngU32(&output, pngCRC32(payload))
+}
+
+fn pngCRC32(value bytes.Bytes) u64 {
+    var checksum u64 = 4294967295
+    const length = pngLength(value)
+    var offset u64 = 0
+    while offset < length {
+        checksum = checksum ^ pngAt(value, offset)
+        var bit u8 = 0
+        while bit < 8 {
+            checksum = if (checksum & 1) == 1 {
+                checksum >> 1 ^ 3988292384
+            } else {
+                checksum >> 1
+            }
+            bit += 1
+        }
+        offset += 1
+    }
+    ~checksum & 4294967295
+}
+
+fn pngAdler32(value bytes.Bytes) u64 {
+    var first u64 = 1
+    var second u64 = 0
+    const length = pngLength(value)
+    var offset u64 = 0
+    while offset < length {
+        first = (first + pngAt(value, offset)) % 65521
+        second = (second + first) % 65521
+        offset += 1
+    }
+    second << 16 | first
+}
+
+fn pngCopyRange(
+    &output bytes.Builder,
+    source bytes.Bytes,
+    start u64,
+    length u64
+) Result<void, Error> {
+    var offset u64 = 0
+    while offset < length {
+        pngByte(&output, pngAt(source, start + offset)) else error {
+            return .Err(error)
+        }
+        offset += 1
+    }
+    .Ok
+}
+
+fn pngU32(&output bytes.Builder, value u64) Result<void, Error> {
+    pngByte(&output, value >> 24 & 255) else error { return .Err(error) }
+    pngByte(&output, value >> 16 & 255) else error { return .Err(error) }
+    pngByte(&output, value >> 8 & 255) else error { return .Err(error) }
+    pngByte(&output, value & 255)
+}
+
+fn pngByte(&output bytes.Builder, value u64) Result<void, Error> {
+    output.WriteByte(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn pngLength(value bytes.Bytes) u64 {
+    const length = value.Len() else {
+        panic("desktop PNG bytes are closed")
+    }
+    length
+}
+
+fn pngAt(value bytes.Bytes, offset u64) u64 {
+    const byte = value.At(offset) else {
+        panic("desktop PNG byte is missing")
+    }
+    byte
+}

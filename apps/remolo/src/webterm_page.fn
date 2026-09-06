@@ -1,0 +1,27 @@
+package remolo.cli
+
+fn webtermPage() String {
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+        "<title>remolo terminal</title>" +
+        "<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/xterm/css/xterm.css\">" +
+        "<script src=\"https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js\"></script>" +
+        "<script src=\"https://cdn.jsdelivr.net/npm/xterm-addon-fit/" +
+        "lib/xterm-addon-fit.js\"></script>" +
+        "<style>html,body,#terminal{width:100%;height:100%;margin:0;" +
+        "background:#000;overflow:hidden}</style>" +
+        "</head><body><div id=\"terminal\"></div><script>" +
+        "const term=new Terminal({cursorBlink:true,fontFamily:'monospace',fontSize:14});" +
+        "const fit=new FitAddon.FitAddon();term.loadAddon(fit);" +
+        "term.open(document.getElementById('terminal'));fit.fit();" +
+        "let ended=false;async function poll(){if(ended)return;try{" +
+        "const r=await fetch('/output',{cache:'no-store'});" +
+        "if(r.status===200)term.write(new Uint8Array(await r.arrayBuffer()));" +
+        "}catch(e){}setTimeout(poll,20)}" +
+        "term.onData(d=>fetch('/input',{method:'POST',body:new TextEncoder().encode(d)}));" +
+        "function resize(){fit.fit();fetch('/resize',{method:'POST'," +
+        "headers:{'Content-Type':'application/json'}," +
+        "body:JSON.stringify({cols:term.cols,rows:term.rows})}).catch(()=>{})}" +
+        "term.onResize(resize);window.addEventListener('resize',resize);" +
+        "resize();poll();term.focus();</script></body></html>"
+}

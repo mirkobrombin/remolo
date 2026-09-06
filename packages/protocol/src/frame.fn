@@ -1,0 +1,133 @@
+package remolo.protocol
+
+import std.bytes
+
+enum FrameType {
+    Data
+    Resize
+    Signal
+    Exit
+    JSON
+    Ping
+    Pong
+    EOF
+    Stderr
+}
+
+enum FrameError {
+    Truncated
+    PayloadTooLarge
+    UnknownType
+    Storage
+}
+
+struct Frame {
+    Type FrameType
+    Payload own bytes.Bytes
+}
+
+fn MaxFramePayload() u64 {
+    16 * 1024 * 1024
+}
+
+fn EncodeFrame(frameType FrameType, payload bytes.Bytes) Result<own bytes.Bytes, FrameError> {
+    const length = payload.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if length > MaxFramePayload() {
+        return .Err(.PayloadTooLarge)
+    }
+    const opened = bytes.NewBuilder(length + 5) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var builder = opened
+    writeByte(&builder, frameTypeCode(frameType)) else error {
+        return .Err(error)
+    }
+    writeByte(&builder, length >> 24) else error { return .Err(error) }
+    writeByte(&builder, length >> 16 & 255) else error { return .Err(error) }
+    writeByte(&builder, length >> 8 & 255) else error { return .Err(error) }
+    writeByte(&builder, length & 255) else error { return .Err(error) }
+    builder.Write(payload) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn DecodeFrame(source bytes.Bytes) Result<Frame, FrameError> {
+    const total = source.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if total < 5 {
+        return .Err(.Truncated)
+    }
+    const frameType = frameTypeFor(byteAt(source, 0)) else error {
+        return .Err(error)
+    }
+    const length = byteAt(source, 1) << 24 |
+        byteAt(source, 2) << 16 |
+        byteAt(source, 3) << 8 |
+        byteAt(source, 4)
+    if length > MaxFramePayload() {
+        return .Err(.PayloadTooLarge)
+    }
+    if total != length + 5 {
+        return .Err(.Truncated)
+    }
+    const payload = source.Slice(5, total) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(Frame { Type = frameType Payload = payload })
+}
+
+fn frameTypeCode(value FrameType) u64 {
+    match value {
+        Data: 1
+        Resize: 2
+        Signal: 3
+        Exit: 4
+        JSON: 5
+        Ping: 6
+        Pong: 7
+        EOF: 8
+        Stderr: 9
+    }
+}
+
+fn frameTypeFor(value u64) Result<FrameType, FrameError> {
+    if value == 1 return .Ok(.Data)
+    if value == 2 return .Ok(.Resize)
+    if value == 3 return .Ok(.Signal)
+    if value == 4 return .Ok(.Exit)
+    if value == 5 return .Ok(.JSON)
+    if value == 6 return .Ok(.Ping)
+    if value == 7 return .Ok(.Pong)
+    if value == 8 return .Ok(.EOF)
+    if value == 9 return .Ok(.Stderr)
+    .Err(.UnknownType)
+}
+
+fn byteAt(value bytes.Bytes, index u64) u64 {
+    const result = value.At(index) else error {
+        discard error
+        panic("frame byte invariant failed")
+    }
+    result
+}
+
+fn writeByte(&builder bytes.Builder, value u64) Result<void, FrameError> {
+    builder.WriteByte(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}

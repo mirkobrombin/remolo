@@ -1,0 +1,45 @@
+package remolo.relay_server
+
+import remolo.relay
+import std.format
+import std.io
+
+fn writeError(value String) void {
+    const written = io.WriteStderrText(value)
+    match written {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
+fn serve($value own options) i32 {
+    const options { address port help } = value
+    discard help
+    const server = relay.NewServer($address, port) else error {
+        discard error
+        writeError("remolo-relay: listen failed\n")
+        return 1
+    }
+    print("remolo-relay: listening on port " + format.U64(server.Port()))
+    const served = spawn relay.Serve($server)
+    const result = $served.wait()
+    match result {
+        Ok: 0
+        Err(error): {
+            discard error
+            1
+        }
+    }
+}
+
+fn main(args [String]) i32 {
+    const parsed = parseOptions(args) else error {
+        writeError("remolo-relay: " + error + "\n" + usage())
+        return 2
+    }
+    if parsed.help {
+        print(usage())
+        return 0
+    }
+    serve($parsed)
+}

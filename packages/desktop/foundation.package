@@ -1,0 +1,12 @@
+format foundation.package/v1
+name remolo.desktop
+version 1.0.0
+language 1
+fcs standard
+source src
+test_source tests
+native_source native/datachannel.c
+native_link dl target linux
+foreign c libdatachannel 0.24.3 path native abi c/v1
+dependency remolo.mux 1.0.0 path ../mux
+dependency remolo.protocol 1.0.0 path ../protocol

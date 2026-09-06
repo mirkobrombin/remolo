@@ -1,0 +1,287 @@
+package remolo.cli
+
+import foundation.web
+import remolo.mux
+import remolo.rpc
+import remolo.session
+import std.collections
+import std.format
+import std.json
+import std.net
+import std.text
+
+struct restHealthHandler implements web.Handler<browserError> {}
+
+struct restInfoHandler implements web.Handler<browserError> {
+    handle mux.Handle
+}
+
+struct restExecHandler implements web.Handler<browserError> {
+    handle mux.Handle
+}
+
+methods restHealthHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        discard request
+        .Ok(web.Text(200, "ok"))
+    }
+}
+
+methods restInfoHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        discard request
+        const loading = spawn rpc.SystemInfo(self.handle.Clone())
+        const value = $loading.wait() else error {
+            discard error
+            return restError(502, "remote operation failed")
+        }
+        const encoded = systemInfoJSON($value) else error {
+            discard error
+            return .Err(.Failed)
+        }
+        .Ok(web.Json(200, $encoded))
+    }
+}
+
+methods restExecHandler {
+    fn Handle(self, $request web.Request) Result<web.Response, browserError> {
+        const command = parseRESTCommand(request.Body) else error {
+            discard error
+            discard request
+            return restError(400, "invalid request")
+        }
+        discard request
+        const executing = spawn rpc.ExecuteList(self.handle.Clone(), $command)
+        const value = $executing.wait() else error {
+            discard error
+            return restError(502, "remote operation failed")
+        }
+        const encoded = executionJSON($value) else error {
+            discard error
+            return .Err(.Failed)
+        }
+        .Ok(web.Json(200, $encoded))
+    }
+}
+
+fn runREST(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("rest requires a token"))
+    const options = parseRESTOptions(args) else error { return .Err(error) }
+    const client = connectToken(args[1]) else error { return .Err(error) }
+    const router = restRouter(client.Handle())
+    const result = serveBrowser($router, $options, "REST API")
+    session.CloseClient($client)
+    result
+}
+
+fn parseRESTOptions(args [String]) Result<own browserOptions, failure> {
+    var options = defaultBrowserOptions()
+    options.open = false
+    options.port = 8790
+    var index usize = 2
+    while index < len(args) {
+        const name = argument(args, index)
+        if name != "--addr" return .Err(invalid("unknown rest option: " + name))
+        const value = optionValue(args, index, name) else error {
+            return .Err(error)
+        }
+        const endpoint = net.ParseEndpoint(value) else error {
+            discard error
+            return .Err(invalid("--addr requires host:port"))
+        }
+        const net.Endpoint { Host Port } = endpoint
+        options.address = Host
+        options.port = u64.From(Port)
+        index += 2
+    }
+    .Ok(options)
+}
+
+fn restRouter($handle mux.Handle) own web.Router<browserError> {
+    var router = web.NewRouter<browserError>()
+    browserRoute(router.Map(.GET, "/healthz", own restHealthHandler {}))
+    browserRoute(router.Map(.GET, "/sysinfo", own restInfoHandler {
+        handle = handle.Clone()
+    }))
+    browserRoute(router.Map(.POST, "/exec", own restExecHandler {
+        handle = handle
+    }))
+    router.Use(0, $restMethodGuard) else error {
+        discard error
+        panic("REST middleware registration failed")
+    }
+    router
+}
+
+fn restMethodGuard(
+    $request web.Request,
+    next fn($web.Request) Result<web.Response, web.DispatchError<browserError>>
+) Result<web.Response, web.DispatchError<browserError>> {
+    const allowed = restAllowedMethod(request.Path)
+    if text.IsEmpty(allowed) || restMethodAllowed(request.Path, request.Method) {
+        return next($request)
+    }
+    discard request
+    const built = restErrorResponse(405, "method not allowed") else error {
+        discard error
+        return .Err(.Handler(error = .Failed))
+    }
+    var response = built
+    response.SetHeader("Allow", allowed)
+    .Ok(response)
+}
+
+fn restAllowedMethod(path String) String {
+    if path == "/healthz" || path == "/sysinfo" return "GET"
+    if path == "/exec" return "POST"
+    ""
+}
+
+fn restMethodAllowed(path String, method web.Method) bool {
+    if path == "/healthz" || path == "/sysinfo" {
+        return match method {
+            GET: true
+            _: false
+        }
+    }
+    if path == "/exec" {
+        return match method {
+            POST: true
+            _: false
+        }
+    }
+    true
+}
+
+fn restError(status i32, message String) Result<web.Response, browserError> {
+    const response = restErrorResponse(status, message) else error {
+        discard error
+        return .Err(.Failed)
+    }
+    .Ok(response)
+}
+
+fn restErrorResponse(status i32, message String) Result<web.Response, failure> {
+    var object = json.NewObject()
+    setJSONText(&object, "error", $text.Copy(message)) else error {
+        return .Err(error)
+    }
+    const encoded = stringifyJSONObject($object) else error {
+        return .Err(error)
+    }
+    .Ok(web.Json(status, $encoded))
+}
+
+fn parseRESTCommand(
+    source String
+) Result<own collections.List<String>, failure> {
+    const parsed = json.Parse(source) else error {
+        discard error
+        return .Err(invalid("invalid JSON body"))
+    }
+    const object = match parsed {
+        Object(found): found
+        _: { return .Err(invalid("request body must be an object")) }
+    }
+    var fields = object
+    const selected = fields.Take("cmd")
+    const value = match selected {
+        Some(found): found
+        None: { return .Err(invalid("request body requires cmd")) }
+    }
+    var array = match value {
+        Array(found): found
+        _: { return .Err(invalid("cmd must be an array")) }
+    }
+    var reversed = collections.NewList<String>()
+    while array.Len() > 0 {
+        const item = match array.PopFront() {
+            Some(found): found
+            None: { panic("REST command array invariant failed") }
+        }
+        match item {
+            Text(found): reversed.PushFront($found)
+            _: {
+                discard reversed
+                return .Err(invalid("cmd values must be strings"))
+            }
+        }
+    }
+    if reversed.IsEmpty() return .Err(invalid("cmd must not be empty"))
+    .Ok(reverseTextList($reversed))
+}
+
+fn reverseTextList(
+    $values own collections.List<String>
+) own collections.List<String> {
+    var source = values
+    var result = collections.NewList<String>()
+    while !source.IsEmpty() {
+        const value = match source.PopFront() {
+            Some(found): found
+            None: { panic("text list invariant failed") }
+        }
+        result.PushFront($value)
+    }
+    result
+}
+
+fn systemInfoJSON($value rpc.SysInfo) Result<String, failure> {
+    const rpc.SysInfo { OS Arch Hostname NumCPU Uptime } = value
+    var object = json.NewObject()
+    setJSONText(&object, "os", $OS) else error { return .Err(error) }
+    setJSONText(&object, "arch", $Arch) else error { return .Err(error) }
+    setJSONText(&object, "hostname", $Hostname) else error {
+        return .Err(error)
+    }
+    setJSONNumber(&object, "numcpu", $format.U64(NumCPU)) else error {
+        return .Err(error)
+    }
+    setJSONNumber(&object, "uptime", $format.U64(Uptime)) else error {
+        return .Err(error)
+    }
+    stringifyJSONObject($object)
+}
+
+fn executionJSON($value rpc.ExecResult) Result<String, failure> {
+    const rpc.ExecResult { Stdout Stderr Code } = value
+    var object = json.NewObject()
+    setJSONText(&object, "stdout", $Stdout) else error { return .Err(error) }
+    setJSONText(&object, "stderr", $Stderr) else error { return .Err(error) }
+    setJSONNumber(&object, "code", $format.I32(Code)) else error {
+        return .Err(error)
+    }
+    stringifyJSONObject($object)
+}
+
+fn setJSONText(
+    &object json.Object,
+    key String,
+    $value String
+) Result<void, failure> {
+    object.Set($text.Copy(key), $ .Text(value)) else error {
+        discard error
+        return .Err(failed("could not encode REST response"))
+    }
+    .Ok
+}
+
+fn setJSONNumber(
+    &object json.Object,
+    key String,
+    $value String
+) Result<void, failure> {
+    object.Set($text.Copy(key), $ .Number(value)) else error {
+        discard error
+        return .Err(failed("could not encode REST response"))
+    }
+    .Ok
+}
+
+fn stringifyJSONObject($object own json.Object) Result<String, failure> {
+    const encoded = json.Stringify(.Object(object)) else error {
+        discard error
+        return .Err(failed("could not encode REST response"))
+    }
+    .Ok(encoded + "\n")
+}

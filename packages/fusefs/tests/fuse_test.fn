@@ -1,0 +1,16 @@
+package remolo.fusefs
+
+import remolo.rpc
+
+test "remote errors map to filesystem errors" {
+    expect(errorNumber($rpc.Error.NotFound) == 2)
+    expect(errorNumber($rpc.Error.Permission) == 13)
+    expect(errorNumber($rpc.Error.AlreadyExists) == 17)
+    expect(errorNumber($rpc.Error.NotEmpty) == 39)
+    expect(errorNumber($rpc.Error.Remote("rpc: no such file")) == 2)
+}
+
+test "mode strings map to native file kinds and permissions" {
+    expect(modeBits("drwxr-xr-x", true) == 16877)
+    expect(modeBits("-rw-r--r--", false) == 33188)
+}

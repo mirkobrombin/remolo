@@ -1,0 +1,343 @@
+package remolo.dirsync
+
+import std.bytes
+import std.format
+import std.json
+import std.parse
+import std.text
+
+// fcs:ignore FCS6001 Encoding keeps wire field order and error mapping in one flow.
+fn encodeSyncMessage(value syncMessage) Result<own bytes.Bytes, Error> {
+    var object = json.NewObject()
+    setMessageText(&object, "t", value.Type) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalText(&object, "dir", value.Direction) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalText(&object, "root", value.Root) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalBool(&object, "del", value.Delete) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalBool(&object, "dry", value.DryRun) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalText(&object, "p", value.Path) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalBool(&object, "hb", value.HasBase) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalU64(&object, "sz", value.Size) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalU32(&object, "mode", value.Permissions) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalU64(&object, "mt", value.Modified) else {
+        return .Err(.Encoding)
+    }
+    setMessageOptionalText(&object, "err", value.RemoteError) else {
+        return .Err(.Encoding)
+    }
+    if value.HasStats {
+        const stats = encodeStats(value.Stats) else error {
+            return .Err(error)
+        }
+        object.Set($text.Copy("stats"), $stats) else error {
+            discard error
+            return .Err(.Encoding)
+        }
+    }
+    const encoded = json.Stringify($ .Object(object)) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok(bytes.FromText(encoded))
+}
+
+fn decodeSyncMessage(source bytes.Bytes) Result<syncMessage, Error> {
+    const encoded = source.Text() else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    const parsed = json.Parse(encoded) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    var object = match parsed {
+        Object(value): value
+        _: { return .Err(.Protocol) }
+    }
+    const messageType = messageRequiredText(&object, "t") else {
+        return .Err(.Protocol)
+    }
+    const direction = messageOptionalText(&object, "dir") else {
+        return .Err(.Protocol)
+    }
+    const root = messageOptionalText(&object, "root") else {
+        return .Err(.Protocol)
+    }
+    const delete = messageOptionalBool(&object, "del") else {
+        return .Err(.Protocol)
+    }
+    const dryRun = messageOptionalBool(&object, "dry") else {
+        return .Err(.Protocol)
+    }
+    const path = messageOptionalText(&object, "p") else {
+        return .Err(.Protocol)
+    }
+    const hasBase = messageOptionalBool(&object, "hb") else {
+        return .Err(.Protocol)
+    }
+    const size = messageOptionalU64(&object, "sz") else {
+        return .Err(.Protocol)
+    }
+    const permissions = messageOptionalU32(&object, "mode") else {
+        return .Err(.Protocol)
+    }
+    const modified = messageOptionalU64(&object, "mt") else {
+        return .Err(.Protocol)
+    }
+    const remoteError = messageOptionalText(&object, "err") else {
+        return .Err(.Protocol)
+    }
+    var stats = Stats {
+        FilesConsidered = 0
+        FilesTransferred = 0
+        BytesTransferred = 0
+    }
+    var hasStats = false
+    const statsValue = object.Take("stats")
+    match statsValue {
+        None: {}
+        Some(value): {
+            const decoded = decodeStats($value) else error {
+                return .Err(error)
+            }
+            stats = decoded
+            hasStats = true
+        }
+    }
+    .Ok(syncMessage {
+        Type = messageType
+        Direction = direction
+        Root = root
+        Delete = delete
+        DryRun = dryRun
+        Path = path
+        HasBase = hasBase
+        Size = size
+        Permissions = permissions
+        Modified = modified
+        Stats = stats
+        HasStats = hasStats
+        RemoteError = remoteError
+    })
+}
+
+fn encodeStats(value Stats) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setMessageU64(&object, "FilesConsidered", value.FilesConsidered) else {
+        return .Err(.Encoding)
+    }
+    setMessageU64(&object, "FilesTransferred", value.FilesTransferred) else {
+        return .Err(.Encoding)
+    }
+    setMessageU64(&object, "BytesTransferred", value.BytesTransferred) else {
+        return .Err(.Encoding)
+    }
+    .Ok(.Object(object))
+}
+
+fn decodeStats($value json.Value) Result<Stats, Error> {
+    var object = match value {
+        Object(found): found
+        _: { return .Err(.Protocol) }
+    }
+    const considered = messageRequiredU64(
+        &object,
+        "FilesConsidered"
+    ) else {
+        return .Err(.Protocol)
+    }
+    const transferred = messageRequiredU64(
+        &object,
+        "FilesTransferred"
+    ) else {
+        return .Err(.Protocol)
+    }
+    const bytesTransferred = messageRequiredU64(
+        &object,
+        "BytesTransferred"
+    ) else {
+        return .Err(.Protocol)
+    }
+    .Ok(Stats {
+        FilesConsidered = considered
+        FilesTransferred = transferred
+        BytesTransferred = bytesTransferred
+    })
+}
+
+fn setMessageText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, Error> {
+    object.Set($text.Copy(key), $ .Text(text.Copy(value))) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok
+}
+
+fn setMessageOptionalText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, Error> {
+    if text.IsEmpty(value) return .Ok
+    setMessageText(&object, key, value)
+}
+
+fn setMessageOptionalBool(
+    &object json.Object,
+    key String,
+    value bool
+) Result<void, Error> {
+    if !value return .Ok
+    object.Set($text.Copy(key), $ .Bool(true)) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok
+}
+
+fn setMessageU64(
+    &object json.Object,
+    key String,
+    value u64
+) Result<void, Error> {
+    object.Set($text.Copy(key), $ .Number(format.U64(value))) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok
+}
+
+fn setMessageOptionalU64(
+    &object json.Object,
+    key String,
+    value u64
+) Result<void, Error> {
+    if value == 0 return .Ok
+    setMessageU64(&object, key, value)
+}
+
+fn setMessageOptionalU32(
+    &object json.Object,
+    key String,
+    value u32
+) Result<void, Error> {
+    if value == 0 return .Ok
+    object.Set($text.Copy(key), $ .Number(format.U32(value))) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok
+}
+
+fn messageRequiredText(
+    &object json.Object,
+    key String
+) Result<String, Error> {
+    match object.Take(key) {
+        None: .Err(.Protocol)
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn messageOptionalText(
+    &object json.Object,
+    key String
+) Result<String, Error> {
+    match object.Take(key) {
+        None: .Ok("")
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn messageOptionalBool(
+    &object json.Object,
+    key String
+) Result<bool, Error> {
+    match object.Take(key) {
+        None: .Ok(false)
+        Some(value): match value {
+            Bool(found): .Ok(found)
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn messageRequiredU64(
+    &object json.Object,
+    key String
+) Result<u64, Error> {
+    match object.Take(key) {
+        None: .Err(.Protocol)
+        Some(value): messageJSONU64($value)
+    }
+}
+
+fn messageOptionalU64(
+    &object json.Object,
+    key String
+) Result<u64, Error> {
+    match object.Take(key) {
+        None: .Ok(0)
+        Some(value): messageJSONU64($value)
+    }
+}
+
+fn messageOptionalU32(
+    &object json.Object,
+    key String
+) Result<u32, Error> {
+    match object.Take(key) {
+        None: .Ok(0)
+        Some(value): match value {
+            Number(found): {
+                const parsed = parse.U32(found) else error {
+                    discard error
+                    return .Err(.Protocol)
+                }
+                if parsed > 511 return .Err(.Protocol)
+                .Ok(parsed)
+            }
+            _: .Err(.Protocol)
+        }
+    }
+}
+
+fn messageJSONU64($value json.Value) Result<u64, Error> {
+    match value {
+        Number(found): {
+            const parsed = parse.U64(found) else error {
+                discard error
+                return .Err(.Protocol)
+            }
+            .Ok(parsed)
+        }
+        _: .Err(.Protocol)
+    }
+}

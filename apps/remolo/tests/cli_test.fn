@@ -1,0 +1,381 @@
+package remolo.cli
+
+import foundation.web
+import std.collections
+import std.terminal
+import std.text
+
+test "host options preserve defaults" {
+    const args [1]String = ["host"]
+    const options = parseHostOptions(args) else {
+        fail("default host options failed")
+    }
+    expect(options.bindAddress == "0.0.0.0")
+    expect(options.advertiseAddress == "")
+    expect(options.port == 0)
+    expect(options.ttl == 86400)
+    expect(!options.readOnly)
+    expect(!options.once)
+}
+
+test "host options parse their own flags" {
+    const args [14]String = [
+        "host",
+        "-b",
+        "127.0.0.1:24001",
+        "--advertise",
+        "10.0.0.8",
+        "--ttl",
+        "90s",
+        "--identity",
+        "host.pem",
+        "--file-root",
+        "files",
+        "--rendezvous",
+        "https://rendezvous.example",
+        "--once"
+    ]
+    const options = parseHostOptions(args) else {
+        fail("host option parsing failed")
+    }
+    expect(options.bindAddress == "127.0.0.1")
+    expect(options.advertiseAddress == "10.0.0.8")
+    expect(options.port == 24001)
+    expect(options.ttl == 90)
+    expect(options.identityPath == "host.pem")
+    expect(options.fileRoot == "files")
+    expect(options.rendezvous == "https://rendezvous.example")
+    expect(options.once)
+}
+
+test "host options reject foreign flags" {
+    const args [2]String = ["host", "--pull"]
+    const result = parseHostOptions(args)
+    match result {
+        Ok(options): {
+            discard options
+            fail("foreign host option was accepted")
+        }
+        Err(error): expect(error.code == 2)
+    }
+}
+
+test "nonpositive host ttl restores the default" {
+    const zero = parseHostOptions(["host", "--ttl", "0s"]) else {
+        fail("zero host ttl failed")
+    }
+    expect(zero.ttl == 86400)
+
+    const negative = parseHostOptions(["host", "--ttl", "-1s"]) else {
+        fail("negative host ttl failed")
+    }
+    expect(negative.ttl == 86400)
+}
+
+test "host options preserve capability and approval policy" {
+    const args [8]String = [
+        "host",
+        "--cap",
+        "pty",
+        "--cap",
+        "file",
+        "--cmd",
+        "bash",
+        "--approve"
+    ]
+    const options = parseHostOptions(args) else {
+        fail("host policy parsing failed")
+    }
+    expect(text.Contains(options.capabilities, "|pty|"))
+    expect(text.Contains(options.capabilities, "|file|"))
+    expect(text.Contains(options.commands, "|bash|"))
+    expect(options.approve)
+}
+
+test "sync flags are command specific" {
+    const args [11]String = [
+        "sync",
+        "token",
+        "local",
+        "remote",
+        "--pull",
+        "--delete",
+        "--dry-run",
+        "--exclude",
+        "*.tmp",
+        "--exclude=cache",
+        "--exclude=logs/*"
+    ]
+    const options = parseSyncOptions(args, 4) else {
+        fail("sync option parsing failed")
+    }
+    expect(options.pull)
+    expect(options.delete)
+    expect(options.dryRun)
+    expect(options.excludes.Len() == 3)
+}
+
+test "root and command help stay successful" {
+    const empty [0]String = []
+    const root = execute(empty) else { fail("root help failed") }
+    expect(root == 0)
+
+    const help [2]String = ["host", "--help"]
+    const command = execute(help) else { fail("command help failed") }
+    expect(command == 0)
+
+    const version [1]String = ["--version"]
+    const printed = execute(version) else { fail("version failed") }
+    expect(printed == 0)
+}
+
+test "exec keeps the command tail in order" {
+    const args [5]String = ["exec", "token", "ls", "-l", "/tmp"]
+    var command = commandArguments(args, 2)
+    const first = command.PopFront()
+    const second = command.PopFront()
+    const third = command.PopFront()
+    match first {
+        None: fail("first command argument missing")
+        Some(value): expect(value == "ls")
+    }
+    match second {
+        None: fail("second command argument missing")
+        Some(value): expect(value == "-l")
+    }
+    match third {
+        None: fail("third command argument missing")
+        Some(value): expect(value == "/tmp")
+    }
+}
+
+test "exec options preserve remote process settings" {
+    const args [11]String = [
+        "exec",
+        "token",
+        "--cwd=/srv/app",
+        "--env",
+        "MODE=test",
+        "--env=PORT=8080",
+        "-t",
+        "--",
+        "sh",
+        "-c",
+        "pwd"
+    ]
+    const options = parseExecOptions(args) else {
+        fail("exec option parsing failed")
+    }
+    expect(options.directory == "/srv/app")
+    expect(options.environment.Len() == 2)
+    expect(options.terminal)
+    expect(options.commandStart == 8)
+}
+
+test "connect options select recording" {
+    const args [6]String = [
+        "connect",
+        "token",
+        "--record",
+        "session.cast",
+        "--",
+        "sh"
+    ]
+    const options = parseConnectOptions(args) else {
+        fail("connect option parsing failed")
+    }
+    expect(options.record == "session.cast")
+    expect(options.commandStart == 5)
+}
+
+test "connect options preserve jump and SSH fallback" {
+    const args [15]String = [
+        "connect",
+        "token",
+        "-J",
+        "bastion",
+        "-A",
+        "--ssh-addr",
+        "example.com:22",
+        "--ssh-user",
+        "mirko",
+        "--ssh-key",
+        "id_ed25519",
+        "--ssh-known-hosts",
+        "known_hosts",
+        "--ssh-target",
+        "127.0.0.1:24001"
+    ]
+    const parsed = parseConnectOptions(args) else {
+        fail("connect transport options failed")
+    }
+    var options = parsed
+    expect(options.jump == "bastion")
+    expect(options.forwardAgent)
+    expect(options.sshAddress == "example.com:22")
+    expect(options.sshUser == "mirko")
+    expect(options.sshKey == "id_ed25519")
+    expect(options.sshKnownHosts == "known_hosts")
+    expect(options.sshTarget == "127.0.0.1:24001")
+    const selected = replace options.connection.SSH with .None
+    const rung = match selected {
+        None: panic("SSH rung missing")
+        Some(value): value
+    }
+    expect(rung.Address == "example.com:22")
+    expect(rung.User == "mirko")
+    expect(rung.KeyPath == "id_ed25519")
+    expect(rung.KnownHosts == "known_hosts")
+    expect(rung.Target == "127.0.0.1:24001")
+    discard rung
+}
+
+test "manual fallback accepts an explicit endpoint" {
+    const candidate = manualCandidate("10.0.0.8:49213", "unused") else {
+        fail("manual fallback endpoint failed")
+    }
+    expect(candidate.IP == "10.0.0.8")
+    expect(candidate.Port == 49213)
+}
+
+test "asciinema header declares terminal dimensions" {
+    const header = castHeader(terminal.Size { Columns = 120 Rows = 40 }) else {
+        fail("cast header failed")
+    }
+    expect(text.Contains(header, "\"version\":2"))
+    expect(text.Contains(header, "\"width\":120"))
+    expect(text.Contains(header, "\"height\":40"))
+}
+
+test "browser commands keep local defaults and validate frame rate" {
+    const defaults [2]String = ["desktop", "token"]
+    const options = parseBrowserOptions(defaults, 2, true) else {
+        fail("browser defaults failed")
+    }
+    expect(options.address == "127.0.0.1")
+    expect(options.port == 0)
+    expect(options.open)
+    expect(options.fps == 15)
+
+    const configured [7]String = [
+        "desktop",
+        "token",
+        "--addr",
+        "127.0.0.1:24002",
+        "--fps",
+        "30",
+        "--no-open"
+    ]
+    const selected = parseBrowserOptions(configured, 2, true) else {
+        fail("browser options failed")
+    }
+    expect(selected.address == "127.0.0.1")
+    expect(selected.port == 24002)
+    expect(!selected.open)
+    expect(selected.fps == 30)
+
+    const invalid [4]String = ["desktop", "token", "--fps", "0"]
+    match parseBrowserOptions(invalid, 2, true) {
+        Ok(value): {
+            discard value
+            fail("invalid frame rate was accepted")
+        }
+        Err(error): expect(error.code == 2)
+    }
+}
+
+test "forward options keep local and SOCKS values separate" {
+    const args [6]String = [
+        "forward",
+        "token",
+        "-L",
+        "8080:example.com:80",
+        "-D",
+        "1080"
+    ]
+    const options = parseForwardOptions(args) else {
+        fail("forward options failed")
+    }
+    expect(options.local == "8080:example.com:80")
+    expect(options.socks == "1080")
+    const local = parseLocalSpec(options.local) else {
+        fail("local forward parsing failed")
+    }
+    expect(local.address == "127.0.0.1")
+    expect(local.port == 8080)
+    expect(local.target == "example.com:80")
+}
+
+test "snapshot options select diff mode" {
+    const args [7]String = [
+        "snapshot",
+        "token",
+        "--num",
+        "3",
+        "--out",
+        "frames",
+        "--diff"
+    ]
+    const options = parseSnapshotOptions(args) else {
+        fail("snapshot options failed")
+    }
+    expect(options.count == 3)
+    expect(options.output == "frames")
+    const diff = match options.mode {
+        Diff: true
+        _: false
+    }
+    expect(diff)
+}
+
+test "file browser input splits command words" {
+    const input = parseFSInput("put local.txt remote.txt") else {
+        fail("file browser input failed")
+    }
+    const fsInput { command arguments } = input
+    const put = match command {
+        Put: true
+        _: false
+    }
+    expect(put)
+    expect(arguments.Len() == 2)
+}
+
+test "REST rejects wrong methods with a JSON response" {
+    const handled = restMethodGuard(
+        $restRequest(.POST, "/sysinfo"),
+        acceptedRESTRequest
+    )
+    const response = handled else {
+        fail("REST method guard failed")
+    }
+    var active = response
+    expect(active.Status == 405)
+    const allow = active.Header("Allow")
+    match allow {
+        Some(value): expect(value == "GET")
+        None: fail("REST method response omitted Allow")
+    }
+    const body = active.TextBody() else {
+        fail("REST method response was not text")
+    }
+    expect(body == "{\"error\":\"method not allowed\"}\n")
+}
+
+fn restRequest(method web.Method, path String) web.Request {
+    web.Request {
+        Method = method
+        Target = text.Copy(path)
+        Path = text.Copy(path)
+        Version = "HTTP/1.1"
+        Headers = collections.NewList<web.HeaderValue>()
+        Params = collections.NewList<web.Parameter>()
+    }
+}
+
+fn acceptedRESTRequest(
+    $request web.Request
+) Result<web.Response, web.DispatchError<browserError>> {
+    discard request
+    .Ok(web.Empty(204))
+}

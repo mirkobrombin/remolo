@@ -1,0 +1,249 @@
+package remolo.token
+
+import std.bytes
+
+struct cborHead {
+    major u64
+    length u64
+}
+
+struct cborReader {
+    source own bytes.Bytes
+    offset u64
+
+    fn ReadHead(&self) Result<cborHead, TokenError> {
+        const initial = self.ReadByte() else error {
+            return .Err(error)
+        }
+        const major = initial >> 5
+        const additional = initial & 31
+        const length = self.ReadLength(additional) else error {
+            return .Err(error)
+        }
+        .Ok(cborHead { major = major length = length })
+    }
+
+    fn ReadLength(&self, additional u64) Result<u64, TokenError> {
+        if additional < 24 return .Ok(additional)
+        if additional > 27 return .Err(.InvalidCBOR)
+        self.ReadIntegerBytes(1 << (additional - 24))
+    }
+
+    fn ReadIntegerBytes(&self, count u64) Result<u64, TokenError> {
+        if self.Remaining() < count return .Err(.Truncated)
+        var result u64 = 0
+        var read u64 = 0
+        while read < count {
+            const byte = self.ReadByte() else error {
+                return .Err(error)
+            }
+            result = result << 8 | byte
+            read += 1
+        }
+        .Ok(result)
+    }
+
+    fn ReadByte(&self) Result<u64, TokenError> {
+        if self.Remaining() == 0 return .Err(.Truncated)
+        const value = self.source.At(self.offset) else error {
+            discard error
+            return .Err(.Storage)
+        }
+        self.offset += 1
+        .Ok(value)
+    }
+
+    fn ReadBytes(&self, length u64) Result<own bytes.Bytes, TokenError> {
+        if length > self.Remaining() return .Err(.Truncated)
+        const result = self.source.Slice(self.offset, self.offset + length) else error {
+            discard error
+            return .Err(.Storage)
+        }
+        self.offset += length
+        .Ok(result)
+    }
+
+    fn ReadUnsigned(&self) Result<u64, TokenError> {
+        const head = self.ReadHead() else error {
+            return .Err(error)
+        }
+        if head.major != 0 return .Err(.InvalidCBOR)
+        .Ok(head.length)
+    }
+
+    fn ReadBinary(&self, limit u64) Result<own bytes.Bytes, TokenError> {
+        const head = self.ReadHead() else error {
+            return .Err(error)
+        }
+        if head.major != 2 return .Err(.InvalidCBOR)
+        if head.length > limit return .Err(.TooLarge)
+        self.ReadBytes(head.length)
+    }
+
+    fn ReadText(&self, limit u64) Result<String, TokenError> {
+        const head = self.ReadHead() else error {
+            return .Err(error)
+        }
+        if head.major != 3 return .Err(.InvalidCBOR)
+        if head.length > limit return .Err(.TooLarge)
+        const raw = self.ReadBytes(head.length) else error {
+            return .Err(error)
+        }
+        const value = raw.Text() else error {
+            discard error
+            return .Err(.InvalidCBOR)
+        }
+        .Ok(value)
+    }
+
+    fn ReadArrayLength(&self, limit u64) Result<u64, TokenError> {
+        self.ReadContainerLength(4, limit)
+    }
+
+    fn ReadMapLength(&self, limit u64) Result<u64, TokenError> {
+        self.ReadContainerLength(5, limit)
+    }
+
+    fn ReadContainerLength(&self, major u64, limit u64) Result<u64, TokenError> {
+        const head = self.ReadHead() else error {
+            return .Err(error)
+        }
+        if head.major != major return .Err(.InvalidCBOR)
+        if head.length > limit return .Err(.TooLarge)
+        .Ok(head.length)
+    }
+
+    fn Remaining(self) u64 {
+        const length = self.source.Len() else error {
+            discard error
+            panic("CBOR source invariant failed")
+        }
+        length - self.offset
+    }
+
+    fn SkipValue(&self, depth u64) Result<void, TokenError> {
+        if depth > 16 return .Err(.TooLarge)
+        const head = self.ReadHead() else error {
+            return .Err(error)
+        }
+        if head.major == 0 || head.major == 1 return .Ok
+        if head.major == 2 || head.major == 3 {
+            const skipped = self.ReadBytes(head.length) else error {
+                return .Err(error)
+            }
+            discard skipped
+            return .Ok
+        }
+        if head.major == 4 return self.SkipItems(head.length, depth + 1)
+        if head.major == 5 return self.SkipItems(head.length * 2, depth + 1)
+        .Err(.InvalidCBOR)
+    }
+
+    fn SkipItems(&self, count u64, depth u64) Result<void, TokenError> {
+        var index u64 = 0
+        while index < count {
+            self.SkipValue(depth) else error {
+                return .Err(error)
+            }
+            index += 1
+        }
+        .Ok
+    }
+}
+
+fn newCBORReader($source own bytes.Bytes) own cborReader {
+    own cborReader { source = source offset = 0 }
+}
+
+fn writeCBORUnsigned(&builder bytes.Builder, value u64) Result<void, TokenError> {
+    writeCBORMajor(&builder, 0, value)
+}
+
+fn writeCBORBinary(&builder bytes.Builder, value bytes.Bytes) Result<void, TokenError> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    writeCBORMajor(&builder, 2, length) else error {
+        return .Err(error)
+    }
+    builder.Write(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn writeCBORText(&builder bytes.Builder, value String) Result<void, TokenError> {
+    const encoded = bytes.FromText(value)
+    const length = encoded.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    writeCBORMajor(&builder, 3, length) else error {
+        return .Err(error)
+    }
+    builder.Write(encoded) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn writeCBORArray(&builder bytes.Builder, length u64) Result<void, TokenError> {
+    writeCBORMajor(&builder, 4, length)
+}
+
+fn writeCBORMap(&builder bytes.Builder, length u64) Result<void, TokenError> {
+    writeCBORMajor(&builder, 5, length)
+}
+
+fn writeCBORMajor(
+    &builder bytes.Builder,
+    major u64,
+    value u64
+) Result<void, TokenError> {
+    if value < 24 return writeCBORByte(&builder, major << 5 | value)
+    if value <= 255 {
+        writeCBORByte(&builder, major << 5 | 24) else error { return .Err(error) }
+        return writeCBORByte(&builder, value)
+    }
+    if value <= 65535 {
+        writeCBORByte(&builder, major << 5 | 25) else error { return .Err(error) }
+        writeCBORByte(&builder, value >> 8) else error { return .Err(error) }
+        return writeCBORByte(&builder, value & 255)
+    }
+    if value <= 4294967295 {
+        writeCBORByte(&builder, major << 5 | 26) else error { return .Err(error) }
+        writeCBORIntegerBytes(&builder, value, 4)
+    } else {
+        writeCBORByte(&builder, major << 5 | 27) else error { return .Err(error) }
+        writeCBORIntegerBytes(&builder, value, 8)
+    }
+}
+
+fn writeCBORIntegerBytes(
+    &builder bytes.Builder,
+    value u64,
+    count u64
+) Result<void, TokenError> {
+    var shift = (count - 1) * 8
+    while true {
+        writeCBORByte(&builder, value >> shift & 255) else error {
+            return .Err(error)
+        }
+        if shift == 0 break
+        shift -= 8
+    }
+    .Ok
+}
+
+fn writeCBORByte(&builder bytes.Builder, value u64) Result<void, TokenError> {
+    builder.WriteByte(value) else error {
+        return .Err(match error {
+            TooLarge: .TooLarge
+            _: .Storage
+        })
+    }
+    .Ok
+}

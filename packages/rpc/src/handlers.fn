@@ -1,0 +1,333 @@
+package remolo.rpc
+
+import remolo.identity
+import std.bytes
+import std.json
+import std.platform
+import std.process
+import std.system
+import std.text
+import std.time
+
+task dispatch(
+    $value request,
+    $root String,
+    $authorizedPath String,
+    allowExec bool,
+    startedAt time.MonotonicInstant
+) response {
+    const request { id method params } = value
+    const dispatching = spawn dispatchMethod(
+        $method,
+        $params,
+        $root,
+        $authorizedPath,
+        allowExec,
+        startedAt
+    )
+    const result = $dispatching.wait()
+    match result {
+        Ok(found): response { id = id result = .Some(found) error = "" }
+        Err(error): response {
+            id = id
+            result = .None
+            error = errorMessage($error)
+        }
+    }
+}
+
+task dispatchMethod(
+    $method String,
+    $params Option<json.Value>,
+    $root String,
+    $authorizedPath String,
+    allowExec bool,
+    startedAt time.MonotonicInstant
+) Result<json.Value, Error> {
+    if method == "sysinfo" {
+        discard method
+        discard params
+        discard root
+        discard authorizedPath
+        return systemInfoValue(startedAt)
+    }
+    if method == "ls" {
+        discard method
+        const selected = takePath($params) else error { return .Err(error) }
+        const result = listValue(root, selected)
+        discard root
+        discard authorizedPath
+        return result
+    }
+    if method == "stat" {
+        discard method
+        const selected = takePath($params) else error { return .Err(error) }
+        if text.IsEmpty(selected) return .Err(.InvalidRequest)
+        const result = statValue(root, selected)
+        discard root
+        discard authorizedPath
+        return result
+    }
+    if method == "pread" || method == "pwrite" || text.StartsWith(method, "f") {
+        discard authorizedPath
+        const dispatching = spawn dispatchFilesystemMethod($method, $params, $root)
+        const result = $dispatching.wait()
+        return result
+    }
+    if method == "exec" {
+        discard method
+        discard root
+        discard authorizedPath
+        if !allowExec {
+            discard params
+            return .Err(.Execution)
+        }
+        return executeValue($params)
+    }
+    if method == "enroll" {
+        discard method
+        discard root
+        const result = enrollValue($params, authorizedPath)
+        discard authorizedPath
+        return result
+    }
+    discard method
+    discard params
+    discard root
+    discard authorizedPath
+    .Err(.InvalidRequest)
+}
+
+task dispatchFilesystemMethod(
+    $method String,
+    $params Option<json.Value>,
+    $root String
+) Result<json.Value, Error> {
+    if method == "pread" {
+        discard method
+        const reading = spawn readValue($params, $root)
+        const result = $reading.wait()
+        return result
+    }
+    if method == "pwrite" {
+        discard method
+        const writing = spawn writeValue($params, $root)
+        const result = $writing.wait()
+        return result
+    }
+    if method == "ftruncate" {
+        discard method
+        const truncating = spawn truncateValue($params, $root)
+        const result = $truncating.wait()
+        return result
+    }
+    if method == "fcreate" {
+        discard method
+        const creating = spawn createValue($params, $root)
+        const result = $creating.wait()
+        return result
+    }
+    if method == "fmkdir" {
+        discard method
+        const creating = spawn makeDirectoryValue($params, $root)
+        const result = $creating.wait()
+        return result
+    }
+    if method == "fremove" {
+        discard method
+        const removing = spawn removeValue($params, $root)
+        const result = $removing.wait()
+        return result
+    }
+    if method == "frename" {
+        discard method
+        const renaming = spawn renameValue($params, $root)
+        const result = $renaming.wait()
+        return result
+    }
+    discard method
+    discard params
+    discard root
+    .Err(.InvalidRequest)
+}
+
+fn enrollValue(
+    $params Option<json.Value>,
+    authorizedPath String
+) Result<json.Value, Error> {
+    if text.IsEmpty(authorizedPath) {
+        discard params
+        return .Err(.Authentication)
+    }
+    const value = match params {
+        Some(found): found
+        None: { return .Err(.InvalidRequest) }
+    }
+    const selected = objectValue($value) else error { return .Err(error) }
+    var object = selected
+    const encoded = takeText(&object, "pubkey") else error {
+        return .Err(error)
+    }
+    const label = takeOptionalText(&object, "label") else error {
+        return .Err(error)
+    }
+    const publicKey = bytes.DecodeBase64(encoded) else error {
+        discard error
+        return .Err(.InvalidRequest)
+    }
+    const length = publicKey.Len() else error {
+        discard error
+        return .Err(.InvalidRequest)
+    }
+    if length != 32 {
+        discard publicKey
+        return .Err(.InvalidRequest)
+    }
+    const adding = spawn identity.AddAuthorized(
+        $text.Copy(authorizedPath),
+        $publicKey,
+        $label
+    )
+    const added = $adding.wait()
+    match added {
+        Ok(value): { discard value }
+        Err(error): {
+            discard error
+            return .Err(.Authentication)
+        }
+    }
+    var response = json.NewObject()
+    setBool(&response, "ok", true) else error { return .Err(error) }
+    .Ok(.Object(response))
+}
+
+fn systemInfoValue(startedAt time.MonotonicInstant) Result<json.Value, Error> {
+    const systemInfo = system.Snapshot() else error {
+        discard error
+        return .Err(.System)
+    }
+    const system.Info { Hostname Architecture LogicalCPUs } = systemInfo
+    const elapsed = time.MonotonicNow().Since(startedAt) else error {
+        discard error
+        return .Err(.System)
+    }
+    const seconds = u64.From(elapsed.Seconds()) else error {
+        discard error
+        return .Err(.System)
+    }
+    var object = json.NewObject()
+    setText(&object, "os", platform.Name(platform.Current())) else error {
+        return .Err(error)
+    }
+    setText(&object, "arch", Architecture) else error { return .Err(error) }
+    setText(&object, "hostname", Hostname) else error { return .Err(error) }
+    setNumber(&object, "numcpu", LogicalCPUs) else error {
+        return .Err(error)
+    }
+    setNumber(&object, "uptime", seconds) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn listValue(root String, requested String) Result<json.Value, Error> {
+    const entries = listPath(root, requested) else error { return .Err(error) }
+    var pending = entries
+    var array = json.NewArray()
+    while !pending.IsEmpty() {
+        const entry = match pending.PopFront() {
+            Some(found): found
+            None: { panic("RPC directory list invariant failed") }
+        }
+        const encoded = dirEntryValue(entry) else error { return .Err(error) }
+        array.Add($encoded)
+    }
+    .Ok(.Array(array))
+}
+
+fn statValue(root String, requested String) Result<json.Value, Error> {
+    const value = statPath(root, requested) else error { return .Err(error) }
+    var object = json.NewObject()
+    setText(&object, "name", value.Name) else error { return .Err(error) }
+    setNumber(&object, "size", value.Size) else error { return .Err(error) }
+    setBool(&object, "is_dir", value.IsDir) else error { return .Err(error) }
+    setText(&object, "mode", value.Mode) else error { return .Err(error) }
+    setNumber(&object, "mod_time", value.ModTime) else error {
+        return .Err(error)
+    }
+    .Ok(.Object(object))
+}
+
+fn dirEntryValue(value DirEntry) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setText(&object, "name", value.Name) else error { return .Err(error) }
+    setNumber(&object, "size", value.Size) else error { return .Err(error) }
+    setBool(&object, "is_dir", value.IsDir) else error { return .Err(error) }
+    setText(&object, "mode", value.Mode) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn executeValue(
+    $params Option<json.Value>
+) Result<json.Value, Error> {
+    const command = takeCommand($params) else error { return .Err(error) }
+    var arguments = command
+    const program = match arguments.PopFront() {
+        Some(found): found
+        None: { return .Err(.InvalidRequest) }
+    }
+    const opened = process.Open(program, $process.DefaultOptions()) else error {
+        discard error
+        discard arguments
+        return .Err(.Execution)
+    }
+    var active = opened
+    while !arguments.IsEmpty() {
+        const argument = match arguments.PopFront() {
+            Some(found): found
+            None: { panic("RPC command list invariant failed") }
+        }
+        active.AddArgument(argument) else error {
+            discard error
+            discard arguments
+            return .Err(.Execution)
+        }
+    }
+    const output = active.Capture() else error {
+        discard error
+        return .Err(.Execution)
+    }
+    const process.Output { ExitCode Stdout Stderr } = output
+    const stdout = Stdout.Text() else error {
+        discard error
+        discard Stderr
+        return .Err(.Execution)
+    }
+    const stderr = Stderr.Text() else error {
+        discard error
+        return .Err(.Execution)
+    }
+    var object = json.NewObject()
+    setText(&object, "stdout", stdout) else error { return .Err(error) }
+    setText(&object, "stderr", stderr) else error { return .Err(error) }
+    setSigned(&object, "code", ExitCode) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn errorMessage($error Error) String {
+    match error {
+        Remote(message): message
+        InvalidRequest: "rpc: invalid request"
+        File: "rpc: file operation failed"
+        Execution: "rpc: command failed"
+        System: "rpc: system information unavailable"
+        Authentication: "rpc: enrollment unavailable"
+        NotFound: "rpc: no such file"
+        AlreadyExists: "rpc: file exists"
+        Permission: "rpc: permission denied"
+        NotEmpty: "rpc: directory not empty"
+        NotDirectory: "rpc: not a directory"
+        IsDirectory: "rpc: is a directory"
+        Storage: "rpc: storage failed"
+        Protocol: "rpc: protocol error"
+        Transport: "rpc: transport error"
+    }
+}

@@ -1,0 +1,5 @@
+format foundation.lock/v1
+root remolo.token 1.0.0
+target linux
+package remolo.codec 1.0.0 sha256:0b669009e86d2d19ad75fb45e813fbc25b11c68889b94a2bc9e5a74dadda0f70 path ../codec
+edge remolo.token remolo.codec

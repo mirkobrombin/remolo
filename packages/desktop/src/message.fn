@@ -1,0 +1,133 @@
+package remolo.desktop
+
+import std.bytes
+import std.json
+
+fn EncodeHello($value own Hello) Result<own bytes.Bytes, Error> {
+    const Hello { Modes Width Height } = value
+    var modes = Modes
+    var array = json.NewArray()
+    while !modes.IsEmpty() {
+        const mode = modeValue(modes.PopFront())
+        array.Add($ .Text(ModeName(mode)))
+    }
+    var object = json.NewObject()
+    desktopSet(&object, "modes", $ .Array(array)) else error {
+        return .Err(error)
+    }
+    desktopSetNumber(&object, "w", Width) else error { return .Err(error) }
+    desktopSetNumber(&object, "h", Height) else error { return .Err(error) }
+    desktopEncodeJSON($object)
+}
+
+fn DecodeHello(source bytes.Bytes) Result<own Hello, Error> {
+    const parsed = desktopParseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const modes = desktopModes(&object) else error { return .Err(error) }
+    const width = desktopRequiredU64(&object, "w") else error {
+        return .Err(error)
+    }
+    const height = desktopRequiredU64(&object, "h") else error {
+        return .Err(error)
+    }
+    .Ok(own Hello { Modes = modes Width = width Height = height })
+}
+
+fn EncodeSelect(value Select) Result<own bytes.Bytes, Error> {
+    var object = json.NewObject()
+    desktopSetText(&object, "mode", ModeName(value.Mode)) else error {
+        return .Err(error)
+    }
+    desktopSetNumber(&object, "fps", normalizedFPS(value.FPS)) else error {
+        return .Err(error)
+    }
+    desktopEncodeJSON($object)
+}
+
+fn DecodeSelect(source bytes.Bytes) Result<Select, Error> {
+    const parsed = desktopParseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const name = desktopRequiredText(&object, "mode") else error {
+        return .Err(error)
+    }
+    const mode = ModeFor(name) else error { return .Err(error) }
+    const fps = desktopRequiredU64(&object, "fps") else error {
+        return .Err(error)
+    }
+    .Ok(Select { Mode = mode FPS = normalizedFPS(fps) })
+}
+
+fn EncodeInput(value InputEvent) Result<own bytes.Bytes, Error> {
+    var object = json.NewObject()
+    desktopSetText(&object, "type", inputKindName(value.Type)) else error {
+        return .Err(error)
+    }
+    desktopSetNumber(&object, "x", value.X) else error { return .Err(error) }
+    desktopSetNumber(&object, "y", value.Y) else error { return .Err(error) }
+    desktopSetNumber(&object, "button", value.Button) else error {
+        return .Err(error)
+    }
+    desktopSetNumber(&object, "key", value.Key) else error { return .Err(error) }
+    desktopSet(&object, "down", $ .Bool(value.Down)) else error {
+        return .Err(error)
+    }
+    desktopSetSigned(&object, "dy", value.Delta) else error {
+        return .Err(error)
+    }
+    desktopEncodeJSON($object)
+}
+
+fn DecodeInput(source bytes.Bytes) Result<InputEvent, Error> {
+    const parsed = desktopParseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const name = desktopRequiredText(&object, "type") else error {
+        return .Err(error)
+    }
+    const kind = inputKindFor(name) else error { return .Err(error) }
+    const x = desktopOptionalU64(&object, "x") else error { return .Err(error) }
+    const y = desktopOptionalU64(&object, "y") else error { return .Err(error) }
+    const button = desktopOptionalU64(&object, "button") else error {
+        return .Err(error)
+    }
+    const key = desktopOptionalU64(&object, "key") else error {
+        return .Err(error)
+    }
+    const down = desktopOptionalBool(&object, "down") else error {
+        return .Err(error)
+    }
+    const delta = desktopOptionalI64(&object, "dy") else error {
+        return .Err(error)
+    }
+    .Ok(InputEvent {
+        Type = kind
+        X = x
+        Y = y
+        Button = button
+        Key = key
+        Down = down
+        Delta = delta
+    })
+}
+
+fn inputKindName(value InputKind) String {
+    match value {
+        MouseMove: "mousemove"
+        MouseButton: "mousebutton"
+        Key: "key"
+        Wheel: "wheel"
+    }
+}
+
+fn inputKindFor(value String) Result<InputKind, Error> {
+    if value == "mousemove" return .Ok(.MouseMove)
+    if value == "mousebutton" return .Ok(.MouseButton)
+    if value == "key" return .Ok(.Key)
+    if value == "wheel" return .Ok(.Wheel)
+    .Err(.Protocol)
+}
+
+fn normalizedFPS(value u64) u64 {
+    if value == 0 return 10
+    if value > 60 return 60
+    value
+}

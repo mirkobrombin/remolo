@@ -1,100 +1,507 @@
-name: ci
+name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: ["main"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    name: build + vet (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  unix:
+    name: ${{ matrix.name }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            target: linux
+            openssl_target: linux-x86_64
+            behavior: true
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            target: linux
+            openssl_target: linux-aarch64
+            behavior: false
+          - name: macOS x64
+            os: macos-15-intel
+            target: macos
+            openssl_target: darwin64-x86_64-cc
+            behavior: false
+          - name: macOS arm64
+            os: macos-15
+            target: macos
+            openssl_target: darwin64-arm64-cc
+            behavior: false
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          go-version: '1.25'
-          check-latest: true
-      - name: Build
-        run: go build ./...
-      - name: Vet
-        run: go vet ./...
+          path: source
+          persist-credentials: false
 
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout Foundation Lang
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          go-version: '1.25'
-      - name: Test
-        run: go test -timeout 180s ./...
+          repository: mirkobrombin/foundation-lang
+          ref: eb31584b36506df0e8e3839c4e6408e62ac172f9
+          path: toolchain
+          persist-credentials: false
 
-  race:
-    name: race detector
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout libdatachannel
+        if: matrix.behavior
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          go-version: '1.25'
-      - name: Test (race)
-        run: go test -race -timeout 240s ./...
+          repository: paullouisageneau/libdatachannel
+          ref: c6696d157b5612df2a741d9a03b192b47ab6cefb
+          path: datachannel
+          submodules: recursive
+          persist-credentials: false
 
-  fuzz:
-    name: fuzz token parser
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-      - name: Fuzz
-        run: go test ./internal/token/ -run x -fuzz FuzzDecode -fuzztime 60s
-
-  lint:
-    name: gofmt + cross-compile
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-      - name: gofmt
-        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
-      - name: Cross-compile matrix (CGO-free)
-        run: ./scripts/build.sh
-
-  scan:
-    name: euprovguard scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download euprovguard
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
-          curl -sL https://github.com/fabricatorsltd/euprovguard/releases/download/v1.1.0/euprovguard-linux-amd64 -o euprovguard
-          chmod +x euprovguard
-      - name: Scan
+          wget -qO "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
+          chmod +x "$RUNNER_TEMP/llvm.sh"
+          sudo "$RUNNER_TEMP/llvm.sh" 21
+          sudo apt-get install --no-install-recommends -y libfuse3-dev llvm-21-dev
+          echo "LLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
-          ./euprovguard -path . -bundle compliance-report > scan.log 2>&1
-          cat scan.log
-      - name: Check for CVEs
+          brew install llvm@21 lld@21
+          echo "LLVM_DIR=$(brew --prefix llvm@21)/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld@21)/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare macFUSE SDK
+        if: runner.os == 'macOS'
         run: |
-          if grep -q "CVEs: [1-9]" scan.log; then
-            echo "::error::CVEs found by euprovguard"
+          image="$RUNNER_TEMP/macfuse-5.3.3.dmg"
+          curl --fail --location --output "$image" \
+            https://github.com/macfuse/macfuse/releases/download/macfuse-5.3.3/macfuse-5.3.3.dmg
+          echo "7a0b7b66c0e7f8932707d1215dc9cf486e178d097ae0a2dcdf17d8530566aa15  $image" \
+            | shasum -a 256 --check
+          hdiutil attach -nobrowse -quiet "$image"
+          package=$(find /Volumes -maxdepth 3 -path '*macFUSE*' -name '*.pkg' -print -quit)
+          test -n "$package"
+          pkgutil --expand-full "$package" "$RUNNER_TEMP/macfuse-package"
+          header=$(find "$RUNNER_TEMP/macfuse-package" -path '*/fuse/fuse.h' -print -quit)
+          library=$(find "$RUNNER_TEMP/macfuse-package" -name 'libfuse*.dylib' -type f -print -quit)
+          test -n "$header"
+          test -n "$library"
+          include_root=$(dirname "$(dirname "$header")")
+          library_root=$(dirname "$library")
+          echo "FUSE_INCLUDE_ROOT=$include_root" >> "$GITHUB_ENV"
+          echo "FUSE_LIBRARY_ROOT=$library_root" >> "$GITHUB_ENV"
+
+      - name: Build pinned OpenSSL
+        run: |
+          mkdir -p "$RUNNER_TEMP/deps"
+          cd "$RUNNER_TEMP/deps"
+          curl --fail --location --remote-name \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.6/openssl-3.5.6.tar.gz
+          echo "deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736  openssl-3.5.6.tar.gz" \
+            | shasum -a 256 --check
+          tar -xzf openssl-3.5.6.tar.gz
+          cd openssl-3.5.6
+          ./Configure "${{ matrix.openssl_target }}" shared \
+            --prefix="$RUNNER_TEMP/deps/openssl-prefix"
+          make -j"$(getconf _NPROCESSORS_ONLN)"
+          make install_sw
+
+      - name: Configure native paths
+        run: |
+          include="$RUNNER_TEMP/deps/openssl-prefix/include"
+          openssl_lib="$RUNNER_TEMP/deps/openssl-prefix/lib"
+          openssl_lib64="$RUNNER_TEMP/deps/openssl-prefix/lib64"
+          libraries="$openssl_lib:$openssl_lib64"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            include="$include:$FUSE_INCLUDE_ROOT"
+            libraries="$libraries:$FUSE_LIBRARY_ROOT"
+          fi
+          compiler="$RUNNER_TEMP/foundation-cc"
+          cat > "$compiler" <<'EOF'
+          #!/bin/sh
+          exec cc -L"$FOUNDATION_OPENSSL_LIB" -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+          EOF
+          chmod +x "$compiler"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          echo "CPATH=$include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$libraries" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$libraries" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$libraries" >> "$GITHUB_ENV"
+          echo "FOUNDATION_CC=$compiler" >> "$GITHUB_ENV"
+          echo "FOUNDATION_OPENSSL_LIB=$openssl_lib" >> "$GITHUB_ENV"
+          echo "FOUNDATION_OPENSSL_LIB64=$openssl_lib64" >> "$GITHUB_ENV"
+
+      - name: Build pinned libdatachannel
+        if: matrix.behavior
+        run: |
+          prefix="$RUNNER_TEMP/deps/datachannel-prefix"
+          cmake -S datachannel -B datachannel/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DNO_EXAMPLES=ON \
+            -DNO_TESTS=ON \
+            -DOPENSSL_ROOT_DIR="$RUNNER_TEMP/deps/openssl-prefix" \
+            -DUSE_GNUTLS=OFF \
+            -DUSE_NICE=OFF
+          cmake --build datachannel/build --target install --parallel 3
+          library=$(find "$prefix" -type f -name 'libdatachannel.so*' -print -quit)
+          test -n "$library"
+          library_root=$(dirname "$library")
+          echo "LD_LIBRARY_PATH=$library_root:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build Foundation compiler
+        run: |
+          cmake -S toolchain -B toolchain/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$FOUNDATION_CC" \
+            -DLLVM_DIR="$LLVM_DIR"
+          cmake --build toolchain/build --target foundationc --parallel 3
+
+      - name: Verify source
+        working-directory: source
+        run: |
+          compiler="$GITHUB_WORKSPACE/toolchain/build/foundationc"
+          while IFS= read -r manifest; do
+            project=${manifest%/foundation.package}
+            "$compiler" package resolve "$project" --target "${{ matrix.target }}"
+            "$compiler" package check "$project" --target "${{ matrix.target }}"
+            "$compiler" lint "$project"
+          done < <(find apps packages -name foundation.package -print | sort)
+          "$compiler" imports --check .
+          "$compiler" format --check .
+
+      - name: Build applications
+        working-directory: source
+        run: |
+          compiler="$GITHUB_WORKSPACE/toolchain/build/foundationc"
+          provider="$GITHUB_WORKSPACE/toolchain/providers/openssl"
+          mkdir -p build
+          for entry in \
+            apps/remolo:remolo \
+            apps/remolo-relay:remolo-relay \
+            apps/remolo-rendezvous:remolo-rendezvous; do
+            project=${entry%%:*}
+            name=${entry##*:}
+            for backend in llvm c; do
+              "$compiler" build "$project" -o "build/$name-$backend" \
+                --backend "$backend" \
+                --native "$provider/foundation_openssl.c" \
+                --native "$provider/foundation_openssl_quic.c" \
+                --native-link ssl \
+                --native-link crypto
+            done
+          done
+          file build/*
+
+      - name: Test both backends
+        if: matrix.behavior
+        working-directory: source
+        run: |
+          compiler="$GITHUB_WORKSPACE/toolchain/build/foundationc"
+          provider="$GITHUB_WORKSPACE/toolchain/providers/openssl"
+          while IFS= read -r manifest; do
+            project=${manifest%/foundation.package}
+            for backend in llvm c; do
+              "$compiler" test "$project" \
+                --backend "$backend" \
+                --native "$provider/foundation_openssl.c" \
+                --native "$provider/foundation_openssl_quic.c" \
+                --native-link ssl \
+                --native-link crypto
+            done
+          done < <(find apps packages -name foundation.package -print | sort)
+
+  portable-linux:
+    name: Portable Linux ${{ matrix.arch }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: ubuntu-24.04
+            openssl_target: linux-x86_64
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            openssl_target: linux-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: source
+          persist-credentials: false
+
+      - name: Checkout Foundation Lang
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mirkobrombin/foundation-lang
+          ref: eb31584b36506df0e8e3839c4e6408e62ac172f9
+          path: toolchain
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          wget -qO "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
+          chmod +x "$RUNNER_TEMP/llvm.sh"
+          sudo "$RUNNER_TEMP/llvm.sh" 21
+          sudo apt-get install --no-install-recommends -y \
+            libfuse3-dev libzstd-dev llvm-21-dev zlib1g-dev
+          echo "LLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+      - name: Build static OpenSSL
+        run: |
+          mkdir -p "$RUNNER_TEMP/deps"
+          cd "$RUNNER_TEMP/deps"
+          curl --fail --location --remote-name \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.6/openssl-3.5.6.tar.gz
+          echo "deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736  openssl-3.5.6.tar.gz" \
+            | shasum -a 256 --check
+          tar -xzf openssl-3.5.6.tar.gz
+          cd openssl-3.5.6
+          ./Configure "${{ matrix.openssl_target }}" \
+            no-shared no-tests no-module no-jitter \
+            --prefix="$RUNNER_TEMP/deps/openssl-prefix"
+          make -j"$(getconf _NPROCESSORS_ONLN)"
+          make install_sw
+
+      - name: Configure static compiler driver
+        run: |
+          include="$RUNNER_TEMP/deps/openssl-prefix/include"
+          openssl_lib="$RUNNER_TEMP/deps/openssl-prefix/lib"
+          openssl_lib64="$RUNNER_TEMP/deps/openssl-prefix/lib64"
+          compiler="$RUNNER_TEMP/foundation-cc"
+          cat > "$compiler" <<'EOF'
+          #!/bin/sh
+          if [ "${FOUNDATION_STATIC_EXECUTABLE:-0}" = "1" ]; then
+            exec cc -static -L"$FOUNDATION_OPENSSL_LIB" \
+              -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+          fi
+          exec cc -L"$FOUNDATION_OPENSSL_LIB" \
+            -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+          EOF
+          chmod +x "$compiler"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          echo "CPATH=$include" >> "$GITHUB_ENV"
+          echo "FOUNDATION_CC=$compiler" >> "$GITHUB_ENV"
+          echo "FOUNDATION_OPENSSL_LIB=$openssl_lib" >> "$GITHUB_ENV"
+          echo "FOUNDATION_OPENSSL_LIB64=$openssl_lib64" >> "$GITHUB_ENV"
+
+      - name: Build Foundation compiler
+        run: |
+          cmake -S toolchain -B toolchain/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$FOUNDATION_CC" \
+            -DLLVM_DIR="$LLVM_DIR"
+          cmake --build toolchain/build --target foundationc --parallel 3
+
+      - name: Build portable executable
+        working-directory: source
+        env:
+          FOUNDATION_STATIC_EXECUTABLE: 1
+        run: |
+          compiler="$GITHUB_WORKSPACE/toolchain/build/foundationc"
+          provider="$GITHUB_WORKSPACE/toolchain/providers/openssl"
+          mkdir -p build artifact
+          "$compiler" build apps/remolo -o build/remolo \
+            --backend llvm \
+            --native "$provider/foundation_openssl.c" \
+            --native "$provider/foundation_openssl_quic.c" \
+            --native-link ssl \
+            --native-link crypto \
+            --native-link z \
+            --native-link zstd
+          strip build/remolo
+          if readelf -l build/remolo | grep -q 'INTERP'; then
+            echo "portable executable contains a program interpreter" >&2
             exit 1
           fi
-      - name: Upload compliance reports
-        if: always()
-        uses: actions/upload-artifact@v4
+          if readelf -d build/remolo 2>&1 | grep -q 'NEEDED'; then
+            echo "portable executable contains a shared dependency" >&2
+            exit 1
+          fi
+          build/remolo --version
+          install -m 0755 build/remolo artifact/remolo
+          tar -C artifact -czf "remolo-linux-${{ matrix.arch }}.tar.gz" remolo
+          sha256sum "remolo-linux-${{ matrix.arch }}.tar.gz" \
+            > "remolo-linux-${{ matrix.arch }}.tar.gz.sha256"
+
+      - name: Upload portable executable
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: compliance-reports
-          path: compliance-report.*
+          name: remolo-linux-${{ matrix.arch }}
+          path: |
+            source/remolo-linux-${{ matrix.arch }}.tar.gz
+            source/remolo-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  windows:
+    name: ${{ matrix.name }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-2025
+            cmake_arch: x64
+            vs_arch: amd64
+            openssl_target: VC-WIN64A
+            llvm_archive: clang+llvm-21.1.8-x86_64-pc-windows-msvc.tar.xz
+            llvm_digest: 749d22f565fcd5718dbed06512572d0e5353b502c03fe1f7f17ee8b8aca21a47
+          - name: Windows arm64
+            os: windows-11-vs2026-arm
+            cmake_arch: ARM64
+            vs_arch: arm64
+            openssl_target: VC-WIN64-ARM
+            llvm_archive: clang+llvm-21.1.8-aarch64-pc-windows-msvc.tar.xz
+            llvm_digest: f214b1226d8de005b5f691dd29d9dfea2b49e22d0de445429916173dbb626f7f
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: source
+          persist-credentials: false
+
+      - name: Checkout Foundation Lang
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mirkobrombin/foundation-lang
+          ref: eb31584b36506df0e8e3839c4e6408e62ac172f9
+          path: toolchain
+          persist-credentials: false
+
+      - name: Install LLVM 21
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "${{ matrix.llvm_archive }}"
+          $root = Join-Path $env:RUNNER_TEMP "llvm-21.1.8"
+          $asset = "${{ matrix.llvm_archive }}".Replace("+", "%2B")
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/$asset"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne "${{ matrix.llvm_digest }}") {
+            throw "LLVM archive checksum mismatch"
+          }
+          New-Item -ItemType Directory -Force $root | Out-Null
+          tar -xJf $archive -C $root --strip-components=1
+          "LLVM_DIR=$root\lib\cmake\llvm" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Activate MSVC environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $visualStudio = & $vswhere -latest -products * `
+            -property installationPath
+          $developerCommand = Join-Path $visualStudio "Common7\Tools\VsDevCmd.bat"
+          $environmentFile = Join-Path $env:RUNNER_TEMP "msvc-environment.txt"
+          cmd /d /s /c "`"$developerCommand`" -arch=${{ matrix.vs_arch }} >nul && set > `"$environmentFile`""
+          Get-Content $environmentFile | ForEach-Object {
+            if ($_ -match '^([^=][^=]*)=(.*)$') {
+              "$($matches[1])=$($matches[2])" | Out-File `
+                -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+      - name: Build pinned OpenSSL
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "openssl-3.5.6.tar.gz"
+          $source = Join-Path $env:RUNNER_TEMP "openssl-3.5.6"
+          $prefix = Join-Path $env:RUNNER_TEMP "openssl-prefix"
+          Invoke-WebRequest `
+            -Uri https://github.com/openssl/openssl/releases/download/openssl-3.5.6/openssl-3.5.6.tar.gz `
+            -OutFile $archive
+          $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne "deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736") {
+            throw "OpenSSL source checksum mismatch"
+          }
+          tar -xzf $archive -C $env:RUNNER_TEMP
+          Push-Location $source
+          perl Configure "${{ matrix.openssl_target }}" shared --prefix="$prefix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          nmake
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          nmake install_sw
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          "INCLUDE=$prefix\include;$env:INCLUDE" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB=$prefix\lib;$env:LIB" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build Foundation compiler
+        shell: pwsh
+        run: |
+          cmake -S toolchain -B toolchain/build -A "${{ matrix.cmake_arch }}" `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DLLVM_DIR=$env:LLVM_DIR"
+          cmake --build toolchain/build --config Release --target foundationc
+
+      - name: Verify source
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $compiler = "$env:GITHUB_WORKSPACE\toolchain\build\Release\foundationc.exe"
+          $projects = Get-ChildItem apps, packages -Filter foundation.package -Recurse |
+            Sort-Object FullName |
+            ForEach-Object { $_.DirectoryName }
+          foreach ($project in $projects) {
+            & $compiler package resolve $project --target windows
+            & $compiler package check $project --target windows
+            & $compiler lint $project
+          }
+          & $compiler imports --check .
+          & $compiler format --check .
+
+      - name: Build applications
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $compiler = "$env:GITHUB_WORKSPACE\toolchain\build\Release\foundationc.exe"
+          $provider = "$env:GITHUB_WORKSPACE\toolchain\providers\openssl"
+          $native = @(
+            "--native", "$provider\foundation_openssl.c",
+            "--native", "$provider\foundation_openssl_quic.c",
+            "--native-link", "libssl",
+            "--native-link", "libcrypto"
+          )
+          New-Item -ItemType Directory -Force build | Out-Null
+          $applications = @(
+            @("apps\remolo", "remolo"),
+            @("apps\remolo-relay", "remolo-relay"),
+            @("apps\remolo-rendezvous", "remolo-rendezvous")
+          )
+          foreach ($application in $applications) {
+            foreach ($backend in "llvm", "c") {
+              $output = "build\$($application[1])-$backend.exe"
+              & $compiler build $application[0] -o $output `
+                --backend $backend @native
+            }
+          }
+          Get-ChildItem build -Filter *.exe | Select-Object Name, Length

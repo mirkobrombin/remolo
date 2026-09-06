@@ -1,0 +1,184 @@
+package remolo.dirsync
+
+import std.bytes
+import std.format
+import std.json
+import std.parse
+import std.text
+
+fn EncodeSignature(
+    $value own Signature
+) Result<SignatureEncoding, Error> {
+    var signature = value
+    var restored = newSignature(signature.BlockSize)
+    var blocks = json.NewArray()
+    while signature.Len() > 0 {
+        const block = requiredBlock(signature.Take())
+        const encoded = encodeBlock(block) else error {
+            discard restored
+            discard signature
+            return .Err(error)
+        }
+        blocks.Add($encoded)
+        restored.add(block)
+    }
+    restored.reverse()
+    discard signature
+    var object = json.NewObject()
+    setJSONU64(&object, "bs", restored.BlockSize) else {
+        discard restored
+        return .Err(.Encoding)
+    }
+    object.Set($text.Copy("blocks"), $ .Array(blocks)) else error {
+        discard error
+        discard restored
+        return .Err(.Encoding)
+    }
+    const encoded = json.Stringify($ .Object(object)) else error {
+        discard error
+        discard restored
+        return .Err(.Encoding)
+    }
+    .Ok(SignatureEncoding {
+        Signature = restored
+        Data = bytes.FromText(encoded)
+    })
+}
+
+fn DecodeSignature(source bytes.Bytes) Result<own Signature, Error> {
+    const textValue = source.Text() else error {
+        discard error
+        return .Err(.InvalidSignature)
+    }
+    const parsed = json.Parse(textValue) else error {
+        discard error
+        return .Err(.InvalidSignature)
+    }
+    var object = match parsed {
+        Object(value): value
+        _: { return .Err(.InvalidSignature) }
+    }
+    const blockSize = signatureU64(&object, "bs") else {
+        return .Err(.InvalidSignature)
+    }
+    if blockSize == 0 || blockSize > maxBlockData() {
+        return .Err(.InvalidSignature)
+    }
+    const selected = object.Take("blocks")
+    var blocks = match selected {
+        Some(value): match value {
+            Array(found): found
+            _: { return .Err(.InvalidSignature) }
+        }
+        None: { return .Err(.InvalidSignature) }
+    }
+    if blocks.Len() > 1000000 {
+        return .Err(.InvalidSignature)
+    }
+    var signature = newSignature(blockSize)
+    while blocks.Len() > 0 {
+        const value = requiredJSON(blocks.PopFront())
+        const block = decodeBlock($value) else error {
+            discard signature
+            return .Err(error)
+        }
+        signature.add(block)
+    }
+    signature.reverse()
+    .Ok(signature)
+}
+
+fn encodeBlock(value BlockSignature) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setJSONU64(&object, "i", value.Index) else {
+        return .Err(.Encoding)
+    }
+    setJSONU64(&object, "w", value.Weak) else {
+        return .Err(.Encoding)
+    }
+    var strong = json.NewArray()
+    var offset u64 = 0
+    while offset < 16 {
+        const byte = strongByte(value, offset)
+        strong.Add($ .Number(format.U64(byte)))
+        offset += 1
+    }
+    object.Set($text.Copy("s"), $ .Array(strong)) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok(.Object(object))
+}
+
+fn decodeBlock($value json.Value) Result<BlockSignature, Error> {
+    var object = match value {
+        Object(found): found
+        _: { return .Err(.InvalidSignature) }
+    }
+    const index = signatureU64(&object, "i") else {
+        return .Err(.InvalidSignature)
+    }
+    const weak = signatureU64(&object, "w") else {
+        return .Err(.InvalidSignature)
+    }
+    if index > 4294967295 || weak > 4294967295 {
+        return .Err(.InvalidSignature)
+    }
+    const selected = object.Take("s")
+    var strong = match selected {
+        Some(found): match found {
+            Array(array): array
+            _: { return .Err(.InvalidSignature) }
+        }
+        None: { return .Err(.InvalidSignature) }
+    }
+    if strong.Len() != 16 {
+        return .Err(.InvalidSignature)
+    }
+    var high u64 = 0
+    var low u64 = 0
+    var offset u64 = 0
+    while offset < 16 {
+        const byte = jsonU64($requiredJSON(strong.PopFront())) else {
+            return .Err(.InvalidSignature)
+        }
+        if byte > 255 return .Err(.InvalidSignature)
+        if offset < 8 {
+            high = (high << 8) | byte
+        } else {
+            low = (low << 8) | byte
+        }
+        offset += 1
+    }
+    .Ok(BlockSignature {
+        Index = index
+        Weak = weak
+        StrongHigh = high
+        StrongLow = low
+    })
+}
+
+fn signatureU64(
+    &object json.Object,
+    key String
+) Result<u64, Error> {
+    const selected = object.Take(key)
+    match selected {
+        None: .Err(.InvalidSignature)
+        Some(value): match value {
+            Number(found): {
+                const parsed = parse.U64(found) else error {
+                    discard error
+                    return .Err(.InvalidSignature)
+                }
+                .Ok(parsed)
+            }
+            _: .Err(.InvalidSignature)
+        }
+    }
+}
+
+fn strongByte(value BlockSignature, offset u64) u64 {
+    if offset < 8 return (value.StrongHigh >> ((7 - offset) * 8)) & 255
+    (value.StrongLow >> ((15 - offset) * 8)) & 255
+}

@@ -1,0 +1,572 @@
+package remolo.rpc
+
+import std.bytes
+import std.collections
+import std.fs
+import std.json
+import std.path
+import std.text
+
+fn listPath(root String, requested String) Result<own collections.List<DirEntry>, Error> {
+    const target = remotePath(requested) else error { return .Err(error) }
+    const opened = fs.OpenTree(root, 1000000, 4096) else error {
+        discard error
+        return .Err(mapFilesystemError(error))
+    }
+    var reader = opened
+    var reversed = collections.NewList<DirEntry>()
+    var found = target == "."
+    var reading = true
+    while reading {
+        const next = reader.Next() else error {
+            discard error
+            return .Err(mapFilesystemError(error))
+        }
+        match next {
+            None: { reading = false }
+            Some(entry): {
+                if entry.Path == target {
+                    found = directoryKind(entry.Kind)
+                }
+                if path.Parent(entry.Path) == target {
+                    reversed.PushFront(directoryEntry(entry))
+                }
+            }
+        }
+    }
+    const closed = reader.Close() else error {
+        discard error
+        return .Err(mapFilesystemError(error))
+    }
+    discard closed
+    if !found {
+        discard reversed
+        return .Err(.NotFound)
+    }
+    .Ok(reverseEntries($reversed))
+}
+
+fn statPath(root String, requested String) Result<StatResult, Error> {
+    const target = remotePath(requested) else error { return .Err(error) }
+    if target == "." {
+        return .Ok(StatResult {
+            Name = path.FileName(root)
+            Size = 0
+            IsDir = true
+            Mode = "drwxr-xr-x"
+            ModTime = 0
+        })
+    }
+    const opened = fs.OpenTree(root, 1000000, 4096) else error {
+        discard error
+        return .Err(mapFilesystemError(error))
+    }
+    var reader = opened
+    var result Option<StatResult> = .None
+    var reading = true
+    while reading {
+        const next = reader.Next() else error {
+            discard error
+            return .Err(mapFilesystemError(error))
+        }
+        match next {
+            None: { reading = false }
+            Some(entry): {
+                if entry.Path == target {
+                    result = .Some(statEntry(entry))
+                    reading = false
+                }
+            }
+        }
+    }
+    const closed = reader.Close() else error {
+        discard error
+        return .Err(mapFilesystemError(error))
+    }
+    discard closed
+    match result {
+        Some(value): .Ok(value)
+        None: .Err(.NotFound)
+    }
+}
+
+fn remotePath(value String) Result<String, Error> {
+    const length = text.ByteLen(value)
+    var start u64 = 0
+    while start < length {
+        const byte = text.ByteAt(value, start) else error {
+            discard error
+            return .Err(.InvalidRequest)
+        }
+        if byte != 47 break
+        start += 1
+    }
+    const selected = if start == length {
+        "."
+    } else {
+        const relative = text.Slice(value, start, length) else error {
+            discard error
+            return .Err(.InvalidRequest)
+        }
+        relative
+    }
+    const normalized = path.Normalize(selected)
+    if normalized == ".." || text.StartsWith(normalized, "../") ||
+        text.StartsWith(normalized, "..\\") {
+        return .Err(.InvalidRequest)
+    }
+    .Ok(normalized)
+}
+
+fn directoryEntry(entry fs.TreeEntry) DirEntry {
+    DirEntry {
+        Name = path.FileName(entry.Path)
+        Size = entry.Size
+        IsDir = directoryKind(entry.Kind)
+        Mode = modeString(entry.Kind, entry.Permissions)
+    }
+}
+
+fn statEntry(entry fs.TreeEntry) StatResult {
+    StatResult {
+        Name = path.FileName(entry.Path)
+        Size = entry.Size
+        IsDir = directoryKind(entry.Kind)
+        Mode = modeString(entry.Kind, entry.Permissions)
+        ModTime = entry.Modified
+    }
+}
+
+fn directoryKind(value fs.TreeKind) bool {
+    match value {
+        Directory: true
+        _: false
+    }
+}
+
+fn modeString(kind fs.TreeKind, permissions u32) String {
+    kindCharacter(kind) +
+        permissionCharacter(permissions, 256, "r") +
+        permissionCharacter(permissions, 128, "w") +
+        permissionCharacter(permissions, 64, "x") +
+        permissionCharacter(permissions, 32, "r") +
+        permissionCharacter(permissions, 16, "w") +
+        permissionCharacter(permissions, 8, "x") +
+        permissionCharacter(permissions, 4, "r") +
+        permissionCharacter(permissions, 2, "w") +
+        permissionCharacter(permissions, 1, "x")
+}
+
+fn kindCharacter(value fs.TreeKind) String {
+    match value {
+        File: "-"
+        Directory: "d"
+        SymbolicLink: "L"
+        Other: "?"
+    }
+}
+
+fn permissionCharacter(permissions u32, bit u32, value String) String {
+    if (permissions & bit) != 0 return text.Copy(value)
+    "-"
+}
+
+fn reverseEntries(
+    $values own collections.List<DirEntry>
+) own collections.List<DirEntry> {
+    var source = values
+    var result = collections.NewList<DirEntry>()
+    while !source.IsEmpty() {
+        const value = match source.PopFront() {
+            Some(found): found
+            None: { panic("RPC directory list invariant failed") }
+        }
+        result.PushFront($value)
+    }
+    result
+}
+
+struct rangeRequest {
+    Path String
+    Offset u64
+    Length u64
+}
+
+struct writeRequest {
+    Path String
+    Offset u64
+    Data own bytes.Bytes
+}
+
+struct sizeRequest {
+    Path String
+    Size u64
+}
+
+struct modeRequest {
+    Path String
+    Mode u32
+}
+
+struct renameRequest {
+    Source String
+    Destination String
+}
+
+task readValue(
+    $params Option<json.Value>,
+    $rootPath String
+) Result<json.Value, Error> {
+    const request = takeRangeRequest($params) else error {
+        return .Err(error)
+    }
+    if request.Length == 0 || request.Length > 16777216 {
+        return .Err(.InvalidRequest)
+    }
+    const relative = remotePath(request.Path) else error {
+        return .Err(error)
+    }
+    if relative == "." return .Err(.IsDirectory)
+    const openedRoot = fs.OpenRoot(rootPath) else error {
+        return .Err(mapFilesystemError(error))
+    }
+    const opening = spawn fs.OpenRootFile($openedRoot, $relative, .Read)
+    const opened = $opening.wait()
+    const fs.RootFileOpenOutcome { Root Value } = opened
+    discard Root
+    const file = Value else error {
+        return .Err(mapHostFilesystemError(error))
+    }
+    const sizing = spawn fs.SizeFile($file)
+    const sized = $sizing.wait()
+    const fs.FileSizeOutcome { File Value as sizeValue } = sized
+    const size = sizeValue else error {
+        discard File
+        return .Err(mapHostFilesystemError(error))
+    }
+    if request.Offset >= size {
+        discard File
+        return readResponse($bytes.FromText(""), true)
+    }
+    const seeking = spawn fs.SeekFile($File, request.Offset)
+    const sought = $seeking.wait()
+    const fs.FileOutcome { File as source Value as seekValue } = sought
+    seekValue else error {
+        discard source
+        return .Err(mapHostFilesystemError(error))
+    }
+    const reading = spawn fs.ReadFileChunk($source, request.Length)
+    const read = $reading.wait()
+    const fs.FileReadOutcome { File as completed Value as readValue } = read
+    discard completed
+    const selected = readValue else error {
+        return .Err(mapHostFilesystemError(error))
+    }
+    match selected {
+        None: readResponse($bytes.FromText(""), true)
+        Some(value): {
+            const length = value.Len() else error {
+                discard error
+                discard value
+                return .Err(.Storage)
+            }
+            readResponse($value, request.Offset + length >= size)
+        }
+    }
+}
+
+task writeValue(
+    $params Option<json.Value>,
+    $rootPath String
+) Result<json.Value, Error> {
+    const request = takeWriteRequest($params) else error {
+        return .Err(error)
+    }
+    const writeRequest { Path Offset Data } = request
+    const length = Data.Len() else error {
+        discard error
+        discard Data
+        return .Err(.Storage)
+    }
+    const relative = remotePath(Path) else error {
+        discard Data
+        return .Err(error)
+    }
+    if relative == "." {
+        discard Data
+        return .Err(.IsDirectory)
+    }
+    const openedRoot = fs.OpenRoot(rootPath) else error {
+        return .Err(mapFilesystemError(error))
+    }
+    const opening = spawn fs.OpenRootFile($openedRoot, $relative, .Write)
+    const opened = $opening.wait()
+    const fs.RootFileOpenOutcome { Root Value } = opened
+    discard Root
+    const file = Value else error {
+        return .Err(mapHostFilesystemError(error))
+    }
+    const seeking = spawn fs.SeekFile($file, Offset)
+    const sought = $seeking.wait()
+    const fs.FileOutcome { File Value as seekValue } = sought
+    seekValue else error {
+        discard File
+        discard Data
+        return .Err(mapHostFilesystemError(error))
+    }
+    const writing = spawn fs.WriteFileChunk($File, $Data)
+    const written = $writing.wait()
+    const fs.FileOutcome { File as completed Value as writeResult } = written
+    discard completed
+    writeResult else error {
+        return .Err(mapHostFilesystemError(error))
+    }
+    var object = json.NewObject()
+    setNumber(&object, "n", length) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+task truncateValue(
+    $params Option<json.Value>,
+    $rootPath String
+) Result<json.Value, Error> {
+    const request = takeSizeRequest($params) else error {
+        return .Err(error)
+    }
+    const relative = remotePath(request.Path) else error {
+        return .Err(error)
+    }
+    if relative == "." return .Err(.IsDirectory)
+    const openedRoot = fs.OpenRoot(rootPath) else error {
+        return .Err(mapFilesystemError(error))
+    }
+    const opening = spawn fs.OpenRootFile($openedRoot, $relative, .Write)
+    const opened = $opening.wait()
+    const fs.RootFileOpenOutcome { Root Value } = opened
+    discard Root
+    const file = Value else error {
+        return .Err(mapHostFilesystemError(error))
+    }
+    const resizing = spawn fs.ResizeFile($file, request.Size)
+    const resized = $resizing.wait()
+    const fs.FileOutcome { File as completed Value as resizeResult } = resized
+    discard completed
+    resizeResult else error {
+        return .Err(mapHostFilesystemError(error))
+    }
+    emptyObject()
+}
+
+task createValue(
+    $params Option<json.Value>,
+    $rootPath String
+) Result<json.Value, Error> {
+    const request = takeModeRequest($params) else error {
+        return .Err(error)
+    }
+    const relative = remotePath(request.Path) else error {
+        return .Err(error)
+    }
+    if relative == "." return .Err(.AlreadyExists)
+    const openedRoot = fs.OpenRoot(rootPath) else error {
+        return .Err(mapFilesystemError(error))
+    }
+    const opening = spawn fs.CreateRootFile(
+        $openedRoot,
+        $text.Copy(relative)
+    )
+    const opened = $opening.wait()
+    const fs.RootFileOpenOutcome { Root Value } = opened
+    const file = Value else error {
+        discard Root
+        return .Err(mapHostFilesystemError(error))
+    }
+    discard file
+    var root = Root
+    root.SetPermissions(relative, request.Mode & 511) else error {
+        discard root
+        return .Err(mapFilesystemError(error))
+    }
+    discard root
+    emptyObject()
+}
+
+task makeDirectoryValue(
+    $params Option<json.Value>,
+    $rootPath String
+) Result<json.Value, Error> {
+    const request = takeModeRequest($params) else error {
+        return .Err(error)
+    }
+    const relative = remotePath(request.Path) else error {
+        return .Err(error)
+    }
+    if relative == "." return .Err(.AlreadyExists)
+    const openedRoot = fs.OpenRoot(rootPath) else error {
+        return .Err(mapFilesystemError(error))
+    }
+    var root = openedRoot
+    root.CreateDirectoryEntry(relative, request.Mode & 511) else error {
+        discard root
+        return .Err(mapHostFilesystemError(error))
+    }
+    discard root
+    emptyObject()
+}
+
+task removeValue(
+    $params Option<json.Value>,
+    $rootPath String
+) Result<json.Value, Error> {
+    const requested = takePath($params) else error { return .Err(error) }
+    const relative = remotePath(requested) else error { return .Err(error) }
+    if relative == "." return .Err(.Permission)
+    const metadata = statPath(rootPath, requested) else error {
+        return .Err(error)
+    }
+    const openedRoot = fs.OpenRoot(rootPath) else error {
+        return .Err(mapFilesystemError(error))
+    }
+    var root = openedRoot
+    if metadata.IsDir {
+        root.RemoveEmptyDirectoryDetailed(relative) else error {
+            discard root
+            return .Err(mapHostFilesystemError(error))
+        }
+    } else {
+        root.RemoveFileDetailed(relative) else error {
+            discard root
+            return .Err(mapHostFilesystemError(error))
+        }
+    }
+    discard root
+    emptyObject()
+}
+
+task renameValue(
+    $params Option<json.Value>,
+    $rootPath String
+) Result<json.Value, Error> {
+    const request = takeRenameRequest($params) else error {
+        return .Err(error)
+    }
+    const source = remotePath(request.Source) else error { return .Err(error) }
+    const destination = remotePath(request.Destination) else error {
+        return .Err(error)
+    }
+    if source == "." || destination == "." return .Err(.Permission)
+    const openedRoot = fs.OpenRoot(rootPath) else error {
+        return .Err(mapFilesystemError(error))
+    }
+    var root = openedRoot
+    root.Rename(source, destination) else error {
+        discard root
+        return .Err(mapHostFilesystemError(error))
+    }
+    discard root
+    emptyObject()
+}
+
+fn takeRangeRequest($params Option<json.Value>) Result<rangeRequest, Error> {
+    const selected = paramsObject($params) else error { return .Err(error) }
+    var object = selected
+    const remote = takeText(&object, "path") else error { return .Err(error) }
+    const offset = takeU64(&object, "offset") else error { return .Err(error) }
+    const length = takeU64(&object, "length") else error { return .Err(error) }
+    .Ok(rangeRequest { Path = remote Offset = offset Length = length })
+}
+
+fn takeWriteRequest(
+    $params Option<json.Value>
+) Result<own writeRequest, Error> {
+    const selected = paramsObject($params) else error { return .Err(error) }
+    var object = selected
+    const remote = takeText(&object, "path") else error { return .Err(error) }
+    const offset = takeU64(&object, "offset") else error { return .Err(error) }
+    const encoded = takeText(&object, "data") else error { return .Err(error) }
+    const data = bytes.DecodeBase64(encoded) else error {
+        discard error
+        return .Err(.InvalidRequest)
+    }
+    .Ok(own writeRequest { Path = remote Offset = offset Data = data })
+}
+
+fn takeSizeRequest($params Option<json.Value>) Result<sizeRequest, Error> {
+    const selected = paramsObject($params) else error { return .Err(error) }
+    var object = selected
+    const remote = takeText(&object, "path") else error { return .Err(error) }
+    const size = takeU64(&object, "size") else error { return .Err(error) }
+    .Ok(sizeRequest { Path = remote Size = size })
+}
+
+fn takeModeRequest($params Option<json.Value>) Result<modeRequest, Error> {
+    const selected = paramsObject($params) else error { return .Err(error) }
+    var object = selected
+    const remote = takeText(&object, "path") else error { return .Err(error) }
+    const mode = takeU64(&object, "mode") else error { return .Err(error) }
+    const converted = u32.From(mode) else error {
+        discard error
+        return .Err(.InvalidRequest)
+    }
+    .Ok(modeRequest { Path = remote Mode = converted })
+}
+
+fn takeRenameRequest($params Option<json.Value>) Result<renameRequest, Error> {
+    const selected = paramsObject($params) else error { return .Err(error) }
+    var object = selected
+    const source = takeText(&object, "path") else error { return .Err(error) }
+    const destination = takeText(&object, "new") else error {
+        return .Err(error)
+    }
+    .Ok(renameRequest { Source = source Destination = destination })
+}
+
+fn paramsObject($params Option<json.Value>) Result<own json.Object, Error> {
+    const value = match params {
+        Some(found): found
+        None: { return .Err(.InvalidRequest) }
+    }
+    match value {
+        Object(found): .Ok(found)
+        _: .Err(.InvalidRequest)
+    }
+}
+
+fn readResponse($value own bytes.Bytes, eof bool) Result<json.Value, Error> {
+    const encoded = bytes.EncodeBase64(value) else error {
+        discard value
+        discard error
+        return .Err(.Storage)
+    }
+    discard value
+    var object = json.NewObject()
+    setText(&object, "data", encoded) else error { return .Err(error) }
+    setBool(&object, "eof", eof) else error { return .Err(error) }
+    .Ok(.Object(object))
+}
+
+fn emptyObject() Result<json.Value, Error> {
+    .Ok(.Object(json.NewObject()))
+}
+
+fn mapFilesystemError(error fs.Error) Error {
+    match error {
+        NotFound: .NotFound
+        Permission: .Permission
+        InvalidPath: .InvalidRequest
+        _: .File
+    }
+}
+
+fn mapHostFilesystemError(error fs.HostError) Error {
+    match error {
+        NotFound: .NotFound
+        Permission: .Permission
+        InvalidPath: .InvalidRequest
+        AlreadyExists: .AlreadyExists
+        NotDirectory: .NotDirectory
+        IsDirectory: .IsDirectory
+        NotEmpty: .NotEmpty
+        _: .File
+    }
+}

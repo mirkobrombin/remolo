@@ -1,0 +1,122 @@
+package remolo.filetransfer
+
+import std.bytes
+import std.fs
+import std.text
+
+fn chunkSize() u64 {
+    32 * 1024
+}
+
+task hashFile($path String) Result<String, Error> {
+    const opening = spawn fs.OpenFile($path, .Read)
+    const opened = $opening.wait()
+    const file = opened else error {
+        discard error
+        return .Err(.Filesystem)
+    }
+    const hashing = spawn hashOpenFile($file)
+    const result = $hashing.wait()
+    result
+}
+
+task hashRootFile(
+    $root own fs.RootWriter,
+    $path String
+) rootHashOutcome {
+    const opening = spawn fs.OpenRootFile($root, $path, .Read)
+    const opened = $opening.wait()
+    const fs.RootFileOpenOutcome { Root Value } = opened
+    const file = Value else error {
+        discard error
+        return rootHashOutcome { Root = Root Value = .Err(.Filesystem) }
+    }
+    const hashing = spawn hashOpenFile($file)
+    const result = $hashing.wait()
+    rootHashOutcome { Root = Root Value = result }
+}
+
+task hashOpenFile($file own fs.File) Result<String, Error> {
+    var source = file
+    var hasher = bytes.NewSha256()
+    var finished = false
+    while !finished {
+        const reading = spawn fs.ReadFileChunk($source, chunkSize())
+        const outcome = $reading.wait()
+        const fs.FileReadOutcome { File Value } = outcome
+        source = File
+        const chunk = Value else error {
+            discard error
+            discard source
+            discard hasher
+            return .Err(.Filesystem)
+        }
+        match chunk {
+            None: { finished = true }
+            Some(value): {
+                hasher.WriteBytes(value) else error {
+                    discard error
+                    discard value
+                    discard source
+                    discard hasher
+                    return .Err(.Storage)
+                }
+                discard value
+            }
+        }
+    }
+    discard source.Close()
+    discard source
+    const digest = hasher.Finish() else error {
+        discard error
+        discard hasher
+        return .Err(.Storage)
+    }
+    discard hasher
+    const encoded = hexDigest(digest) else error {
+        discard error
+        discard digest
+        return .Err(.Storage)
+    }
+    discard digest
+    .Ok(encoded)
+}
+
+fn hexDigest(value bytes.Bytes) Result<String, Error> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var builder = text.NewBuilder()
+    var offset u64 = 0
+    while offset < length {
+        const byte = value.At(offset) else error {
+            discard error
+            discard builder
+            return .Err(.Storage)
+        }
+        const high = builder.WriteCodePoint(hexDigit(byte >> 4)) else error {
+            discard error
+            discard builder
+            return .Err(.Storage)
+        }
+        discard high
+        const low = builder.WriteCodePoint(hexDigit(byte & 15)) else error {
+            discard error
+            discard builder
+            return .Err(.Storage)
+        }
+        discard low
+        offset += 1
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn hexDigit(value u64) u64 {
+    if value < 10 return 48 + value
+    87 + value
+}

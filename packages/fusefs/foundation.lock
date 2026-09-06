@@ -1,0 +1,17 @@
+format foundation.lock/v1
+root remolo.fusefs 1.0.0
+target linux
+foreign c remolo-fuse 1.0.0 path native/fuse abi c/v1 sha256:f33d4d6237b696030a3be436c998deae40a0d6c0a38ef532c6030e986db68343
+package remolo.identity 1.0.0 sha256:4bde0d7cbc708fccb379bea965b029b2ce26a731c04752d049eef8de0688f8dd path ../identity
+package remolo.mux 1.0.0 sha256:abc55d77def06a298c81045f85b204efdd69253e575a80fb6db6cd697d25d180 path ../mux
+package remolo.protocol 1.0.0 sha256:5a26ca47013edd03b97092c499b9295a4d95544c97db720834070323380754f3 path ../protocol
+package remolo.rpc 1.0.0 sha256:89277004226fd4b5df5a3e12950af798ac981ea88a363bc26e2c155d9c09770e path ../rpc
+package remolo.transport 1.0.0 sha256:85de38aef8a4062981b3b999eaee877ce6a983d9a28e27682779cf427bdeb3ea path ../transport
+edge remolo.fusefs remolo.mux
+edge remolo.fusefs remolo.rpc
+edge remolo.mux remolo.protocol
+edge remolo.mux remolo.transport
+edge remolo.rpc remolo.identity
+edge remolo.rpc remolo.mux
+edge remolo.rpc remolo.protocol
+edge remolo.transport remolo.protocol

@@ -1,0 +1,5 @@
+format foundation.lock/v1
+root remolo.relay_server 1.0.0
+target linux
+package remolo.relay 1.0.0 sha256:134259408251451c272daf274f31bcc5a3b5932d171e3cafbbfca503d73491c9 path ../../packages/relay
+edge remolo.relay_server remolo.relay

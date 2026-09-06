@@ -1,0 +1,378 @@
+package remolo.relay
+
+import foundation.worker
+import std.collections
+import std.concurrent
+import std.net
+import std.text
+import std.time
+
+@concurrent.Transferable()
+struct peer {
+    reader own net.TcpReader
+    writer own net.TcpWriter
+    controller own net.TcpController
+}
+
+struct waitingPeer {
+    key String
+    value own peer
+    deadline u64
+}
+
+struct arrival {
+    key String
+    value own peer
+}
+
+struct waitingSearch {
+    waiting own collections.List<waitingPeer>
+    value Option<waitingPeer>
+}
+
+struct expiry {
+    waiting own collections.List<waitingPeer>
+    delay u64
+}
+
+enum relayRequest {
+    Arrive(value arrival)
+}
+
+struct Server {
+    listener own net.TcpListener
+    actor Task<void>
+    requests Sender<relayRequest>
+    handlers own worker.Supervisor
+
+    fn Port(self) u64 {
+        self.listener.Port
+    }
+
+    fn Control(self) Result<own net.TcpListenerController, Error> {
+        const result = self.listener.Control() else error {
+            return .Err(networkError(error))
+        }
+        .Ok(result)
+    }
+}
+
+fn NewServer(
+    $address String,
+    port u64
+) Result<own Server, Error> {
+    const listener = net.Listen($address, port) else error {
+        return .Err(networkError(error))
+    }
+    const Channel { sender receiver } = channel<relayRequest>(256)
+    .Ok(own Server {
+        listener = listener
+        actor = spawn runBroker($receiver)
+        requests = sender
+        handlers = worker.NewSupervisor()
+    })
+}
+
+task Serve($server own Server) Result<void, Error> {
+    const Server { listener actor requests handlers } = server
+    var active = listener
+    var failure Option<Error> = .None
+    while true {
+        const accepting = spawn net.Accept($active)
+        const accepted = $accepting.wait()
+        const net.AcceptOutcome { Listener Value } = accepted
+        active = Listener
+        const connection = Value else error {
+            failure = acceptFailure(error)
+            break
+        }
+        handlers.Start(spawn announce($connection, requests.clone()))
+    }
+    const stopping = handlers.CancelTask()
+    discard $stopping.wait()
+    discard active
+    discard requests
+    $actor.wait()
+    match failure {
+        None: .Ok
+        Some(error): .Err(error)
+    }
+}
+
+task announce(
+    $connection own net.TcpConnection,
+    $requests Sender<relayRequest>
+) void {
+    const split = connection.SplitControlled() else error {
+        discard error
+        return
+    }
+    const net.ControlledStream { Reader Writer Controller } = split
+    const deadline = net.DeadlineAfter(time.Seconds(30)) else error {
+        discard error
+        discard Reader
+        discard Writer
+        discard Controller
+        return
+    }
+    const reading = spawn net.ReadLineLimitedUntil($Reader, 512, deadline)
+    const read = $reading.wait()
+    const net.ReadLineOutcome { Reader as restored Value } = read
+    const line = Value else error {
+        discard error
+        discard restored
+        discard Writer
+        discard Controller
+        return
+    }
+    const present = match line {
+        None: {
+            discard restored
+            discard Writer
+            discard Controller
+            return
+        }
+        Some(value): value
+    }
+    const key = greetingSession($present) else error {
+        discard error
+        discard restored
+        discard Writer
+        discard Controller
+        return
+    }
+    discard requests.send(.Arrive(value = arrival {
+        key = key
+        value = own peer {
+            reader = restored
+            writer = Writer
+            controller = Controller
+        }
+    }))
+}
+
+task runBroker($receiver Receiver<relayRequest>) void {
+    var inbox = receiver
+    var waiting = collections.NewList<waitingPeer>()
+    var relays = worker.NewSupervisor()
+    while true {
+        waiting = discardExpired($waiting, time.MonotonicNow().Nanoseconds())
+        const selected = nextExpiry($waiting, time.MonotonicNow().Nanoseconds())
+        const expiry { waiting as restored delay } = selected
+        waiting = restored
+        select {
+            const request = inbox.receive(): {
+                match request {
+                    Arrive(value): {
+                        waiting = acceptArrival($waiting, &relays, $value)
+                    }
+                }
+            }
+            timeout delay: {}
+            else error: {
+                discard error
+                break
+            }
+        }
+    }
+    const stopping = relays.CancelTask()
+    discard $stopping.wait()
+    discard waiting
+}
+
+fn acceptArrival(
+    $waiting own collections.List<waitingPeer>,
+    &relays worker.Supervisor,
+    $value arrival
+) own collections.List<waitingPeer> {
+    var active = waiting
+    const arrival { key value as current } = value
+    const searched = takeWaiting($active, key)
+    const waitingSearch { waiting as remaining value as matched } = searched
+    active = remaining
+    match matched {
+        Some(existing): {
+            const waitingPeer { key as storedKey value as parked deadline } = existing
+            discard storedKey
+            discard deadline
+            discard key
+            relays.Start(spawn splice($parked, $current))
+            active
+        }
+        None: {
+            const now = time.MonotonicNow().Nanoseconds()
+            const lifetime u64 = 120000000000
+            const maximum u64 = 18446744073709551614
+            const deadline = if now > maximum - lifetime {
+                maximum
+            } else {
+                now + lifetime
+            }
+            active.PushFront(waitingPeer {
+                key = key
+                value = current
+                deadline = deadline
+            })
+            active
+        }
+    }
+}
+
+fn takeWaiting(
+    $waiting own collections.List<waitingPeer>,
+    key String
+) waitingSearch {
+    var pending = waiting
+    var restored = collections.NewList<waitingPeer>()
+    var found Option<waitingPeer> = .None
+    var matched = false
+    while !pending.IsEmpty() {
+        const current = waitingValue(pending.PopFront())
+        if text.Equal(current.key, key) && !matched {
+            found = .Some(current)
+            matched = true
+        } else {
+            restored.PushFront($current)
+        }
+    }
+    while !restored.IsEmpty() {
+        pending.PushFront(waitingValue(restored.PopFront()))
+    }
+    waitingSearch { waiting = pending value = found }
+}
+
+fn discardExpired(
+    $waiting own collections.List<waitingPeer>,
+    now u64
+) own collections.List<waitingPeer> {
+    var pending = waiting
+    var restored = collections.NewList<waitingPeer>()
+    while !pending.IsEmpty() {
+        const current = waitingValue(pending.PopFront())
+        if current.deadline <= now {
+            discard current
+        } else {
+            restored.PushFront($current)
+        }
+    }
+    while !restored.IsEmpty() {
+        pending.PushFront(waitingValue(restored.PopFront()))
+    }
+    pending
+}
+
+fn nextExpiry(
+    $waiting own collections.List<waitingPeer>,
+    now u64
+) expiry {
+    var pending = waiting
+    var restored = collections.NewList<waitingPeer>()
+    const maximum u64 = 18446744073709551614
+    var deadline u64 = if now > maximum - 60000000000 {
+        maximum
+    } else {
+        now + 60000000000
+    }
+    while !pending.IsEmpty() {
+        const current = waitingValue(pending.PopFront())
+        if current.deadline < deadline {
+            deadline = current.deadline
+        }
+        restored.PushFront($current)
+    }
+    while !restored.IsEmpty() {
+        pending.PushFront(waitingValue(restored.PopFront()))
+    }
+    var delay u64 = 0
+    if deadline > now {
+        delay = deadline - now
+    }
+    expiry { waiting = pending delay = delay }
+}
+
+fn waitingValue($value Option<waitingPeer>) waitingPeer {
+    match value {
+        Some(current): current
+        None: missingWaiting()
+    }
+}
+
+fn missingWaiting() waitingPeer {
+    panic("relay waiting peer invariant failed")
+}
+
+task splice($left own peer, $right own peer) void {
+    const peer {
+        reader as leftReader
+        writer as leftWriter
+        controller as leftController
+    } = left
+    const peer {
+        reader as rightReader
+        writer as rightWriter
+        controller as rightController
+    } = right
+    var copies = worker.NewGroup<bool>(2)
+    requireCopyAdmission(copies.Add(spawn copy($leftReader, $rightWriter)))
+    requireCopyAdmission(copies.Add(spawn copy($rightReader, $leftWriter)))
+    const firstPending = $copies.Next()
+    const first = $firstPending.wait()
+    const worker.GroupNext { Group Value } = first
+    copies = Group
+    discard Value
+    var leftControl = leftController
+    var rightControl = rightController
+    discard leftControl.Abort()
+    discard rightControl.Abort()
+    const secondPending = $copies.Next()
+    const second = $secondPending.wait()
+    const worker.GroupNext { Group as completed Value as secondValue } = second
+    discard secondValue
+    const stopping = completed.ShutdownTask()
+    discard $stopping.wait()
+}
+
+task copy(
+    $reader own net.TcpReader,
+    $writer own net.TcpWriter
+) bool {
+    var source = reader
+    var destination = writer
+    while true {
+        const reading = spawn net.ReadSomeBytes($source, 65536)
+        const read = $reading.wait()
+        const net.ReadSomeBytesOutcome { Reader Value } = read
+        source = Reader
+        const chunk = Value else error {
+            discard error
+            return false
+        }
+        const payload = match chunk {
+            None: { return true }
+            Some(value): value
+        }
+        const writing = spawn net.WriteAllBytes($destination, $payload)
+        const written = $writing.wait()
+        const net.WriteOutcome { Writer Value as writeValue } = written
+        destination = Writer
+        writeValue else error {
+            discard error
+            return false
+        }
+    }
+    false
+}
+
+fn acceptFailure(error net.Error) Option<Error> {
+    match error {
+        Closed: .None
+        _: .Some(networkError(error))
+    }
+}
+
+fn requireCopyAdmission($value Result<void, worker.GroupError>) void {
+    value else error {
+        discard error
+        panic("relay copy admission invariant failed")
+    }
+}

@@ -1,0 +1,166 @@
+package remolo.desktop
+
+import std.bytes
+
+struct Decoder {
+    previous Option<own bytes.Bytes>
+}
+
+fn NewDecoder() own Decoder {
+    own Decoder { previous = .None }
+}
+
+fn DecodeFrame(
+    &decoder Decoder,
+    $source own bytes.Bytes
+) Result<own EncodedFrame, Error> {
+    const length = frameLength(source)
+    if length < 17 return .Err(.InvalidFrame)
+    const kind = frameByte(source, 0)
+    if kind == 1 return decodeFullFrame(&decoder, $source)
+    if kind == 2 return decodeDiffFrame(&decoder, $source)
+    .Err(.InvalidFrame)
+}
+
+fn decodeFullFrame(
+    &decoder Decoder,
+    $source own bytes.Bytes
+) Result<own EncodedFrame, Error> {
+    const frame = DecodeFullFrame(source) else error { return .Err(error) }
+    const decodedPixels = decodePNG(frame.Image) else error {
+        discard frame
+        return .Err(error)
+    }
+    const pixelFrame { width height pixels } = decodedPixels
+    if width != frame.Width || height != frame.Height {
+        discard pixels
+        discard frame
+        return .Err(.InvalidFrame)
+    }
+    const previous = replace decoder.previous with .Some(pixels)
+    discard previous
+    .Ok(frame)
+}
+
+fn decodeDiffFrame(
+    &decoder Decoder,
+    $source own bytes.Bytes
+) Result<own EncodedFrame, Error> {
+    const length = frameLength(source)
+    const width = frameU32(source, 1)
+    const height = frameU32(source, 5)
+    const sequence = frameU32(source, 9)
+    const count = frameU32(source, 13)
+    const baseline = replace decoder.previous with .None
+    const previous = match baseline {
+        Some(found): found
+        None: { return .Err(.InvalidFrame) }
+    }
+    const previousLength = frameLength(previous)
+    if !validPixels(width, height, previousLength) {
+        discard previous
+        return .Err(.InvalidFrame)
+    }
+    const opened = bytes.NewBuilder(previousLength) else error {
+        discard error
+        discard previous
+        return .Err(.Storage)
+    }
+    var output = opened
+    output.Write(previous) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var offset u64 = 17
+    var index u64 = 0
+    while index < count {
+        const next = applyTile(&output, source, offset, width, height) else error {
+            return .Err(error)
+        }
+        offset = next
+        index += 1
+    }
+    if offset != length return .Err(.InvalidFrame)
+    const pixels = output.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const next = pixels.Copy() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    decoder.previous = .Some(next)
+    const image = EncodePNG(width, height, pixels) else error { return .Err(error) }
+    .Ok(own EncodedFrame {
+        Sequence = sequence
+        Width = width
+        Height = height
+        Image = image
+    })
+}
+
+fn applyTile(
+    &output bytes.Builder,
+    source bytes.Bytes,
+    offset u64,
+    frameWidth u64,
+    frameHeight u64
+) Result<u64, Error> {
+    const length = frameLength(source)
+    if offset > length || length - offset < 12 return .Err(.InvalidFrame)
+    const x = frameU16(source, offset)
+    const y = frameU16(source, offset + 2)
+    const width = frameU16(source, offset + 4)
+    const height = frameU16(source, offset + 6)
+    const imageLength = frameU32(source, offset + 8)
+    const imageStart = offset + 12
+    if imageLength > length - imageStart || width == 0 || height == 0 ||
+        x > frameWidth || width > frameWidth - x ||
+        y > frameHeight || height > frameHeight - y {
+        return .Err(.InvalidFrame)
+    }
+    const image = source.Slice(imageStart, imageStart + imageLength) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const decoded = decodePNG(image) else error { return .Err(error) }
+    const pixelFrame { width as tileWidth height as tileHeight pixels } = decoded
+    if tileWidth != width || tileHeight != height {
+        discard pixels
+        return .Err(.InvalidFrame)
+    }
+    patchPixels(&output, frameWidth, x, y, width, height, pixels) else error {
+        return .Err(error)
+    }
+    .Ok(imageStart + imageLength)
+}
+
+fn patchPixels(
+    &output bytes.Builder,
+    frameWidth u64,
+    x u64,
+    y u64,
+    width u64,
+    height u64,
+    pixels bytes.Bytes
+) Result<void, Error> {
+    var row u64 = 0
+    while row < height {
+        var column u64 = 0
+        while column < width * 4 {
+            const sourceOffset = row * width * 4 + column
+            const destinationOffset = ((y + row) * frameWidth + x) * 4 + column
+            output.SetByte(destinationOffset, frameByte(pixels, sourceOffset)) else error {
+                discard error
+                return .Err(.Storage)
+            }
+            column += 1
+        }
+        row += 1
+    }
+    .Ok
+}
+
+fn frameU16(value bytes.Bytes, offset u64) u64 {
+    frameByte(value, offset) << 8 | frameByte(value, offset + 1)
+}

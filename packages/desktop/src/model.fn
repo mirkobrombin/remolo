@@ -1,0 +1,116 @@
+package remolo.desktop
+
+import std.bytes
+import std.collections
+
+enum Error {
+    Storage
+    Protocol
+    InvalidMode
+    InvalidFrame
+    Capture
+    Input
+    Closed
+}
+
+enum Mode {
+    Screenshot
+    Diff
+    WebRTC
+}
+
+enum InputKind {
+    MouseMove
+    MouseButton
+    Key
+    Wheel
+}
+
+struct Hello {
+    Modes own collections.List<Mode>
+    Width u64
+    Height u64
+}
+
+struct Select {
+    Mode Mode
+    FPS u64
+}
+
+struct InputEvent {
+    Type InputKind
+    X u64
+    Y u64
+    Button u64
+    Key u64
+    Down bool
+    Delta i64
+}
+
+struct EncodedFrame {
+    Sequence u64
+    Width u64
+    Height u64
+    Image own bytes.Bytes
+}
+
+struct Encoder {
+    mode Mode
+    sequence u64
+    width u64
+    height u64
+    previous Option<own bytes.Bytes>
+
+    fn Mode(self) Mode {
+        self.mode
+    }
+
+    fn SetMode(&self, mode Mode) void {
+        self.mode = mode
+        self.width = 0
+        self.height = 0
+        const previous = replace self.previous with .None
+        discard previous
+    }
+}
+
+fn NewEncoder(mode Mode) own Encoder {
+    own Encoder {
+        mode = mode
+        sequence = 0
+        width = 0
+        height = 0
+        previous = .None
+    }
+}
+
+fn ModeName(mode Mode) String {
+    match mode {
+        Screenshot: "screenshot"
+        Diff: "diff"
+        WebRTC: "webrtc"
+    }
+}
+
+fn ModeFor(value String) Result<Mode, Error> {
+    if value == "screenshot" return .Ok(.Screenshot)
+    if value == "diff" return .Ok(.Diff)
+    if value == "webrtc" return .Ok(.WebRTC)
+    .Err(.InvalidMode)
+}
+
+fn DefaultSelect(mode Mode) Select {
+    Select { Mode = mode FPS = 10 }
+}
+
+fn NewInputEvent(value InputKind) InputEvent {
+    InputEvent {
+        Type = value
+        X = 0
+        Y = 0
+        Button = 0
+        Key = 0
+        Down = false
+        Delta = 0
+    }
+}

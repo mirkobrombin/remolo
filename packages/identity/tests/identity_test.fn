@@ -1,0 +1,171 @@
+package remolo.identity
+
+import std.bytes
+import std.fs
+import std.path
+import std.text
+
+fn sequence(start u64, count u64) own bytes.Bytes {
+    const opened = bytes.NewBuilder(count) else { panic("builder failed") }
+    var builder = opened
+    var offset u64 = 0
+    while offset < count {
+        builder.WriteByte(start + offset) else { panic("write failed") }
+        offset += 1
+    }
+    const result = builder.Finish() else { panic("finish failed") }
+    result
+}
+
+fn changed(value bytes.Bytes) own bytes.Bytes {
+    const length = value.Len() else { panic("length failed") }
+    const opened = bytes.NewBuilder(length) else { panic("builder failed") }
+    var builder = opened
+    var offset u64 = 0
+    while offset < length {
+        const current = value.At(offset) else { panic("byte failed") }
+        var next = current
+        if offset == length - 1 {
+            next = current ^ 1
+        }
+        builder.WriteByte(next) else { panic("write failed") }
+        offset += 1
+    }
+    const result = builder.Finish() else { panic("finish failed") }
+    result
+}
+
+test "generated identities sign and verify" {
+    const identity = Generate() else { fail("identity generation failed") }
+    const message = bytes.FromText("remolo identity")
+    const signature = identity.Sign(message) else { fail("signing failed") }
+    Verify(identity.PublicKeyPEM, message, signature) else {
+        fail("verification failed")
+    }
+    const rawLength = identity.RawPublicKey.Len() else { fail("raw key failed") }
+    expect(rawLength == 32)
+}
+
+test "persistent identities reload the same public key" {
+    const directory = fs.CreateTempDirectory(".", "remolo-identity-") else {
+        fail("temp directory failed")
+    }
+    const destination = path.Join(directory, "host.key")
+    const firstPending = spawn LoadOrCreate($text.Copy(destination))
+    const first = $firstPending.wait() else { fail("identity create failed") }
+    const expected = first.RawPublicKey.Copy() else { fail("key copy failed") }
+    discard first
+    const secondPending = spawn LoadOrCreate($destination)
+    const second = $secondPending.wait() else { fail("identity reload failed") }
+    expect(bytes.ConstantTimeEqual(expected, second.RawPublicKey))
+    const cleanup = fs.Canonicalize(directory) else { fail("temp path failed") }
+    fs.RemoveTree(cleanup, 32, 4) else { fail("temp cleanup failed") }
+}
+
+test "client key authentication proves both identities" {
+    const host = Generate() else { fail("host identity failed") }
+    const client = Generate() else { fail("client identity failed") }
+    const clientNonce = sequence(0, 32)
+    const hostNonce = sequence(32, 32)
+    const hostProof = HostSignature(
+        host,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else {
+        fail("host proof failed")
+    }
+    const clientProof = ClientSignature(
+        client,
+        host.PublicKeyPEM,
+        host.RawPublicKey,
+        clientNonce,
+        hostNonce,
+        hostProof
+    ) else {
+        fail("client proof failed")
+    }
+    VerifyClientSignature(
+        client.PublicKeyPEM,
+        host.RawPublicKey,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce,
+        clientProof
+    ) else {
+        fail("client verification failed")
+    }
+}
+
+test "client rejects an impersonated host" {
+    const host = Generate() else { fail("host identity failed") }
+    const other = Generate() else { fail("other identity failed") }
+    const client = Generate() else { fail("client identity failed") }
+    const clientNonce = sequence(0, 32)
+    const hostNonce = sequence(32, 32)
+    const hostProof = HostSignature(
+        host,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else {
+        fail("host proof failed")
+    }
+    match ClientSignature(
+        client,
+        other.PublicKeyPEM,
+        other.RawPublicKey,
+        clientNonce,
+        hostNonce,
+        hostProof
+    ) {
+        Ok(value): {
+            discard value
+            fail("impersonated host was accepted")
+        }
+        Err(error): match error {
+            AuthenticationFailed: {}
+            _: fail("wrong impersonation error")
+        }
+    }
+}
+
+test "host rejects a changed client signature" {
+    const host = Generate() else { fail("host identity failed") }
+    const client = Generate() else { fail("client identity failed") }
+    const clientNonce = sequence(0, 32)
+    const hostNonce = sequence(32, 32)
+    const hostProof = HostSignature(
+        host,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce
+    ) else {
+        fail("host proof failed")
+    }
+    const clientProof = ClientSignature(
+        client,
+        host.PublicKeyPEM,
+        host.RawPublicKey,
+        clientNonce,
+        hostNonce,
+        hostProof
+    ) else {
+        fail("client proof failed")
+    }
+    const tampered = changed(clientProof)
+    match VerifyClientSignature(
+        client.PublicKeyPEM,
+        host.RawPublicKey,
+        client.RawPublicKey,
+        clientNonce,
+        hostNonce,
+        tampered
+    ) {
+        Ok: fail("changed client signature was accepted")
+        Err(error): match error {
+            AuthenticationFailed: {}
+            _: fail("wrong client signature error")
+        }
+    }
+}

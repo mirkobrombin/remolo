@@ -1,0 +1,494 @@
+package remolo.session
+
+import remolo.crypto
+import remolo.identity
+import remolo.mux
+import remolo.transport
+import std.bytes
+import std.text
+import std.time
+
+task acceptPeer(
+    $secured transport.SecureStream,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    $privateKey own bytes.Bytes,
+    $authorizedPath String,
+    expiry u64,
+    $resume ResumeHandle,
+    $encodedCaps own bytes.Bytes
+) Result<own Peer, Error> {
+    const pending = spawn acceptMuxPeer(
+        $mux.NewServer($secured),
+        $psk,
+        $publicKey,
+        $privateKey,
+        $authorizedPath,
+        expiry,
+        $resume,
+        $encodedCaps
+    )
+    const result = $pending.wait()
+    result
+}
+
+task acceptMuxPeer(
+    $opened own mux.Session,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    $privateKey own bytes.Bytes,
+    $authorizedPath String,
+    expiry u64,
+    $resume ResumeHandle,
+    $encodedCaps own bytes.Bytes
+) Result<own Peer, Error> {
+    var session = opened
+    const handle = session.Handle()
+    const accepting = spawn mux.AcceptChannel($handle.Clone())
+    const acceptedResult = $accepting.wait()
+    const accepted = acceptedResult else error {
+        mux.Close($session)
+        discard psk
+        discard publicKey
+        discard privateKey
+        discard authorizedPath
+        discard resume
+        discard encodedCaps
+        discard error
+        return .Err(.Multiplex)
+    }
+    if !controlKind(accepted.Open.Kind) {
+        discard accepted
+        mux.Close($session)
+        discard psk
+        discard publicKey
+        discard privateKey
+        discard authorizedPath
+        discard resume
+        discard encodedCaps
+        return .Err(.Protocol)
+    }
+    const mux.AcceptedChannel { Open Stream } = accepted
+    discard Open
+    const peerAuthorizedPath = text.Copy(authorizedPath)
+    const authenticating = spawn authenticateHost(
+        $Stream,
+        $psk,
+        $publicKey,
+        $privateKey,
+        $authorizedPath,
+        expiry,
+        $encodedCaps
+    )
+    const controlResult = $authenticating.wait()
+    const control = controlResult else error {
+        mux.Close($session)
+        discard resume
+        return .Err(error)
+    }
+    const hostControl { reader writer key } = control
+    .Ok(own Peer {
+        session = session
+        handle = handle
+        controlReader = reader
+        controlWriter = writer
+        sessionKey = key
+        authorizedPath = peerAuthorizedPath
+        resume = resume
+    })
+}
+
+task authenticateHost(
+    $stream mux.Stream,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    $privateKey own bytes.Bytes,
+    $authorizedPath String,
+    expiry u64,
+    $encodedCaps own bytes.Bytes
+) Result<hostControl, Error> {
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    const modePending = spawn readRaw($Reader, 1)
+    const modeResult = $modePending.wait()
+    const modeRead = modeResult else error {
+        discard Writer
+        discard psk
+        discard publicKey
+        discard privateKey
+        discard authorizedPath
+        discard encodedCaps
+        return .Err(error)
+    }
+    const rawRead { reader value as modeValue } = modeRead
+    const mode = modeValue.At(0) else error {
+        discard error
+        discard reader
+        discard Writer
+        discard psk
+        discard publicKey
+        discard privateKey
+        discard authorizedPath
+        discard encodedCaps
+        return .Err(.Protocol)
+    }
+    if mode == 80 {
+        discard privateKey
+        discard authorizedPath
+        const pending = spawn authenticateHostPSK(
+            $reader,
+            $Writer,
+            $psk,
+            $publicKey,
+            expiry
+        )
+        const result = $pending.wait()
+        const control = result else error {
+            discard encodedCaps
+            return .Err(error)
+        }
+        const finishing = spawn finishHostControl($control, $encodedCaps)
+        const finished = $finishing.wait()
+        return finished
+    }
+    if mode == 75 {
+        discard psk
+        const pending = spawn authenticateHostKey(
+            $reader,
+            $Writer,
+            $publicKey,
+            $privateKey,
+            $authorizedPath
+        )
+        const result = $pending.wait()
+        const control = result else error {
+            discard encodedCaps
+            return .Err(error)
+        }
+        const finishing = spawn finishHostControl($control, $encodedCaps)
+        const finished = $finishing.wait()
+        return finished
+    }
+    discard reader
+    discard Writer
+    discard psk
+    discard publicKey
+    discard privateKey
+    discard authorizedPath
+    discard encodedCaps
+    .Err(.Authentication)
+}
+
+task authenticateHostPSK(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $psk own bytes.Bytes,
+    $publicKey own bytes.Bytes,
+    expiry u64
+) Result<hostControl, Error> {
+    if time.Now().Unix() > expiry {
+        discard reader
+        discard writer
+        discard psk
+        discard publicKey
+        return .Err(.Expired)
+    }
+    const noncePending = spawn readRaw($reader, 32)
+    const nonceResult = $noncePending.wait()
+    const nonceRead = nonceResult else error {
+        discard writer
+        discard psk
+        discard publicKey
+        return .Err(error)
+    }
+    const rawRead { reader as nonceReader value as clientNonce } = nonceRead
+    const hostNonce = crypto.GenerateNonce() else error {
+        discard nonceReader
+        discard writer
+        discard psk
+        discard publicKey
+        return .Err(handshakeError(error))
+    }
+    const response = crypto.HostResponse(
+        psk,
+        publicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        discard nonceReader
+        discard writer
+        discard psk
+        discard publicKey
+        return .Err(handshakeError(error))
+    }
+    const responsePending = spawn writeRaw($writer, $response)
+    const writerResult = $responsePending.wait()
+    const activeWriter = writerResult else error {
+        discard nonceReader
+        discard psk
+        discard publicKey
+        return .Err(error)
+    }
+    const proofPending = spawn readRaw($nonceReader, 32)
+    const proofResult = $proofPending.wait()
+    const proofRead = proofResult else error {
+        discard activeWriter
+        discard psk
+        discard publicKey
+        return .Err(error)
+    }
+    const rawRead { reader as proofReader value as proofValue } = proofRead
+    const sessionKey = crypto.FinishHost(
+        psk,
+        publicKey,
+        clientNonce,
+        hostNonce,
+        proofValue
+    ) else error {
+        discard proofReader
+        discard activeWriter
+        return .Err(handshakeError(error))
+    }
+    .Ok(hostControl {
+        reader = proofReader
+        writer = activeWriter
+        key = sessionKey
+    })
+}
+
+task authenticateHostKey(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $hostPublicKey own bytes.Bytes,
+    $hostPrivateKey own bytes.Bytes,
+    $authorizedPath String
+) Result<hostControl, Error> {
+    if text.IsEmpty(authorizedPath) {
+        discard reader
+        discard writer
+        discard hostPublicKey
+        discard hostPrivateKey
+        discard authorizedPath
+        return .Err(.Authentication)
+    }
+    const initialPending = spawn readRaw($reader, 64)
+    const initialResult = $initialPending.wait()
+    const initial = initialResult else error {
+        discard writer
+        discard hostPublicKey
+        discard hostPrivateKey
+        discard authorizedPath
+        return .Err(error)
+    }
+    const rawRead { reader as activeReader value as initialValue } = initial
+    const clientPublicKey = keySlice(initialValue, 0, 32) else error {
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard hostPrivateKey
+        discard authorizedPath
+        return .Err(error)
+    }
+    const clientNonce = keySlice(initialValue, 32, 64) else error {
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard hostPrivateKey
+        discard authorizedPath
+        discard clientPublicKey
+        return .Err(error)
+    }
+    const loading = spawn identity.LoadAuthorized($authorizedPath)
+    const loaded = $loading.wait()
+    const value = loaded else error {
+        discard error
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard hostPrivateKey
+        discard clientPublicKey
+        discard clientNonce
+        return .Err(.Authentication)
+    }
+    var authorized = value
+    if !authorized.Contains(clientPublicKey) {
+        discard authorized
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard hostPrivateKey
+        discard clientPublicKey
+        discard clientNonce
+        return .Err(.Authentication)
+    }
+    discard authorized
+    const host = identity.FromPrivateKey($hostPrivateKey) else error {
+        discard error
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        return .Err(.Authentication)
+    }
+    const hostNonce = identity.GenerateAuthNonce() else error {
+        discard host
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        return .Err(identityError(error))
+    }
+    const signature = identity.HostSignature(
+        host,
+        clientPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        discard host
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        discard hostNonce
+        return .Err(identityError(error))
+    }
+    discard host
+    const response = joinKeyBytes(hostNonce, signature) else error {
+        discard activeReader
+        discard writer
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        discard hostNonce
+        return .Err(error)
+    }
+    const responsePending = spawn writeRaw($writer, $response)
+    const writerResult = $responsePending.wait()
+    const activeWriter = writerResult else error {
+        discard activeReader
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        discard hostNonce
+        return .Err(error)
+    }
+    const proofPending = spawn readRaw($activeReader, 64)
+    const proofResult = $proofPending.wait()
+    const proof = proofResult else error {
+        discard activeWriter
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        discard hostNonce
+        return .Err(error)
+    }
+    const rawRead { reader as proofReader value as proofValue } = proof
+    const clientPEM = identity.PublicPEM(clientPublicKey) else error {
+        discard proofReader
+        discard activeWriter
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        discard hostNonce
+        discard proofValue
+        return .Err(identityError(error))
+    }
+    identity.VerifyClientSignature(
+        clientPEM,
+        hostPublicKey,
+        clientPublicKey,
+        clientNonce,
+        hostNonce,
+        proofValue
+    ) else error {
+        discard proofReader
+        discard activeWriter
+        discard hostPublicKey
+        discard clientPublicKey
+        discard clientNonce
+        discard hostNonce
+        return .Err(identityError(error))
+    }
+    const sessionKey = identity.SessionKey(
+        hostPublicKey,
+        clientPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        discard proofReader
+        discard activeWriter
+        return .Err(identityError(error))
+    }
+    .Ok(hostControl {
+        reader = proofReader
+        writer = activeWriter
+        key = sessionKey
+    })
+}
+
+task finishHostControl(
+    $control hostControl,
+    $encodedCaps own bytes.Bytes
+) Result<hostControl, Error> {
+    const hostControl { reader writer key } = control
+    const pending = spawn mux.WriteFrame($writer, .JSON, $encodedCaps)
+    const outcome = $pending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Ok(hostControl { reader = reader writer = Writer key = key })
+        Err(error): {
+            discard error
+            discard reader
+            discard Writer
+            discard key
+            .Err(.Transport)
+        }
+    }
+}
+
+fn keySlice(
+    value bytes.Bytes,
+    start u64,
+    end u64
+) Result<own bytes.Bytes, Error> {
+    const result = value.Slice(start, end) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    .Ok(result)
+}
+
+fn joinKeyBytes(
+    left bytes.Bytes,
+    right bytes.Bytes
+) Result<own bytes.Bytes, Error> {
+    const opened = bytes.NewBuilder(96) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var builder = opened
+    builder.Write(left) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    builder.Write(right) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn identityError(error identity.IdentityError) Error {
+    match error {
+        AuthenticationFailed: .Authentication
+        InvalidKey: .Authentication
+        _: .Storage
+    }
+}

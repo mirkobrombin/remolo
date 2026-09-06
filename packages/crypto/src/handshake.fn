@@ -1,0 +1,256 @@
+package remolo.crypto
+
+import std.bytes
+import std.text
+
+enum HandshakeError {
+    InvalidCredential
+    InvalidMessage
+    AuthenticationFailed
+    Storage
+    EntropyUnavailable
+}
+
+struct ClientFinish {
+    Proof own bytes.Bytes
+    SessionKey own bytes.Bytes
+}
+
+fn GenerateNonce() Result<own bytes.Bytes, HandshakeError> {
+    const nonce = bytes.Random(32) else error {
+        discard error
+        return .Err(.EntropyUnavailable)
+    }
+    .Ok(nonce)
+}
+
+fn HostResponse(
+    psk bytes.Bytes,
+    hostPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes
+) Result<own bytes.Bytes, HandshakeError> {
+    validateInputs(psk, hostPublicKey, clientNonce, hostNonce) else error {
+        return .Err(error)
+    }
+    const proof = handshakeMAC(
+        psk,
+        "remolo-host-v1",
+        hostPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    join(hostNonce, proof)
+}
+
+fn FinishClient(
+    psk bytes.Bytes,
+    hostPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostResponse bytes.Bytes
+) Result<ClientFinish, HandshakeError> {
+    validateLength(psk, 32, .InvalidCredential) else error {
+        return .Err(error)
+    }
+    validateLength(hostPublicKey, 32, .InvalidCredential) else error {
+        return .Err(error)
+    }
+    validateLength(clientNonce, 32, .InvalidMessage) else error {
+        return .Err(error)
+    }
+    validateLength(hostResponse, 64, .InvalidMessage) else error {
+        return .Err(error)
+    }
+    const hostNonce = slice(hostResponse, 0, 32) else error {
+        return .Err(error)
+    }
+    const suppliedProof = slice(hostResponse, 32, 64) else error {
+        return .Err(error)
+    }
+    const expectedProof = handshakeMAC(
+        psk,
+        "remolo-host-v1",
+        hostPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    if !bytes.ConstantTimeEqual(suppliedProof, expectedProof) {
+        return .Err(.AuthenticationFailed)
+    }
+    const proof = handshakeMAC(
+        psk,
+        "remolo-client-v1",
+        hostPublicKey,
+        hostNonce,
+        clientNonce
+    ) else error {
+        return .Err(error)
+    }
+    const sessionKey = sessionKey(
+        psk,
+        hostPublicKey,
+        clientNonce,
+        hostNonce
+    ) else error {
+        return .Err(error)
+    }
+    .Ok(ClientFinish { Proof = proof SessionKey = sessionKey })
+}
+
+fn FinishHost(
+    psk bytes.Bytes,
+    hostPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes,
+    clientProof bytes.Bytes
+) Result<own bytes.Bytes, HandshakeError> {
+    validateInputs(psk, hostPublicKey, clientNonce, hostNonce) else error {
+        return .Err(error)
+    }
+    validateLength(clientProof, 32, .InvalidMessage) else error {
+        return .Err(error)
+    }
+    const expectedProof = handshakeMAC(
+        psk,
+        "remolo-client-v1",
+        hostPublicKey,
+        hostNonce,
+        clientNonce
+    ) else error {
+        return .Err(error)
+    }
+    if !bytes.ConstantTimeEqual(clientProof, expectedProof) {
+        return .Err(.AuthenticationFailed)
+    }
+    sessionKey(psk, hostPublicKey, clientNonce, hostNonce)
+}
+
+fn sessionKey(
+    psk bytes.Bytes,
+    hostPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes
+) Result<own bytes.Bytes, HandshakeError> {
+    handshakeMAC(
+        psk,
+        "remolo-session-v1",
+        hostPublicKey,
+        clientNonce,
+        hostNonce
+    )
+}
+
+fn handshakeMAC(
+    psk bytes.Bytes,
+    label String,
+    hostPublicKey bytes.Bytes,
+    firstNonce bytes.Bytes,
+    secondNonce bytes.Bytes
+) Result<own bytes.Bytes, HandshakeError> {
+    const labelBytes = bytes.FromText(label)
+    const labelLength = text.ByteLen(label)
+    const opened = bytes.NewBuilder(labelLength + 96) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var builder = opened
+    write(&builder, labelBytes) else error { return .Err(error) }
+    write(&builder, hostPublicKey) else error { return .Err(error) }
+    write(&builder, firstNonce) else error { return .Err(error) }
+    write(&builder, secondNonce) else error { return .Err(error) }
+    const message = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const result = bytes.HmacSha256(psk, message) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn validateInputs(
+    psk bytes.Bytes,
+    hostPublicKey bytes.Bytes,
+    clientNonce bytes.Bytes,
+    hostNonce bytes.Bytes
+) Result<void, HandshakeError> {
+    validateLength(psk, 32, .InvalidCredential) else error {
+        return .Err(error)
+    }
+    validateLength(hostPublicKey, 32, .InvalidCredential) else error {
+        return .Err(error)
+    }
+    validateLength(clientNonce, 32, .InvalidMessage) else error {
+        return .Err(error)
+    }
+    validateLength(hostNonce, 32, .InvalidMessage)
+}
+
+fn validateLength(
+    value bytes.Bytes,
+    expected u64,
+    failure HandshakeError
+) Result<void, HandshakeError> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    if length != expected return .Err(failure)
+    .Ok
+}
+
+fn join(
+    first bytes.Bytes,
+    second bytes.Bytes
+) Result<own bytes.Bytes, HandshakeError> {
+    const firstLength = length(first) else error { return .Err(error) }
+    const secondLength = length(second) else error { return .Err(error) }
+    const opened = bytes.NewBuilder(firstLength + secondLength) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    var builder = opened
+    write(&builder, first) else error { return .Err(error) }
+    write(&builder, second) else error { return .Err(error) }
+    const result = builder.Finish() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn slice(
+    value bytes.Bytes,
+    start u64,
+    end u64
+) Result<own bytes.Bytes, HandshakeError> {
+    const result = value.Slice(start, end) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn length(value bytes.Bytes) Result<u64, HandshakeError> {
+    const result = value.Len() else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(result)
+}
+
+fn write(
+    &builder bytes.Builder,
+    value bytes.Bytes
+) Result<void, HandshakeError> {
+    builder.Write(value) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}

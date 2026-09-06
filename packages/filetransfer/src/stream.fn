@@ -1,0 +1,266 @@
+package remolo.filetransfer
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.fs
+
+task sendFile(
+    $writer own mux.Writer,
+    $file own fs.File
+) Result<own mux.Writer, Error> {
+    var output = writer
+    var source = file
+    var finished = false
+    while !finished {
+        const reading = spawn fs.ReadFileChunk($source, chunkSize())
+        const outcome = $reading.wait()
+        const fs.FileReadOutcome { File Value } = outcome
+        source = File
+        const chunk = Value else error {
+            discard error
+            discard source
+            discard output
+            return .Err(.Filesystem)
+        }
+        var value = bytes.FromText("")
+        var available = false
+        match chunk {
+            None: { finished = true }
+            Some(found): {
+                value = found
+                available = true
+            }
+        }
+        if available {
+            const sending = spawn writeFrame($output, .Data, $value)
+            const sendResult = $sending.wait()
+            const next = sendResult else error {
+                discard source
+                return .Err(error)
+            }
+            output = next
+        } else {
+            discard value
+        }
+    }
+    discard source.Close()
+    discard source
+    .Ok(output)
+}
+
+task receiveFile(
+    $reader own mux.Reader,
+    $file own fs.File
+) receiveOutcome {
+    var input = reader
+    var output = file
+    var total u64 = 0
+    var finished = false
+    while !finished {
+        const reading = spawn mux.ReadFrame($input)
+        const outcome = $reading.wait()
+        const mux.FrameReadOutcome { Reader Value } = outcome
+        input = Reader
+        const frame = Value else error {
+            discard error
+            return receiveOutcome {
+                Reader = input
+                File = output
+                Value = .Err(.Protocol)
+            }
+        }
+        const selected = filePayload($frame) else error {
+            return receiveOutcome {
+                Reader = input
+                File = output
+                Value = .Err(error)
+            }
+        }
+        var payload = bytes.FromText("")
+        var available = false
+        match selected {
+            None: { finished = true }
+            Some(value): {
+                payload = value
+                available = true
+            }
+        }
+        if available {
+            const length = payload.Len() else error {
+                discard error
+                discard payload
+                return receiveOutcome {
+                    Reader = input
+                    File = output
+                    Value = .Err(.Storage)
+                }
+            }
+            const writing = spawn fs.WriteFileChunk($output, $payload)
+            const written = $writing.wait()
+            const fs.FileOutcome { File Value } = written
+            output = File
+            Value else error {
+                discard error
+                return receiveOutcome {
+                    Reader = input
+                    File = output
+                    Value = .Err(.Filesystem)
+                }
+            }
+            total += length
+        } else {
+            discard payload
+        }
+    }
+    receiveOutcome { Reader = input File = output Value = .Ok(total) }
+}
+
+fn filePayload(
+    $frame protocol.Frame
+) Result<Option<own bytes.Bytes>, Error> {
+    const protocol.Frame { Type Payload } = frame
+    if isData(Type) return .Ok(.Some(Payload))
+    discard Payload
+    if isEOF(Type) return .Ok(.None)
+    if isExit(Type) return .Err(.Remote)
+    .Err(.Protocol)
+}
+
+task drainFile($reader own mux.Reader) own mux.Reader {
+    var input = reader
+    var finished = false
+    while !finished {
+        const reading = spawn mux.ReadFrame($input)
+        const outcome = $reading.wait()
+        const mux.FrameReadOutcome { Reader Value } = outcome
+        input = Reader
+        const frame = Value else error {
+            discard error
+            return input
+        }
+        const protocol.Frame { Type Payload } = frame
+        discard Payload
+        if isEOF(Type) {
+            finished = true
+        }
+    }
+    input
+}
+
+task readAck($reader own mux.Reader) ackOutcome {
+    const reading = spawn mux.ReadFrame($reader)
+    const outcome = $reading.wait()
+    const mux.FrameReadOutcome { Reader Value } = outcome
+    const frame = Value else error {
+        discard error
+        return ackOutcome { Reader = Reader Value = .Err(.Protocol) }
+    }
+    const protocol.Frame { Type Payload } = frame
+    if !isExit(Type) {
+        discard Payload
+        return ackOutcome { Reader = Reader Value = .Err(.Protocol) }
+    }
+    const exit = protocol.DecodeExit(Payload) else error {
+        discard error
+        return ackOutcome { Reader = Reader Value = .Err(.Protocol) }
+    }
+    const protocol.Exit { Code Error as message } = exit
+    if Code != 0 {
+        discard message
+        return ackOutcome { Reader = Reader Value = .Err(.Remote) }
+    }
+    ackOutcome { Reader = Reader Value = .Ok(message) }
+}
+
+task sendExit(
+    $writer own mux.Writer,
+    code i32,
+    $message String
+) Result<own mux.Writer, Error> {
+    const payload = protocol.EncodeExit(protocol.Exit {
+        Code = code
+        Error = message
+    }) else error {
+        discard error
+        discard writer
+        return .Err(.Protocol)
+    }
+    const sending = spawn writeFrame($writer, .Exit, $payload)
+    const result = $sending.wait()
+    result
+}
+
+task reject($writer own mux.Writer, $message String) void {
+    const sending = spawn sendExit($writer, 1, $message)
+    const sent = $sending.wait()
+    const value = sent else error {
+        discard error
+        return
+    }
+    const closing = spawn mux.CloseWriter($value)
+    const closed = $closing.wait()
+    match closed {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
+task drainAndReject(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $message String
+) void {
+    const draining = spawn drainFile($reader)
+    const restored = $draining.wait()
+    discard restored
+    const rejecting = spawn reject($writer, $message)
+    $rejecting.wait()
+}
+
+task writeFrame(
+    $writer own mux.Writer,
+    frameType protocol.FrameType,
+    $payload own bytes.Bytes
+) Result<own mux.Writer, Error> {
+    const sending = spawn mux.WriteFrame($writer, frameType, $payload)
+    const outcome = $sending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Ok(Writer)
+        Err(error): {
+            discard error
+            discard Writer
+            .Err(.Protocol)
+        }
+    }
+}
+
+
+fn isJSON(value protocol.FrameType) bool {
+    match value {
+        JSON: true
+        _: false
+    }
+}
+
+fn isData(value protocol.FrameType) bool {
+    match value {
+        Data: true
+        _: false
+    }
+}
+
+fn isEOF(value protocol.FrameType) bool {
+    match value {
+        EOF: true
+        _: false
+    }
+}
+
+fn isExit(value protocol.FrameType) bool {
+    match value {
+        Exit: true
+        _: false
+    }
+}

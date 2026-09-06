@@ -1,0 +1,146 @@
+package remolo.dirsync
+
+import std.collections
+import std.text
+
+struct Excluder {
+    patterns own collections.List<String>
+
+    fn Match(&self, path String, directory bool) bool {
+        var source = replace self.patterns with collections.NewList<String>()
+        var reversed = collections.NewList<String>()
+        var matched = false
+        while !source.IsEmpty() {
+            const pattern = requiredPattern(source.PopFront())
+            if !matched && matchesPattern(pattern, path, directory) {
+                matched = true
+            }
+            reversed.PushFront($pattern)
+        }
+        var restored = collections.NewList<String>()
+        while !reversed.IsEmpty() {
+            restored.PushFront(requiredPattern(reversed.PopFront()))
+        }
+        discard source
+        discard reversed
+        self.patterns = restored
+        matched
+    }
+
+    fn Add(&self, pattern String) void {
+        const cleaned = cleanPattern(pattern)
+        if !text.IsEmpty(cleaned) {
+            self.patterns.PushFront($cleaned)
+        }
+    }
+}
+
+fn NewExcluder(patterns [String]) own Excluder {
+    var result = own Excluder { patterns = collections.NewList<String>() }
+    for pattern in patterns {
+        result.Add(pattern)
+    }
+    result
+}
+
+fn matchesPattern(pattern String, path String, directory bool) bool {
+    discard directory
+    if globMatch(pattern, path) return true
+    if !text.Contains(pattern, "/") && componentMatches(pattern, path) {
+        return true
+    }
+    text.StartsWith(path, pattern + "/")
+}
+
+fn componentMatches(pattern String, path String) bool {
+    const length = text.ByteLen(path)
+    var start u64 = 0
+    var end u64 = 0
+    while end <= length {
+        if end == length || byteAt(path, end) == 47 {
+            const component = text.Slice(path, start, end) else error {
+                discard error
+                panic("dirsync component boundary invariant failed")
+            }
+            if globMatch(pattern, component) return true
+            start = end + 1
+        }
+        end += 1
+    }
+    false
+}
+
+fn globMatch(pattern String, value String) bool {
+    const patternLength = text.ByteLen(pattern)
+    const valueLength = text.ByteLen(value)
+    var patternOffset u64 = 0
+    var valueOffset u64 = 0
+    var starOffset u64 = 0
+    var retryOffset u64 = 0
+    var hasStar = false
+    while valueOffset < valueLength {
+        if patternOffset < patternLength && byteAt(pattern, patternOffset) == 42 {
+            hasStar = true
+            starOffset = patternOffset
+            patternOffset += 1
+            retryOffset = valueOffset
+            continue
+        }
+        if patternOffset < patternLength &&
+            byteAt(pattern, patternOffset) == byteAt(value, valueOffset) {
+            patternOffset += 1
+            valueOffset += 1
+            continue
+        }
+        if hasStar && retryOffset < valueLength && byteAt(value, retryOffset) != 47 {
+            retryOffset += 1
+            valueOffset = retryOffset
+            patternOffset = starOffset + 1
+            continue
+        }
+        return false
+    }
+    while patternOffset < patternLength && byteAt(pattern, patternOffset) == 42 {
+        patternOffset += 1
+    }
+    patternOffset == patternLength
+}
+
+fn cleanPattern(value String) String {
+    const length = text.ByteLen(value)
+    var start u64 = 0
+    var end = length
+    while start < end && isSpace(byteAt(value, start)) {
+        start += 1
+    }
+    while end > start && isSpace(byteAt(value, end - 1)) {
+        end -= 1
+    }
+    while end > start && byteAt(value, end - 1) == 47 {
+        end -= 1
+    }
+    const cleaned = text.Slice(value, start, end) else error {
+        discard error
+        panic("dirsync pattern boundary invariant failed")
+    }
+    cleaned
+}
+
+fn requiredPattern($value Option<String>) String {
+    match value {
+        None: panic("dirsync pattern invariant failed")
+        Some(pattern): pattern
+    }
+}
+
+fn isSpace(value u64) bool {
+    value == 32 || value == 9 || value == 10 || value == 13
+}
+
+fn byteAt(value String, offset u64) u64 {
+    const result = text.ByteAt(value, offset) else error {
+        discard error
+        panic("dirsync byte boundary invariant failed")
+    }
+    result
+}

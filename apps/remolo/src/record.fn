@@ -1,0 +1,265 @@
+package remolo.cli
+
+import std.bytes
+import std.concurrent
+import std.env
+import std.format
+import std.fs
+import std.json
+import std.terminal
+import std.text
+import std.time
+
+enum castCommand {
+    Output(value own bytes.Bytes)
+    Close
+}
+
+@concurrent.Transferable()
+struct castRecorder {
+    sender Sender<castCommand>
+    actor Task<Result<void, failure>>
+    enabled bool
+}
+
+task openCastRecorder(
+    $path String,
+    size terminal.Size
+) Result<own castRecorder, failure> {
+    const Channel { sender receiver } = channel<castCommand>(256)
+    if text.IsEmpty(path) {
+        discard path
+        return .Ok(own castRecorder {
+            sender = sender
+            actor = spawn discardCastCommands($receiver)
+            enabled = false
+        })
+    }
+    const opening = spawn fs.OpenFile($path, .Truncate)
+    const opened = $opening.wait()
+    const file = opened else error {
+        discard sender
+        discard receiver
+        discard error
+        return .Err(failed("could not create the session recording"))
+    }
+    const header = castHeader(size) else error {
+        discard sender
+        discard receiver
+        discard file
+        return .Err(error)
+    }
+    const writing = spawn writeCastLine($file, $header)
+    const outcome = $writing.wait()
+    const fs.FileOutcome { File Value } = outcome
+    Value else error {
+        discard sender
+        discard receiver
+        discard error
+        discard File
+        return .Err(failed("could not write the session recording"))
+    }
+    .Ok(own castRecorder {
+        sender = sender
+        actor = spawn runCastRecorder(
+            $File,
+            $receiver,
+            time.MonotonicNow()
+        )
+        enabled = true
+    })
+}
+
+task runCastRecorder(
+    $file own fs.File,
+    $receiver Receiver<castCommand>,
+    started time.MonotonicInstant
+) Result<void, failure> {
+    var destination = file
+    var inbox = receiver
+    var running = true
+    while running {
+        const received = inbox.receive()
+        const command = received else error {
+            discard error
+            discard destination
+            discard inbox
+            return .Err(failed("session recording channel closed"))
+        }
+        var line = ""
+        var write = false
+        match command {
+            Output(value): {
+                const encoded = castEvent(started, value) else error {
+                    discard value
+                    discard destination
+                    discard inbox
+                    return .Err(error)
+                }
+                discard value
+                line = encoded
+                write = true
+            }
+            Close: { running = false }
+        }
+        if write {
+            const writing = spawn writeCastLine($destination, $line)
+            const outcome = $writing.wait()
+            const fs.FileOutcome { File Value } = outcome
+            destination = File
+            Value else error {
+                discard error
+                discard destination
+                discard inbox
+                return .Err(failed("could not write the session recording"))
+            }
+        }
+    }
+    discard inbox
+    const closed = destination.Close() else error {
+        discard error
+        return .Err(failed("could not close the session recording"))
+    }
+    discard closed
+    discard destination
+    .Ok
+}
+
+task discardCastCommands(
+    $receiver Receiver<castCommand>
+) Result<void, failure> {
+    var inbox = receiver
+    var running = true
+    while running {
+        const received = inbox.receive()
+        const command = received else error {
+            discard error
+            discard inbox
+            return .Ok
+        }
+        match command {
+            Output(value): { discard value }
+            Close: { running = false }
+        }
+    }
+    discard inbox
+    .Ok
+}
+
+task closeCastRecorder(
+    $recorder own castRecorder
+) Result<void, failure> {
+    const castRecorder { sender actor enabled } = recorder
+    discard enabled
+    const sent = sender.send(.Close)
+    match sent {
+        Ok: {}
+        Err(error): { discard error }
+    }
+    discard sender
+    const result = $actor.wait()
+    result
+}
+
+task writeCastLine($file own fs.File, $line String) fs.FileOutcome {
+    const payload = bytes.FromText(line + "\n")
+    const writing = spawn fs.WriteFileChunk($file, $payload)
+    const result = $writing.wait()
+    result
+}
+
+fn castHeader(size terminal.Size) Result<String, failure> {
+    var root = json.NewObject()
+    setCastField(&root, "version", $ .Number("2")) else error {
+        return .Err(error)
+    }
+    setCastField(&root, "width", $ .Number(format.U16(size.Columns))) else error {
+        return .Err(error)
+    }
+    setCastField(&root, "height", $ .Number(format.U16(size.Rows))) else error {
+        return .Err(error)
+    }
+    setCastField(
+        &root,
+        "timestamp",
+        $ .Number(format.U64(time.Now().Unix()))
+    ) else error {
+        return .Err(error)
+    }
+    var environment = json.NewObject()
+    const term = environmentValue("TERM")
+    const shell = environmentValue("SHELL")
+    setCastField(&environment, "TERM", $ .Text(term)) else error {
+        return .Err(error)
+    }
+    setCastField(&environment, "SHELL", $ .Text(shell)) else error {
+        return .Err(error)
+    }
+    setCastField(&root, "env", $ .Object(environment)) else error {
+        return .Err(error)
+    }
+    stringifyCast($ .Object(root))
+}
+
+fn castEvent(
+    started time.MonotonicInstant,
+    value bytes.Bytes
+) Result<String, failure> {
+    const elapsed = time.MonotonicNow().Since(started) else error {
+        discard error
+        return .Err(failed("could not measure the recording timestamp"))
+    }
+    const output = value.Text() else error {
+        discard error
+        return .Err(failed("terminal output is not valid UTF-8"))
+    }
+    var event = json.NewArray()
+    event.Add($ .Number(durationSeconds(elapsed)))
+    event.Add($ .Text("o"))
+    event.Add($ .Text(output))
+    stringifyCast($ .Array(event))
+}
+
+fn durationSeconds(value time.Duration) String {
+    const nanoseconds = value.Nanoseconds()
+    const seconds = nanoseconds / 1000000000
+    const fraction = nanoseconds - seconds * 1000000000
+    format.I64(seconds) + "." + padNanoseconds(fraction)
+}
+
+fn padNanoseconds(value i64) String {
+    var result = format.I64(value)
+    while text.ByteLen(result) < 9 { result = "0" + result }
+    result
+}
+
+fn environmentValue(name String) String {
+    const selected = env.Get(name) else error {
+        discard error
+        return ""
+    }
+    match selected {
+        Some(value): value
+        None: ""
+    }
+}
+
+fn setCastField(
+    &object json.Object,
+    name String,
+    $value json.Value
+) Result<void, failure> {
+    object.Set($text.Copy(name), $value) else error {
+        discard error
+        return .Err(failed("could not encode the session recording"))
+    }
+    .Ok
+}
+
+fn stringifyCast($value json.Value) Result<String, failure> {
+    const encoded = json.Stringify($value) else error {
+        discard error
+        return .Err(failed("could not encode the session recording"))
+    }
+    .Ok(encoded)
+}

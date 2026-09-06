@@ -1,0 +1,255 @@
+package remolo.transport
+
+import remolo.protocol
+import std.bytes
+import std.concurrent
+import std.net
+
+enum Error {
+    InvalidAddress
+    ResolveFailed
+    Refused
+    Closed
+    Cancelled
+    Timeout
+    PayloadTooLarge
+    InvalidFrame
+    AddressInUse
+    Io
+}
+
+@concurrent.Transferable()
+struct Reader {
+    inner own net.TcpReader
+}
+
+@concurrent.Transferable()
+struct Writer {
+    inner own net.TcpWriter
+}
+
+struct Stream {
+    Reader own Reader
+    Writer own Writer
+    Peer String
+}
+
+struct ReadOutcome {
+    Reader own Reader
+    Value Result<protocol.Frame, Error>
+}
+
+struct WriteOutcome {
+    Writer own Writer
+    Value Result<void, Error>
+}
+
+struct Listener {
+    inner own net.TcpListener
+
+    fn Port(self) u64 {
+        self.inner.Port
+    }
+
+    fn Close(&self) bool {
+        self.inner.Close()
+    }
+}
+
+struct AcceptOutcome {
+    Listener own Listener
+    Value Result<Stream, Error>
+}
+
+fn Listen($address String, port u64) Result<own Listener, Error> {
+    const listener = net.Listen($address, port) else error {
+        return .Err(networkError(error))
+    }
+    .Ok(own Listener { inner = listener })
+}
+
+task Dial($host String, port u64) Result<Stream, Error> {
+    const pending = spawn net.Connect($host, port)
+    const connected = $pending.wait()
+    match connected {
+        Ok(connection): openStream($connection)
+        Err(error): .Err(networkError(error))
+    }
+}
+
+task Accept($listener own Listener) AcceptOutcome {
+    const Listener { inner } = listener
+    const pending = spawn net.Accept($inner)
+    const accepted = $pending.wait()
+    const net.AcceptOutcome { Listener as restored Value } = accepted
+    const listenerOwner = own Listener { inner = restored }
+    match Value {
+        Ok(connection): AcceptOutcome {
+            Listener = listenerOwner
+            Value = openStream($connection)
+        }
+        Err(error): AcceptOutcome {
+            Listener = listenerOwner
+            Value = .Err(networkError(error))
+        }
+    }
+}
+
+task ReadFrame($reader own Reader) ReadOutcome {
+    const Reader { inner } = reader
+    const headerPending = spawn net.ReadExactBytes($inner, 5)
+    const headerRead = $headerPending.wait()
+    const net.ReadBytesOutcome { Reader as afterHeader Value } = headerRead
+    const header = match Value {
+        Ok(value): value
+        Err(error): {
+            return ReadOutcome {
+                Reader = own Reader { inner = afterHeader }
+                Value = .Err(networkError(error))
+            }
+        }
+    }
+    const length = frameLength(header)
+    if length > protocol.MaxFramePayload() {
+        return ReadOutcome {
+            Reader = own Reader { inner = afterHeader }
+            Value = .Err(.PayloadTooLarge)
+        }
+    }
+    const bodyPending = spawn net.ReadExactBytes($afterHeader, length)
+    const bodyRead = $bodyPending.wait()
+    const net.ReadBytesOutcome { Reader as restored Value as bodyValue } = bodyRead
+    const body = match bodyValue {
+        Ok(value): value
+        Err(error): {
+            return ReadOutcome {
+                Reader = own Reader { inner = restored }
+                Value = .Err(networkError(error))
+            }
+        }
+    }
+    const frame = decodeParts(header, body)
+    ReadOutcome { Reader = own Reader { inner = restored } Value = frame }
+}
+
+task WriteFrame(
+    $writer own Writer,
+    frameType protocol.FrameType,
+    $payload own bytes.Bytes
+) WriteOutcome {
+    const encoded = protocol.EncodeFrame(frameType, payload)
+    discard payload
+    const frame = match encoded {
+        Ok(value): value
+        Err(error): {
+            discard error
+            return WriteOutcome { Writer = writer Value = .Err(.InvalidFrame) }
+        }
+    }
+    const Writer { inner } = writer
+    const pending = spawn net.WriteAllBytes($inner, $frame)
+    const written = $pending.wait()
+    const net.WriteOutcome { Writer as restored Value } = written
+    match Value {
+        Ok: WriteOutcome { Writer = own Writer { inner = restored } Value = .Ok }
+        Err(error): WriteOutcome {
+            Writer = own Writer { inner = restored }
+            Value = .Err(networkError(error))
+        }
+    }
+}
+
+task WriteRaw(
+    $writer own Writer,
+    $value own bytes.Bytes
+) WriteOutcome {
+    const Writer { inner } = writer
+    const pending = spawn net.WriteAllBytes($inner, $value)
+    const written = $pending.wait()
+    const net.WriteOutcome { Writer as restored Value } = written
+    match Value {
+        Ok: WriteOutcome { Writer = own Writer { inner = restored } Value = .Ok }
+        Err(error): WriteOutcome {
+            Writer = own Writer { inner = restored }
+            Value = .Err(networkError(error))
+        }
+    }
+}
+
+fn openStream($connection own net.TcpConnection) Result<Stream, Error> {
+    const peer = connection.PeerAddress() else error {
+        return .Err(networkError(error))
+    }
+    const split = connection.Split() else error {
+        return .Err(networkError(error))
+    }
+    const net.StreamPair { Reader Writer } = split
+    .Ok(Stream {
+        Reader = own Reader { inner = Reader }
+        Writer = own Writer { inner = Writer }
+        Peer = peer
+    })
+}
+
+fn frameLength(header bytes.Bytes) u64 {
+    byteAt(header, 1) << 24 |
+        byteAt(header, 2) << 16 |
+        byteAt(header, 3) << 8 |
+        byteAt(header, 4)
+}
+
+fn decodeParts(
+    header bytes.Bytes,
+    body bytes.Bytes
+) Result<protocol.Frame, Error> {
+    const bodyLength = body.Len() else error {
+        discard error
+        return .Err(.Io)
+    }
+    const opened = bytes.NewBuilder(bodyLength + 5) else error {
+        discard error
+        return .Err(.Io)
+    }
+    var builder = opened
+    builder.Write(header) else error {
+        discard error
+        return .Err(.Io)
+    }
+    builder.Write(body) else error {
+        discard error
+        return .Err(.Io)
+    }
+    const encoded = builder.Finish() else error {
+        discard error
+        return .Err(.Io)
+    }
+    const decoded = protocol.DecodeFrame(encoded) else error {
+        discard error
+        return .Err(.InvalidFrame)
+    }
+    .Ok(decoded)
+}
+
+fn byteAt(value bytes.Bytes, index u64) u64 {
+    const byte = value.At(index) else error {
+        discard error
+        panic("transport header invariant failed")
+    }
+    byte
+}
+
+fn networkError(error net.Error) Error {
+    match error {
+        InvalidAddress: .InvalidAddress
+        ResolveFailed: .ResolveFailed
+        Refused: .Refused
+        Closed: .Closed
+        Cancelled: .Cancelled
+        InvalidUtf8: .InvalidFrame
+        LineTooLong: .InvalidFrame
+        AddressInUse: .AddressInUse
+        Timeout: .Timeout
+        InvalidLimit: .PayloadTooLarge
+        Io: .Io
+    }
+}

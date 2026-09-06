@@ -1,0 +1,1901 @@
+package remolo.session
+
+import foundation.worker
+import remolo.desktop as remoteDesktop
+import remolo.dirsync
+import remolo.mux
+import remolo.protocol
+import remolo.relay
+import remolo.rpc
+import remolo.token
+import remolo.tunnel
+import std.bytes
+import std.collections
+import std.format
+import std.fs
+import std.net
+import std.path as filepath
+import std.text
+import std.time
+
+fn testCapabilities() protocol.Capabilities {
+    protocol.Capabilities {
+        OS = "linux"
+        Arch = "amd64"
+        PTY = true
+        Desktop = true
+        Exec = true
+        File = true
+        Hostname = "foundation-host"
+        Version = "0.1.0"
+    }
+}
+
+test "daemon owner signals stop before joining workers" {
+    const Channel { sender receiver } = channel<void>(1)
+    const supervisor = worker.NewSupervisor()
+    supervisor.Start(spawn awaitDaemonStop($receiver))
+    var owner = own DaemonOwner {
+        supervisor = supervisor
+        stop = sender
+        metadataPath = "remolo-missing-daemon-metadata"
+    }
+    owner.Stop()
+    discard owner
+}
+
+task awaitDaemonStop($receiver Receiver<void>) void {
+    var inbox = receiver
+    discard inbox.receive()
+    discard inbox
+}
+
+test "host listener uses configured identity and advertised endpoint" {
+    const directory = temporaryDirectory("remolo-host-")
+    const identityPath = directory + "/identity.pem"
+    const expiry = time.Now().Unix() + 3600
+    const pending = spawn Listen($HostOptions {
+        BindAddress = "127.0.0.1"
+        AdvertiseAddress = "10.0.0.8"
+        Port = 0
+        IdentityPath = text.Copy(identityPath)
+        Capabilities = testCapabilities()
+        Expiry = expiry
+        Rendezvous = ""
+        IncludeLoopback = true
+        MDNS = false
+        STUN = ""
+        Relay = ""
+    })
+    const listening = $pending.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    var credential = Token
+    expect(host.Port() > 0)
+    expect(credential.Expiry == expiry)
+    expect(credential.Candidates.Len() == 1)
+    const candidate = match credential.Candidates.PopFront() {
+        None: panic("advertised endpoint missing")
+        Some(value): value
+    }
+    expect(candidate.IP == "10.0.0.8")
+    expect(u64.From(candidate.Port) == host.Port())
+    expect(pathExists(identityPath))
+    expect(host.Close())
+    discard host
+    discard credential
+    fs.RemoveTree(directory, 16, 4) else {
+        fail("host listener cleanup failed")
+    }
+}
+
+test "client and host authenticate over pinned multiplexed TLS" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+    const capabilities = client.Capabilities()
+    expect(capabilities.OS == "linux")
+    expect(capabilities.Arch == "amd64")
+    expect(capabilities.PTY)
+    expect(capabilities.Desktop)
+    expect(capabilities.Exec)
+    expect(capabilities.File)
+    expect(capabilities.Hostname == "foundation-host")
+    expect(capabilities.Version == "0.1.0")
+    expect(bytes.ConstantTimeEqual(client.sessionKey, peer.sessionKey))
+    const serving = spawn ServeExec($peer.Handle())
+    const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const executed = $executing.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("stdout text failed") }
+    const stderr = Stderr.Text() else { fail("stderr text failed") }
+    expect(Exit.Code == 7)
+    expect(Exit.Error == "")
+    expect(stdout == "foundation-exec\n")
+    expect(stderr == "foundation-stderr\n")
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+}
+
+test "daemon proxy preserves output after client input closes" {
+    const connectionID = "daemon-proxy-half-close-test"
+    const metadataPath = daemonMetadataPath(connectionID)
+    discard fs.RemoveFile(metadataPath)
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("client connection failed")
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error {
+        discard error
+        fail("host authentication failed")
+    }
+    const serving = spawn ServePeer($peer, $".", true)
+    const starting = spawn StartDaemon($client, $connectionID)
+    const local = $starting.wait() else error {
+        discard error
+        fail("daemon start failed")
+    }
+    const executing = spawn Execute(local.Handle(), $execDescriptor())
+    const executed = $executing.wait() else error {
+        discard error
+        fail("daemon execution failed")
+    }
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("daemon stdout text failed") }
+    const stderr = Stderr.Text() else { fail("daemon stderr text failed") }
+    expect(Exit.Code == 7)
+    expect(stdout == "foundation-exec\n")
+    expect(stderr == "foundation-stderr\n")
+    CloseClient($local)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    expect(host.Close())
+    discard fs.RemoveFile(metadataPath)
+}
+
+test "SSH agent forwarding relays a local socket" {
+    const directory = temporaryDirectory("remolo-agent-test-")
+    const localSocket = filepath.Join(directory, "agent.sock")
+    const localListener = net.ListenLocal($text.Copy(localSocket)) else error {
+        discard error
+        discard fs.RemoveTree(directory, 2, 2)
+        fail("local agent listen failed")
+    }
+    const listenerController = localListener.Control() else error {
+        discard error
+        discard localListener
+        discard fs.RemoveTree(directory, 2, 2)
+        fail("local agent control failed")
+    }
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("client connection failed")
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error {
+        discard error
+        fail("host authentication failed")
+    }
+    const Peer {
+        session as peerSession
+        handle as peerHandle
+        controlReader
+        controlWriter
+        sessionKey
+        authorizedPath
+        resume
+    } = peer
+    const Channel { sender receiver } = newAgentState()
+    const state = agentStateHandle { requests = sender }
+    const workers = worker.NewSupervisor()
+    workers.Start(spawn serveAgentState($receiver))
+    workers.Start(spawn servePeerControl(
+            $controlReader,
+            $controlWriter,
+            peerHandle.Clone(),
+            state.Clone()
+        ))
+    const forwarding = spawn ForwardAgent($client, $localSocket)
+    const forwarded = $forwarding.wait() else error {
+        discard error
+        fail("agent forwarding request failed")
+    }
+    const readingSocket = spawn agentSocket(state.Clone())
+    const remoteSocket = $readingSocket.wait()
+    expect(!text.IsEmpty(remoteSocket))
+    const acceptingAgent = spawn net.AcceptLocal($localListener)
+    const remote = net.DialLocal(remoteSocket) else error {
+        discard error
+        fail("remote agent socket dial failed")
+    }
+    const net.LocalAcceptOutcome {
+        Listener as localListenerAfter
+        Value as localAgentValue
+    } = $acceptingAgent.wait()
+    const localAgent = localAgentValue else error {
+        discard error
+        fail("local agent socket accept failed")
+    }
+    const remotePair = remote.Split() else error {
+        discard error
+        fail("remote agent split failed")
+    }
+    const localPair = localAgent.Split() else error {
+        discard error
+        fail("local agent split failed")
+    }
+    const net.StreamPair {
+        Reader as remoteReader
+        Writer as remoteWriter
+    } = remotePair
+    const net.StreamPair {
+        Reader as localReader
+        Writer as localWriter
+    } = localPair
+    const sendingRequest = spawn net.WriteAll($remoteWriter, "request\n")
+    const readingRequest = spawn net.ReadLine($localReader)
+    const net.WriteOutcome {
+        Writer as remoteWriterAfter
+        Value as requestWrite
+    } = $sendingRequest.wait()
+    const net.ReadLineOutcome {
+        Reader as localReaderAfter
+        Value as requestRead
+    } = $readingRequest.wait()
+    const sendingReply = spawn net.WriteAll($localWriter, "reply\n")
+    const readingReply = spawn net.ReadLine($remoteReader)
+    const net.WriteOutcome {
+        Writer as localWriterAfter
+        Value as replyWrite
+    } = $sendingReply.wait()
+    const net.ReadLineOutcome {
+        Reader as remoteReaderAfter
+        Value as replyRead
+    } = $readingReply.wait()
+    expect(agentLine($requestRead) == "request")
+    expect(agentLine($replyRead) == "reply")
+    expect(agentWriteSucceeded($requestWrite))
+    expect(agentWriteSucceeded($replyWrite))
+    discard remoteWriterAfter
+    discard localReaderAfter
+    discard localWriterAfter
+    discard remoteReaderAfter
+    CloseClient($forwarded)
+    mux.Close($peerSession)
+    discard peerHandle
+    discard sessionKey
+    discard authorizedPath
+    discard resume
+    discard state
+    const stopping = workers.CancelTask()
+    discard $stopping.wait()
+    var localControl = listenerController
+    discard localControl.Close()
+    discard localControl
+    discard localListenerAfter
+    expect(host.Close())
+    discard host
+    fs.RemoveTree(directory, 4, 2) else {
+        fail("local agent cleanup failed")
+    }
+}
+
+fn agentLine(
+    $value Result<Option<String>, net.Error>
+) String {
+    match value {
+        Ok(found): match found {
+            Some(line): line
+            None: ""
+        }
+        Err(error): {
+            discard error
+            ""
+        }
+    }
+}
+
+fn agentWriteSucceeded(
+    $value Result<void, net.Error>
+) bool {
+    match value {
+        Ok: true
+        Err(error): {
+            discard error
+            false
+        }
+    }
+}
+
+test "client advances to the next direct candidate" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    var credential = Token
+    credential.Candidates.PushFront(token.Candidate {
+        IP = "127.0.0.1"
+        Port = 1
+    })
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($credential)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("candidate fallback failed")
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error {
+        discard error
+        fail("candidate fallback authentication failed")
+    }
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+}
+
+test "client and host execute through an opaque relay" {
+    const relayServer = relay.NewServer($"127.0.0.1", 0) else error {
+        discard error
+        fail("relay listen failed")
+    }
+    const openedControl = relayServer.Control() else error {
+        discard error
+        fail("relay control failed")
+    }
+    var relayControl = openedControl
+    const relayPort = relayServer.Port()
+    const relayServing = spawn relay.Serve($relayServer)
+    const relayAddress = "127.0.0.1:" + format.U64(relayPort)
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn AcceptRelay($host, text.Copy(relayAddress))
+    const connecting = spawn ConnectRelay($Token, $relayAddress)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("relay client connection failed")
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error {
+        discard error
+        fail("relay host connection failed")
+    }
+    expect(bytes.ConstantTimeEqual(client.sessionKey, peer.sessionKey))
+    const serving = spawn ServeExec($peer.Handle())
+    const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const executed = $executing.wait() else error {
+        discard error
+        fail("relay execution failed")
+    }
+    const served = $serving.wait()
+    served else error {
+        discard error
+        fail("relay execution service failed")
+    }
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("relay stdout text failed") }
+    const stderr = Stderr.Text() else { fail("relay stderr text failed") }
+    expect(Exit.Code == 7)
+    expect(stdout == "foundation-exec\n")
+    expect(stderr == "foundation-stderr\n")
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    discard host
+    discard relayControl.Close()
+    const relayServed = $relayServing.wait()
+    relayServed else error {
+        discard error
+        fail("relay shutdown failed")
+    }
+}
+
+test "connect falls back to the configured relay" {
+    const relayServer = relay.NewServer($"127.0.0.1", 0) else error {
+        discard error
+        fail("relay listen failed")
+    }
+    const openedControl = relayServer.Control() else error {
+        discard error
+        fail("relay control failed")
+    }
+    var relayControl = openedControl
+    const relayAddress = "127.0.0.1:" + format.U64(relayServer.Port())
+    const relayServing = spawn relay.Serve($relayServer)
+    const listening = spawn Listen($HostOptions {
+        BindAddress = "127.0.0.1"
+        AdvertiseAddress = "127.0.0.1"
+        Port = 0
+        IdentityPath = ""
+        Capabilities = testCapabilities()
+        Expiry = time.Now().Unix() + 3600
+        Rendezvous = ""
+        IncludeLoopback = true
+        MDNS = false
+        STUN = ""
+        Relay = text.Copy(relayAddress)
+    })
+    const listeningResult = $listening.wait()
+    const opened = listeningResult else error {
+        discard error
+        fail("host listen failed")
+    }
+    const ListeningHost { Host Token } = opened
+    var host = Host
+    var credential = Token
+    const Relay = host.TakeRelay()
+    var relayHost = match Relay {
+        None: panic("relay host missing")
+        Some(value): value
+    }
+    while !credential.Candidates.IsEmpty() {
+        discard credential.Candidates.PopFront()
+    }
+    credential.Candidates.PushFront(token.Candidate {
+        IP = "127.0.0.1"
+        Port = 1
+    })
+    const accepting = spawn AcceptRelayHost($relayHost)
+    const connectionOptions = own ConnectOptions {
+        Rendezvous = ""
+        Relay = relayAddress
+        LocalDiscovery = false
+        Preferred = .None
+        SSH = .None
+    }
+    const connecting = spawn ConnectWith($credential, $connectionOptions)
+    const client = $connecting.wait() else error {
+        discard error
+        fail("relay fallback connection failed")
+    }
+    const accepted = $accepting.wait()
+    const RelayHostAcceptOutcome { Host as restored Value } = accepted
+    relayHost = restored
+    const peer = Value else error {
+        discard error
+        fail("relay fallback authentication failed")
+    }
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    discard host
+    discard relayHost
+    discard relayControl.Close()
+    const relayServed = $relayServing.wait()
+    relayServed else error {
+        discard error
+        fail("relay shutdown failed")
+    }
+}
+
+test "client executes through a jump host" {
+    const expiry = time.Now().Unix() + 3600
+    const targetListening = ListenLocal($testCapabilities(), expiry) else error {
+        discard error
+        fail("target host listen failed")
+    }
+    const ListeningHost {
+        Host as TargetHost
+        Token as TargetToken
+    } = targetListening
+    var targetHost = TargetHost
+    const bastionListening = ListenLocal(
+        $testCapabilities(),
+        expiry
+    ) else error {
+        discard error
+        fail("bastion host listen failed")
+    }
+    const ListeningHost {
+        Host as BastionHost
+        Token as BastionToken
+    } = bastionListening
+    var bastionHost = BastionHost
+    const acceptingTarget = spawn Accept($targetHost)
+    const acceptingBastion = spawn Accept($bastionHost)
+    const connecting = spawn ConnectViaJump($TargetToken, $BastionToken)
+
+    const bastionAccepted = $acceptingBastion.wait()
+    const HostAcceptOutcome {
+        Host as RestoredBastion
+        Value as BastionValue
+    } = bastionAccepted
+    bastionHost = RestoredBastion
+    const bastionPeer = BastionValue else error {
+        discard error
+        fail("bastion authentication failed")
+    }
+    const servingBastion = spawn ServePeer($bastionPeer, $".", true)
+
+    const clientResult = $connecting.wait()
+    const client = clientResult else error {
+        discard error
+        fail("jump connection failed")
+    }
+    const targetAccepted = $acceptingTarget.wait()
+    const HostAcceptOutcome {
+        Host as RestoredTarget
+        Value as TargetValue
+    } = targetAccepted
+    targetHost = RestoredTarget
+    const targetPeer = TargetValue else error {
+        discard error
+        fail("target authentication failed")
+    }
+    const servingTarget = spawn ServePeer($targetPeer, $".", true)
+    const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const executed = $executing.wait() else error {
+        discard error
+        fail("jump execution failed")
+    }
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("jump stdout text failed") }
+    discard Stderr
+    expect(Exit.Code == 7)
+    expect(stdout == "foundation-exec\n")
+    CloseClient($client)
+    const targetServed = $servingTarget.wait()
+    targetServed else error { panic(sessionFailure(error)) }
+    const bastionServed = $servingBastion.wait()
+    bastionServed else error { panic(sessionFailure(error)) }
+    expect(targetHost.Close())
+    expect(bastionHost.Close())
+}
+
+fn execDescriptor() protocol.Open {
+    var command = collections.NewList<String>()
+    command.PushFront($"printf 'foundation-stderr\\n' >&2; " +
+        "printf 'foundation-exec\\n'; exit 7")
+    command.PushFront($"-c")
+    command.PushFront($"/bin/sh")
+    protocol.Open {
+        Kind = .Exec
+        Cols = 0
+        Rows = 0
+        Command = command
+        Env = collections.NewList<protocol.Environment>()
+        Term = ""
+        Dir = ""
+        Target = ""
+        ResumeID = ""
+    }
+}
+
+test "interactive PTY forwards input resize output and exit" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+    const serving = spawn ServePeer($peer, $".", true)
+    const opening = spawn OpenPTY($client.Handle(), $ptyDescriptor())
+    const remote = $opening.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const RemotePTY { Reader Writer Controller } = remote
+    var writer = Writer
+    const resizing = spawn ResizePTY($writer, 111, 37)
+    const resized = $resizing.wait()
+    const afterResize = resized else error {
+        panic(sessionFailure(error))
+    }
+    writer = afterResize
+    const writing = spawn WritePTY($writer, $bytes.FromText(ptyInput()))
+    const written = $writing.wait()
+    const afterWrite = written else error {
+        panic(sessionFailure(error))
+    }
+    writer = afterWrite
+    const closing = spawn ClosePTYInput($writer)
+    const closed = $closing.wait()
+    closed else error { panic(sessionFailure(error)) }
+    const result = readPTYResult($Reader)
+    expect(result.exit.Code == 3)
+    expect(result.exit.Error == "")
+    expect(text.Contains(result.output, "FOUNDATION-PTY:answer"))
+    const expectedSize = ptyExpectedSize()
+    if !text.IsEmpty(expectedSize) {
+        expect(text.Contains(result.output, expectedSize))
+    }
+    discard Controller
+    CloseClient($client)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    expect(host.Close())
+}
+
+struct ptyTestResult {
+    output String
+    exit protocol.Exit
+}
+
+fn readPTYResult($reader own PTYReader) ptyTestResult {
+    const opened = bytes.NewBuilder(65536) else {
+        fail("PTY output builder failed")
+    }
+    var builder = opened
+    var source = reader
+    while true {
+        const reading = spawn ReadPTY($source)
+        const outcome = $reading.wait()
+        const PTYReadOutcome { Reader Value } = outcome
+        source = Reader
+        const event = Value else error { panic(sessionFailure(error)) }
+        match event {
+            Data(value): {
+                builder.Write(value) else { fail("PTY output write failed") }
+            }
+            Exit(value): {
+                discard source
+                const bytesValue = builder.Finish() else {
+                    fail("PTY output finish failed")
+                }
+                const output = bytesValue.Text() else {
+                    fail("PTY output text failed")
+                }
+                return ptyTestResult { output = output exit = value }
+            }
+        }
+    }
+    panic("PTY event loop invariant failed")
+}
+
+@target(linux)
+fn ptyDescriptor() protocol.Open {
+    posixPTYDescriptor()
+}
+
+@target(macos)
+fn ptyDescriptor() protocol.Open {
+    posixPTYDescriptor()
+}
+
+@target(windows)
+fn ptyDescriptor() protocol.Open {
+    var command = collections.NewList<String>()
+    command.PushFront($"set /p value=& echo FOUNDATION-PTY:%value%& exit /b 3")
+    command.PushFront($"/c")
+    command.PushFront($"cmd.exe")
+    ptyDescriptorFor($command)
+}
+
+fn posixPTYDescriptor() protocol.Open {
+    var command = collections.NewList<String>()
+    command.PushFront($"read value; stty size; printf 'FOUNDATION-PTY:%s\\n' " +
+        "$value; exit 3")
+    command.PushFront($"-c")
+    command.PushFront($"/bin/sh")
+    ptyDescriptorFor($command)
+}
+
+fn ptyDescriptorFor(
+    $command own collections.List<String>
+) protocol.Open {
+    protocol.Open {
+        Kind = .PTY
+        Cols = 80
+        Rows = 24
+        Command = command
+        Env = collections.NewList<protocol.Environment>()
+        Term = "xterm-256color"
+        Dir = ""
+        Target = ""
+        ResumeID = ""
+    }
+}
+
+@target(linux)
+fn ptyInput() String {
+    "answer\n"
+}
+
+@target(macos)
+fn ptyInput() String {
+    "answer\n"
+}
+
+@target(windows)
+fn ptyInput() String {
+    "answer\r\n"
+}
+
+@target(linux)
+fn ptyExpectedSize() String {
+    "37 111"
+}
+
+@target(macos)
+fn ptyExpectedSize() String {
+    "37 111"
+}
+
+@target(windows)
+fn ptyExpectedSize() String {
+    ""
+}
+
+test "client authentication rejects a changed token secret" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    var credential = Token
+    const changed = bytes.Random(32) else { fail("secret generation failed") }
+    const original = replace credential.PSK with changed
+    discard original
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($credential)
+    const connected = $connecting.wait()
+    match connected {
+        Ok(client): {
+            CloseClient($client)
+            fail("changed token secret was accepted")
+        }
+        Err(error): expect(authenticationFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    match Value {
+        Ok(peer): {
+            ClosePeer($peer)
+            fail("host accepted changed token secret")
+        }
+        Err(error): { discard error }
+    }
+    expect(host.Close())
+}
+
+test "file transfer uploads, resumes, and rejects writes by policy" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const connected = $connecting.wait()
+    const client = connected else error { panic(sessionFailure(error)) }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const localCreated = fs.CreateTempDirectory(".", "remolo-local-") else {
+        fail("local temporary directory creation failed")
+    }
+    const local = fs.Canonicalize(localCreated) else {
+        fail("local temporary directory resolution failed")
+    }
+    const remoteCreated = fs.CreateTempDirectory(".", "remolo-remote-") else {
+        fail("remote temporary directory creation failed")
+    }
+    const remote = fs.Canonicalize(remoteCreated) else {
+        fail("remote temporary directory resolution failed")
+    }
+    const payload = transferPayload()
+    const source = local + "/source.bin"
+    fs.WriteTextAtomic(source, payload, 262144) else {
+        fail("source write failed")
+    }
+    const remoteNested = remote + "/nested"
+    fs.CreateDirectory(remoteNested) else {
+        fail("remote directory creation failed")
+    }
+    fs.WriteTextAtomic(
+        remoteNested + "/upload.bin",
+        payload + "stale tail",
+        262144
+    ) else {
+        fail("stale remote write failed")
+    }
+
+    const servingPut = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const putting = spawn PutFile(
+        $client.Handle(),
+        $text.Copy(source),
+        $"nested/upload.bin"
+    )
+    const put = $putting.wait()
+    put else error { panic(sessionFailure(error)) }
+    const servedPut = $servingPut.wait()
+    servedPut else error { panic(sessionFailure(error)) }
+
+    const prefixLength u64 = 40960
+    const prefix = text.Slice(payload, 0, prefixLength) else {
+        fail("resume prefix failed")
+    }
+    const destination = local + "/download.bin"
+    fs.WriteTextAtomic(destination, prefix, 262144) else {
+        fail("resume prefix write failed")
+    }
+    const servingGet = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const getting = spawn GetFile(
+        $client.Handle(),
+        $"nested/upload.bin",
+        $text.Copy(destination)
+    )
+    const get = $getting.wait()
+    const total = get else error { panic(sessionFailure(error)) }
+    const servedGet = $servingGet.wait()
+    servedGet else error { panic(sessionFailure(error)) }
+    expect(total == text.ByteLen(payload))
+    const downloaded = fs.ReadBytesSync(destination, 262144) else {
+        fail("download read failed")
+    }
+    const downloadedText = downloaded.Text() else {
+        fail("download text failed")
+    }
+    expect(downloadedText == payload)
+
+    const servingRejected = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        false
+    )
+    const rejectedPut = spawn PutFile(
+        $client.Handle(),
+        $source,
+        $"rejected.bin"
+    )
+    const rejected = $rejectedPut.wait()
+    match rejected {
+        Ok: fail("read-only host accepted an upload")
+        Err(error): expect(fileTransferFailure(error))
+    }
+    const servedRejected = $servingRejected.wait()
+    match servedRejected {
+        Ok: fail("read-only host reported success")
+        Err(error): expect(fileTransferFailure(error))
+    }
+
+    const servingTraversal = spawn ServeFile(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const traversing = spawn GetFile(
+        $client.Handle(),
+        $"../outside.bin",
+        $(local + "/outside.bin")
+    )
+    const traversal = $traversing.wait()
+    match traversal {
+        Ok(value): {
+            discard value
+            fail("path traversal was accepted")
+        }
+        Err(error): expect(fileTransferFailure(error))
+    }
+    const servedTraversal = $servingTraversal.wait()
+    match servedTraversal {
+        Ok: fail("path traversal reported success")
+        Err(error): expect(fileTransferFailure(error))
+    }
+
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    fs.RemoveTree(local, 16, 4) else { fail("local cleanup failed") }
+    fs.RemoveTree(remote, 16, 4) else { fail("remote cleanup failed") }
+}
+
+fn transferPayload() String {
+    var builder = text.NewBuilder()
+    var blocks u64 = 0
+    while blocks < 4097 {
+        const written = builder.Write("0123456789abcdef0123456789abcdef") else {
+            fail("payload builder failed")
+        }
+        discard written
+        blocks += 1
+    }
+    const result = builder.Finish() else { fail("payload finish failed") }
+    result
+}
+
+test "directory sync pushes rolling deltas and pulls trees" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const local = temporaryDirectory("remolo-sync-local-")
+    const remote = temporaryDirectory("remolo-sync-remote-")
+    const pulled = temporaryDirectory("remolo-sync-pulled-")
+    const changed = verifyInitialDirectorySync(client, peer, local, remote)
+    verifyDirectorySyncPolicies(client, peer, local, remote, changed)
+    verifyDirectoryPull(client, peer, remote, pulled, changed)
+    verifyDirectorySyncExcludes(client, peer, local, remote)
+    expectDirectoryPushRejected(client, peer, local, remote, "rejected", false)
+    expectDirectoryPushRejected(client, peer, local, remote, "../escape", true)
+
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(host.Close())
+    fs.RemoveTree(local, 16, 4) else { fail("local cleanup failed") }
+    fs.RemoveTree(remote, 32, 6) else { fail("remote cleanup failed") }
+    fs.RemoveTree(pulled, 16, 4) else { fail("pull cleanup failed") }
+}
+
+fn verifyInitialDirectorySync(
+    client Client,
+    peer Peer,
+    local String,
+    remote String
+) String {
+    fs.CreateDirectory(local + "/nested") else {
+        fail("source directory creation failed")
+    }
+    const payload = syncPayload()
+    fs.WriteTextAtomic(local + "/nested/data.bin", payload, 131072) else {
+        fail("source file write failed")
+    }
+    const script = "#!/bin/sh\necho remolo\n"
+    const scriptPath = local + "/run.sh"
+    fs.WriteTextAtomic(scriptPath, script, 128) else {
+        fail("source script write failed")
+    }
+    const executable = makeExecutable(scriptPath)
+    const linked = createSyncLink(local)
+    const first = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(first.FilesTransferred == 2)
+    expect(first.BytesTransferred == text.ByteLen(payload) + text.ByteLen(script))
+    if executable {
+        const copiedExecutable = fs.IsExecutable(remote + "/tree/run.sh") else {
+            fail("destination executable check failed")
+        }
+        expect(copiedExecutable)
+    }
+    if linked {
+        expectSyncedLink(remote + "/tree")
+    }
+    const left = text.Slice(payload, 0, 32768) else {
+        fail("payload prefix failed")
+    }
+    const right = text.Slice(payload, 32769, text.ByteLen(payload)) else {
+        fail("payload suffix failed")
+    }
+    const changed = left + "X" + right
+    fs.WriteTextAtomic(local + "/nested/data.bin", changed, 131072) else {
+        fail("changed source write failed")
+    }
+    const second = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(second.FilesTransferred == 1)
+    expect(second.BytesTransferred < text.ByteLen(changed) / 2)
+    const noOp = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(noOp.FilesTransferred == 0)
+    expect(noOp.BytesTransferred == 0)
+    changed
+}
+
+fn verifyDirectorySyncPolicies(
+    client Client,
+    peer Peer,
+    local String,
+    remote String,
+    changed String
+) void {
+    fs.WriteTextAtomic(remote + "/tree/extra.txt", "remove", 64) else {
+        fail("extra file write failed")
+    }
+    discard pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(pathExists(remote + "/tree/extra.txt"))
+    discard pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(true)
+    )
+    expect(!pathExists(remote + "/tree/extra.txt"))
+    const dry = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "preview",
+        $dryRunOptions()
+    )
+    expect(dry.FilesTransferred == 2)
+    expect(dry.BytesTransferred ==
+        text.ByteLen(changed) + text.ByteLen("#!/bin/sh\necho remolo\n"))
+    expect(!pathExists(remote + "/preview"))
+    fs.RemoveFile(remote + "/tree/nested/data.bin") else {
+        fail("conflicting file removal failed")
+    }
+    fs.CreateDirectory(remote + "/tree/nested/data.bin") else {
+        fail("conflicting directory creation failed")
+    }
+    fs.WriteTextAtomic(
+        remote + "/tree/nested/data.bin/child",
+        "conflict",
+        64
+    ) else {
+        fail("conflicting child write failed")
+    }
+    const replaced = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "tree",
+        $syncOptions(false)
+    )
+    expect(replaced.FilesTransferred == 1)
+    const kind = fs.Kind(remote + "/tree/nested/data.bin") else {
+        fail("replacement kind check failed")
+    }
+    expect(filesystemFileKind(kind))
+}
+
+fn verifyDirectoryPull(
+    client Client,
+    peer Peer,
+    remote String,
+    pulled String,
+    changed String
+) void {
+    const stats = pullDirectory(client, peer, remote, "tree", pulled)
+    expect(stats.FilesTransferred == 2)
+    const resultBytes = fs.ReadBytesSync(
+        pulled + "/nested/data.bin",
+        131072
+    ) else {
+        fail("pulled file read failed")
+    }
+    const result = resultBytes.Text() else { fail("pulled text failed") }
+    expect(result == changed)
+}
+
+fn verifyDirectorySyncExcludes(
+    client Client,
+    peer Peer,
+    local String,
+    remote String
+) void {
+    fs.WriteTextAtomic(local + "/ignored.tmp", "ignored", 64) else {
+        fail("excluded file write failed")
+    }
+    fs.CreateDirectory(local + "/node_modules/module") else {
+        fail("excluded directory creation failed")
+    }
+    fs.WriteTextAtomic(
+        local + "/node_modules/module/index.js",
+        "ignored",
+        64
+    ) else {
+        fail("excluded nested file write failed")
+    }
+    const stats = pushDirectory(
+        client,
+        peer,
+        local,
+        remote,
+        "filtered",
+        $excludeOptions()
+    )
+    expect(stats.FilesTransferred == 2)
+    expect(pathExists(remote + "/filtered/nested/data.bin"))
+    expect(!pathExists(remote + "/filtered/ignored.tmp"))
+    expect(!pathExists(remote + "/filtered/node_modules"))
+}
+
+fn pushDirectory(
+    client Client,
+    peer Peer,
+    local String,
+    remote String,
+    target String,
+    $options own dirsync.Options
+) dirsync.Stats {
+    const serving = spawn ServeDirectory(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const pushing = spawn PushDirectory(
+        $client.Handle(),
+        $text.Copy(local),
+        $text.Copy(target),
+        $options
+    )
+    const stats = $pushing.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    stats
+}
+
+fn pullDirectory(
+    client Client,
+    peer Peer,
+    remote String,
+    source String,
+    local String
+) dirsync.Stats {
+    const serving = spawn ServeDirectory(
+        $peer.Handle(),
+        $text.Copy(remote),
+        true
+    )
+    const pulling = spawn PullDirectory(
+        $client.Handle(),
+        $text.Copy(source),
+        $text.Copy(local),
+        $syncOptions(false)
+    )
+    const stats = $pulling.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    stats
+}
+
+fn expectDirectoryPushRejected(
+    client Client,
+    peer Peer,
+    local String,
+    remote String,
+    target String,
+    allowWrite bool
+) void {
+    const serving = spawn ServeDirectory(
+        $peer.Handle(),
+        $text.Copy(remote),
+        allowWrite
+    )
+    const pushing = spawn PushDirectory(
+        $client.Handle(),
+        $text.Copy(local),
+        $text.Copy(target),
+        $syncOptions(false)
+    )
+    match $pushing.wait() {
+        Ok(stats): {
+            discard stats
+            fail("rejected directory sync was accepted")
+        }
+        Err(error): expect(directorySyncFailure(error))
+    }
+    match $serving.wait() {
+        Ok: fail("rejected directory sync reported success")
+        Err(error): expect(directorySyncFailure(error))
+    }
+}
+
+fn pathExists(path String) bool {
+    const exists = fs.Exists(path) else {
+        fail("path check failed")
+    }
+    exists
+}
+
+fn makeExecutable(path String) bool {
+    match fs.SetExecutable(path, true) {
+        Ok: true
+        Err(error): {
+            discard error
+            false
+        }
+    }
+}
+
+fn createSyncLink(directory String) bool {
+    const opened = fs.OpenRoot(directory) else {
+        fail("source root opening failed")
+    }
+    var root = opened
+    var linked = true
+    match root.CreateSymbolicLink("current", "nested/data.bin", false) {
+        Ok: {}
+        Err(error): {
+            discard error
+            linked = false
+        }
+    }
+    discard root.Close()
+    discard root
+    linked
+}
+
+fn expectSyncedLink(directory String) void {
+    const opened = fs.OpenTree(directory, 16, 32768) else {
+        fail("destination tree opening failed")
+    }
+    var tree = opened
+    const link = tree.ReadSymbolicLink("current", 1024) else {
+        fail("destination link reading failed")
+    }
+    expect(link.Target == "nested/data.bin")
+    expect(!link.Directory)
+    discard tree.Close()
+    discard tree
+}
+
+fn temporaryDirectory(prefix String) String {
+    const created = fs.CreateTempDirectory(".", prefix) else {
+        fail("temporary directory creation failed")
+    }
+    const directory = fs.Canonicalize(created) else {
+        fail("temporary directory resolution failed")
+    }
+    directory
+}
+
+fn syncPayload() String {
+    var builder = text.NewBuilder()
+    var blocks u64 = 0
+    while blocks < 2048 {
+        const written = builder.Write("0123456789abcdef0123456789abcdef") else {
+            fail("sync payload builder failed")
+        }
+        discard written
+        blocks += 1
+    }
+    const result = builder.Finish() else { fail("sync payload finish failed") }
+    result
+}
+
+fn syncOptions(delete bool) own dirsync.Options {
+    const noExcludes [0]String = []
+    var options = dirsync.NewOptions(noExcludes)
+    options.Delete = delete
+    options
+}
+
+fn dryRunOptions() own dirsync.Options {
+    const noExcludes [0]String = []
+    var options = dirsync.NewOptions(noExcludes)
+    options.DryRun = true
+    options
+}
+
+fn excludeOptions() own dirsync.Options {
+    const excludes [2]String = ["*.tmp", "node_modules"]
+    dirsync.NewOptions(excludes)
+}
+
+struct networkRead {
+    reader own net.TcpReader
+    value own bytes.Bytes
+}
+
+task echoOnce($listener own net.TcpListener, length u64) void {
+    const accepting = spawn net.Accept($listener)
+    const accepted = $accepting.wait()
+    const net.AcceptOutcome { Listener Value } = accepted
+    const connection = Value else error {
+        discard error
+        discard Listener
+        return
+    }
+    const split = connection.Split() else error {
+        discard error
+        discard Listener
+        return
+    }
+    const net.StreamPair { Reader Writer } = split
+    const reading = spawn net.ReadExactBytes($Reader, length)
+    const read = $reading.wait()
+    const net.ReadBytesOutcome { Reader as restored Value as payload } = read
+    const value = payload else error {
+        discard error
+        discard restored
+        discard Writer
+        discard Listener
+        return
+    }
+    const writing = spawn net.WriteAllBytes($Writer, $value)
+    const written = $writing.wait()
+    discard written
+    discard restored
+    discard Listener
+}
+
+task writeNetwork(
+    $writer own net.TcpWriter,
+    $value own bytes.Bytes
+) own net.TcpWriter {
+    const pending = spawn net.WriteAllBytes($writer, $value)
+    const outcome = $pending.wait()
+    const net.WriteOutcome { Writer Value } = outcome
+    Value else error {
+        discard error
+        discard Writer
+        fail("network write failed")
+    }
+    Writer
+}
+
+task readNetwork(
+    $reader own net.TcpReader,
+    length u64
+) networkRead {
+    const pending = spawn net.ReadExactBytes($reader, length)
+    const outcome = $pending.wait()
+    const net.ReadBytesOutcome { Reader Value } = outcome
+    const value = Value else error {
+        discard error
+        discard Reader
+        fail("network read failed")
+    }
+    networkRead { reader = Reader value = value }
+}
+
+test "local forwarding carries bytes through an authenticated channel" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const echoListener = net.Listen($"127.0.0.1", 0) else {
+        fail("echo listen failed")
+    }
+    const echoPort = echoListener.Port
+    const echoing = spawn echoOnce($echoListener, 13)
+    const endpointPort = u16.From(echoPort) else {
+        fail("echo port conversion failed")
+    }
+    const endpoint = net.Endpoint {
+        Host = "127.0.0.1"
+        Port = endpointPort
+    }
+    const target = endpoint.Address()
+    const forward = tunnel.ListenLocal(
+        $client.Handle(),
+        $"127.0.0.1",
+        0,
+        $target
+    ) else error {
+        discard error
+        fail("local forward listen failed")
+    }
+    const localControlValue = forward.Control() else {
+        fail("local forward control failed")
+    }
+    var localControl = localControlValue
+    const forwardPort = forward.Port()
+    const servingLocal = spawn tunnel.ServeLocal($forward)
+    const servingRemote = spawn tunnel.ServeForward($peer.Handle())
+    const localConnecting = spawn net.Connect($"127.0.0.1", forwardPort)
+    const local = $localConnecting.wait() else {
+        fail("local forward connection failed")
+    }
+    const localSplit = local.Split() else {
+        fail("local forward split failed")
+    }
+    const net.StreamPair { Reader Writer } = localSplit
+    const writing = spawn writeNetwork(
+        $Writer,
+        $bytes.FromText("local-forward")
+    )
+    const afterWrite = $writing.wait()
+    const reading = spawn readNetwork($Reader, 13)
+    const networkRead { reader value } = $reading.wait()
+    const payload = value.Text() else { fail("forwarded text failed") }
+    expect(payload == "local-forward")
+    discard reader
+    discard afterWrite
+    const remoteResult = $servingRemote.wait()
+    remoteResult else error {
+        discard error
+        fail("remote forward failed")
+    }
+    discard $echoing.wait()
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(localControl.Close())
+    const localResult = $servingLocal.wait()
+    localResult else error {
+        discard error
+        fail("local forward stop failed")
+    }
+    discard localControl
+    expect(host.Close())
+}
+
+test "SOCKS5 forwards domain targets and rejects unsupported commands" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const echoListener = net.Listen($"127.0.0.1", 0) else {
+        fail("echo listen failed")
+    }
+    const echoPort = echoListener.Port
+    const echoing = spawn echoOnce($echoListener, 13)
+    const forward = tunnel.ListenSocks(
+        $client.Handle(),
+        $"127.0.0.1",
+        0
+    ) else error {
+        discard error
+        fail("SOCKS listen failed")
+    }
+    const socksControlValue = forward.Control() else {
+        fail("SOCKS control failed")
+    }
+    var socksControl = socksControlValue
+    const socksPort = forward.Port()
+    const servingSocks = spawn tunnel.ServeSocks($forward)
+    const servingRemote = spawn tunnel.ServeForward($peer.Handle())
+    const socksConnecting = spawn net.Connect($"127.0.0.1", socksPort)
+    const socks = $socksConnecting.wait() else {
+        fail("SOCKS connection failed")
+    }
+    const socksSplit = socks.Split() else { fail("SOCKS split failed") }
+    const net.StreamPair { Reader Writer } = socksSplit
+    const greeting = socksGreeting()
+    const greetingWrite = spawn writeNetwork($Writer, $greeting)
+    const afterGreeting = $greetingWrite.wait()
+    const methodRead = spawn readNetwork($Reader, 2)
+    const networkRead {
+        reader as afterMethod
+        value as method
+    } = $methodRead.wait()
+    const methodVersion = method.At(0) else { fail("method version failed") }
+    const methodChoice = method.At(1) else { fail("method choice failed") }
+    expect(methodVersion == 5)
+    expect(methodChoice == 0)
+    const request = socksDomainRequest("127.0.0.1", echoPort, 1)
+    const requestWrite = spawn writeNetwork($afterGreeting, $request)
+    const afterRequest = $requestWrite.wait()
+    const replyRead = spawn readNetwork($afterMethod, 10)
+    const networkRead {
+        reader as afterReply
+        value as reply
+    } = $replyRead.wait()
+    const replyVersion = reply.At(0) else { fail("reply version failed") }
+    const replyStatus = reply.At(1) else { fail("reply status failed") }
+    expect(replyVersion == 5)
+    expect(replyStatus == 0)
+    const payloadWrite = spawn writeNetwork(
+        $afterRequest,
+        $bytes.FromText("socks-forward")
+    )
+    const finalWriter = $payloadWrite.wait()
+    const payloadRead = spawn readNetwork($afterReply, 13)
+    const networkRead { reader as finalReader value } = $payloadRead.wait()
+    const payload = value.Text() else { fail("SOCKS payload failed") }
+    expect(payload == "socks-forward")
+    discard finalReader
+    discard finalWriter
+    const remoteResult = $servingRemote.wait()
+    remoteResult else error {
+        discard error
+        fail("SOCKS remote forward failed")
+    }
+    discard $echoing.wait()
+
+    const rejectedConnecting = spawn net.Connect($"127.0.0.1", socksPort)
+    const rejected = $rejectedConnecting.wait() else {
+        fail("SOCKS rejection connection failed")
+    }
+    const rejectedSplit = rejected.Split() else {
+        fail("SOCKS rejection split failed")
+    }
+    const net.StreamPair {
+        Reader as rejectedReader
+        Writer as rejectedWriter
+    } = rejectedSplit
+    const rejectedGreeting = spawn writeNetwork(
+        $rejectedWriter,
+        $socksGreeting()
+    )
+    const afterRejectedGreeting = $rejectedGreeting.wait()
+    const rejectedMethodRead = spawn readNetwork($rejectedReader, 2)
+    const networkRead {
+        reader as afterRejectedMethod
+        value as rejectedMethod
+    } = $rejectedMethodRead.wait()
+    discard rejectedMethod
+    const rejectedRequest = socksDomainRequest("127.0.0.1", echoPort, 2)
+    const rejectedRequestWrite = spawn writeNetwork(
+        $afterRejectedGreeting,
+        $rejectedRequest
+    )
+    const rejectedFinalWriter = $rejectedRequestWrite.wait()
+    const rejectedReplyRead = spawn readNetwork($afterRejectedMethod, 10)
+    const networkRead {
+        reader as rejectedFinalReader
+        value as rejectedReply
+    } = $rejectedReplyRead.wait()
+    const rejectedStatus = rejectedReply.At(1) else {
+        fail("SOCKS rejection status failed")
+    }
+    expect(rejectedStatus == 7)
+    discard rejectedFinalReader
+    discard rejectedFinalWriter
+
+    const authConnecting = spawn net.Connect($"127.0.0.1", socksPort)
+    const authRejected = $authConnecting.wait() else {
+        fail("SOCKS auth connection failed")
+    }
+    const authSplit = authRejected.Split() else {
+        fail("SOCKS auth split failed")
+    }
+    const net.StreamPair {
+        Reader as authReader
+        Writer as authWriter
+    } = authSplit
+    const authGreeting = spawn writeNetwork(
+        $authWriter,
+        $socksGreetingFor(2)
+    )
+    const authFinalWriter = $authGreeting.wait()
+    const authReplyRead = spawn readNetwork($authReader, 2)
+    const networkRead {
+        reader as authFinalReader
+        value as authReply
+    } = $authReplyRead.wait()
+    const authStatus = authReply.At(1) else {
+        fail("SOCKS auth status failed")
+    }
+    expect(authStatus == 255)
+    discard authFinalReader
+    discard authFinalWriter
+    CloseClient($client)
+    ClosePeer($peer)
+    expect(socksControl.Close())
+    const socksResult = $servingSocks.wait()
+    socksResult else error {
+        discard error
+        fail("SOCKS stop failed")
+    }
+    discard socksControl
+    expect(host.Close())
+}
+
+test "peer dispatcher serves concurrent exec and file channels" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+
+    const localCreated = fs.CreateTempDirectory(".", "remolo-dispatch-local-") else {
+        fail("dispatcher local directory creation failed")
+    }
+    const local = fs.Canonicalize(localCreated) else {
+        fail("dispatcher local directory resolution failed")
+    }
+    const remoteCreated = fs.CreateTempDirectory(".", "remolo-dispatch-remote-") else {
+        fail("dispatcher remote directory creation failed")
+    }
+    const remote = fs.Canonicalize(remoteCreated) else {
+        fail("dispatcher remote directory resolution failed")
+    }
+    const source = local + "/source.txt"
+    fs.WriteTextAtomic(source, "dispatcher-file", 64) else {
+        fail("dispatcher source write failed")
+    }
+
+    const serving = spawn ServePeer($peer, $text.Copy(remote), true)
+    const executing = spawn Execute($client.Handle(), $execDescriptor())
+    const inspecting = spawn rpc.SystemInfo(client.Handle())
+    const putting = spawn PutFile(
+        $client.Handle(),
+        $text.Copy(source),
+        $"uploaded.txt"
+    )
+    const executed = $executing.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const inspected = $inspecting.wait() else error {
+        discard error
+        fail("dispatcher RPC failed")
+    }
+    const uploaded = $putting.wait()
+    uploaded else error { panic(sessionFailure(error)) }
+
+    const ExecResult { Exit Stdout Stderr } = executed
+    const stdout = Stdout.Text() else { fail("dispatcher stdout failed") }
+    const stderr = Stderr.Text() else { fail("dispatcher stderr failed") }
+    expect(Exit.Code == 7)
+    expect(stdout == "foundation-exec\n")
+    expect(stderr == "foundation-stderr\n")
+    expect(!text.IsEmpty(inspected.Hostname))
+    expect(!text.IsEmpty(inspected.Arch))
+    expect(inspected.NumCPU > 0)
+    const stored = fs.ReadBytesSync(remote + "/uploaded.txt", 64) else {
+        fail("dispatcher upload read failed")
+    }
+    const storedText = stored.Text() else {
+        fail("dispatcher upload text failed")
+    }
+    expect(storedText == "dispatcher-file")
+
+    CloseClient($client)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    fs.RemoveTree(local, 16, 4) else { fail("dispatcher local cleanup failed") }
+    fs.RemoveTree(remote, 16, 4) else { fail("dispatcher remote cleanup failed") }
+    expect(host.Close())
+}
+
+test "desktop channel negotiates and streams a browser image" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    var host = Host
+    const accepting = spawn Accept($host)
+    const connecting = spawn Connect($Token)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    const accepted = $accepting.wait()
+    const HostAcceptOutcome { Host as restored Value } = accepted
+    host = restored
+    const peer = Value else error { panic(sessionFailure(error)) }
+    const serving = spawn ServePeer($peer, $".", true)
+    const opening = spawn remoteDesktop.Open(client.Handle(), 30)
+    const opened = $opening.wait() else error {
+        discard error
+        fail("desktop open failed")
+    }
+    const remoteDesktop.RemoteDesktop {
+        Reader
+        Writer
+        Controller
+        Hello
+    } = opened
+    expect(Hello.Width > 0)
+    expect(Hello.Height > 0)
+    discard Hello
+    discard Writer
+    const reading = spawn remoteDesktop.Read($Reader)
+    const outcome = $reading.wait()
+    const remoteDesktop.ReadOutcome { Reader as afterFrame Value as event } = outcome
+    const received = event else error {
+        discard error
+        fail("desktop frame read failed")
+    }
+    match received {
+        Frame(value): {
+            expect(value.Width > 0)
+            expect(value.Height > 0)
+            const signature = value.Image.At(0) else {
+                fail("desktop frame is empty")
+            }
+            expect(signature == 137)
+        }
+        Exit: fail("desktop stream exited before its first frame")
+    }
+    discard afterFrame
+    const closing = spawn remoteDesktop.Close($Controller)
+    discard $closing.wait()
+    CloseClient($client)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+    expect(host.Close())
+}
+
+fn socksGreeting() own bytes.Bytes {
+    socksGreetingFor(0)
+}
+
+fn socksGreetingFor(method u64) own bytes.Bytes {
+    const opened = bytes.NewBuilder(3) else { fail("greeting builder failed") }
+    var builder = opened
+    builder.WriteByte(5) else { fail("greeting version failed") }
+    builder.WriteByte(1) else { fail("greeting count failed") }
+    builder.WriteByte(method) else { fail("greeting method failed") }
+    const result = builder.Finish() else { fail("greeting finish failed") }
+    result
+}
+
+fn socksDomainRequest(host String, port u64, command u64) own bytes.Bytes {
+    const hostBytes = bytes.FromText(host)
+    const hostLength = hostBytes.Len() else { fail("host length failed") }
+    const opened = bytes.NewBuilder(hostLength + 7) else {
+        fail("request builder failed")
+    }
+    var builder = opened
+    builder.WriteByte(5) else { fail("request version failed") }
+    builder.WriteByte(command) else { fail("request command failed") }
+    builder.WriteByte(0) else { fail("request reserved byte failed") }
+    builder.WriteByte(3) else { fail("request address type failed") }
+    builder.WriteByte(hostLength) else { fail("request host length failed") }
+    builder.Write(hostBytes) else { fail("request host failed") }
+    builder.WriteByte((port >> 8) & 255) else {
+        fail("request port failed")
+    }
+    builder.WriteByte(port & 255) else { fail("request port failed") }
+    const result = builder.Finish() else { fail("request finish failed") }
+    result
+}
+
+fn fileTransferFailure(error Error) bool {
+    match error {
+        FileTransfer: true
+        _: false
+    }
+}
+
+fn directorySyncFailure(error Error) bool {
+    match error {
+        DirectorySync: true
+        _: false
+    }
+}
+
+fn filesystemFileKind(kind fs.EntryKind) bool {
+    match kind {
+        File: true
+        _: false
+    }
+}
+
+fn authenticationFailure(error Error) bool {
+    match error {
+        Authentication: true
+        _: false
+    }
+}
+
+fn sessionFailure(error Error) String {
+    match error {
+        Expired: "session: expired"
+        NoCandidate: "session: no candidate"
+        Transport: "session: transport"
+        Multiplex: "session: multiplex"
+        Protocol: "session: protocol"
+        Authentication: "session: authentication"
+        Execution: "session: execution"
+        FileTransfer: "session: file transfer"
+        DirectorySync: "session: directory sync"
+        Storage: "session: storage"
+    }
+}

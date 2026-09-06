@@ -1,0 +1,47 @@
+package remolo.config
+
+import std.collections
+
+test "configuration round trips aliases groups and defaults" {
+    var config = Empty()
+    var alias = NewAlias("desk", "token")
+    alias.Rendezvous = "https://rendezvous.example"
+    alias.Candidates.PushFront($"192.0.2.10:9000")
+    config.SetAlias($alias)
+    var members = collections.NewList<String>()
+    members.PushFront($"desk")
+    config.SetGroup($NewGroup("work", $members))
+    config.DefaultValues.Relay = "relay.example:9001"
+
+    const encoded = Encode($config) else { fail("configuration encode failed") }
+    const loaded = Decode(encoded) else { fail("configuration decode failed") }
+    var decoded = loaded
+    const selected = decoded.TakeAlias("desk")
+    match selected {
+        None: fail("alias was not decoded")
+        Some(value): {
+            expect(value.Token == "token")
+            expect(value.Rendezvous == "https://rendezvous.example")
+            expect(value.Candidates.Len() == 1)
+        }
+    }
+    const group = decoded.TakeGroup("work")
+    match group {
+        None: fail("group was not decoded")
+        Some(value): { expect(value.Members.Len() == 1) }
+    }
+    expect(decoded.DefaultValues.Relay == "relay.example:9001")
+}
+
+test "invalid configuration is rejected" {
+    match Decode("[]") {
+        Ok(value): {
+            discard value
+            fail("non-object configuration was accepted")
+        }
+        Err(error): match error {
+            InvalidDocument: {}
+            _: fail("invalid configuration returned the wrong error")
+        }
+    }
+}

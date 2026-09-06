@@ -1,0 +1,162 @@
+package remolo.rpc
+
+import remolo.mux
+import remolo.protocol
+import std.bytes
+import std.text
+import std.time
+
+task Serve(
+    $channel mux.AcceptedChannel,
+    $rootPath String,
+    $authorizedPath String,
+    allowExec bool,
+    startedAt time.MonotonicInstant
+) Result<void, Error> {
+    const mux.AcceptedChannel { Open Stream } = channel
+    if !rpcKind(Open.Kind) {
+        discard Open
+        discard Stream
+        discard rootPath
+        discard authorizedPath
+        return .Err(.Protocol)
+    }
+    discard Open
+    const mux.Stream { ID Reader Writer } = Stream
+    discard ID
+    const serving = spawn serveRequests(
+        $Reader,
+        $Writer,
+        $rootPath,
+        $authorizedPath,
+        allowExec,
+        startedAt
+    )
+    const result = $serving.wait()
+    result
+}
+
+task serveRequests(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $rootPath String,
+    $authorizedPath String,
+    allowExec bool,
+    startedAt time.MonotonicInstant
+) Result<void, Error> {
+    var source = reader
+    var destination = writer
+    while true {
+        const reading = spawn mux.ReadFrame($source)
+        const read = $reading.wait()
+        const mux.FrameReadOutcome { Reader Value } = read
+        source = Reader
+        const frame = Value else error {
+            discard destination
+            discard source
+            discard rootPath
+            return readResult(error)
+        }
+        const protocol.Frame { Type Payload } = frame
+        if !jsonFrame(Type) {
+            discard Payload
+            continue
+        }
+        const requestText = Payload.Text() else error {
+            discard error
+            const sent = spawn sendBadRequest($destination)
+            const result = $sent.wait()
+            const next = result else error {
+                discard source
+                discard rootPath
+                discard authorizedPath
+                return .Err(error)
+            }
+            destination = next
+            continue
+        }
+        const decoded = decodeRequest(requestText)
+        const reply = match decoded {
+            Ok(value): {
+                const dispatching = spawn dispatch(
+                    $value,
+                    $text.Copy(rootPath),
+                    $text.Copy(authorizedPath),
+                    allowExec,
+                    startedAt
+                )
+                const result = $dispatching.wait()
+                result
+            }
+            Err(error): {
+                discard error
+                response { id = 0 result = .None error = "rpc: bad request" }
+            }
+        }
+        const sending = spawn sendResponse($destination, $reply)
+        const result = $sending.wait()
+        const next = result else error {
+            discard source
+            discard rootPath
+            discard authorizedPath
+            return .Err(error)
+        }
+        destination = next
+    }
+    discard source
+    discard destination
+    discard rootPath
+    discard authorizedPath
+    .Ok
+}
+
+task sendBadRequest(
+    $writer own mux.Writer
+) Result<own mux.Writer, Error> {
+    const reply = response {
+        id = 0
+        result = .None
+        error = "rpc: bad request"
+    }
+    const sending = spawn sendResponse($writer, $reply)
+    const result = $sending.wait()
+    result
+}
+
+task sendResponse(
+    $writer own mux.Writer,
+    $value response
+) Result<own mux.Writer, Error> {
+    const encoded = encodeResponse($value) else error {
+        discard writer
+        return .Err(error)
+    }
+    const sending = spawn mux.WriteFrame(
+        $writer,
+        .JSON,
+        $bytes.FromText(encoded)
+    )
+    const sent = $sending.wait()
+    const mux.WriteOutcome { Writer Value } = sent
+    Value else error {
+        discard error
+        discard Writer
+        return .Err(.Transport)
+    }
+    .Ok(Writer)
+}
+
+fn rpcKind(value protocol.Kind) bool {
+    match value {
+        RPC: true
+        _: false
+    }
+}
+
+fn readResult(error mux.Error) Result<void, Error> {
+    match error {
+        Closed: .Ok
+        Transport: .Ok
+        _: .Err(.Transport)
+    }
+}

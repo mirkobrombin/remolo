@@ -1,0 +1,1168 @@
+package remolo.session
+
+import foundation.worker
+import remolo.identity
+import remolo.mux
+import remolo.protocol
+import remolo.token
+import remolo.transport
+import std.bytes
+import std.collections
+import std.env
+import std.format
+import std.fs
+import std.json
+import std.net
+import std.parse
+import std.path
+import std.process
+import std.text
+import std.time
+
+enum DaemonError {
+    NotFound
+    Ambiguous
+    InvalidState
+    Storage
+    Transport
+}
+
+struct SessionInfo {
+    SessionID String
+    Hostname String
+    Route String
+    OS String
+    PID u64
+    Started u64
+    tokenValue String
+    metadataPath String
+}
+
+struct DaemonOwner {
+    supervisor own worker.Supervisor
+    stop Sender<void>
+    metadataPath String
+
+    fn Stop(&self) void {
+        const supervisor = replace self.supervisor with worker.NewSupervisor()
+        const Channel { sender receiver } = channel<void>(1)
+        const stop = replace self.stop with sender
+        discard receiver
+        const signaling = spawn signalDaemonStop($stop)
+        discard $signaling.wait()
+        supervisor.Shutdown()
+        discard fs.RemoveFile(self.metadataPath)
+    }
+
+    fn drop(&self) void {
+        self.Stop()
+    }
+}
+
+task signalDaemonStop($stop Sender<void>) void {
+    discard stop.send()
+}
+
+struct daemonPeer {
+    value own Peer
+}
+
+struct daemonListener {
+    listener own net.LocalListener
+    psk own bytes.Bytes
+    publicKey own bytes.Bytes
+    privateKey own bytes.Bytes
+    capabilities protocol.Capabilities
+    expiry u64
+    resume own ResumeRegistry
+}
+
+struct daemonListening {
+    Listener own daemonListener
+    Token own token.Token
+}
+
+struct daemonAcceptOutcome {
+    Listener own daemonListener
+    Value Result<own Peer, Error>
+}
+
+fn TokenConnectionID(value token.Token) Result<String, Error> {
+    bytesHex(value.SessionID)
+}
+
+fn HostConnectionID(value bytes.Bytes) Result<String, Error> {
+    bytesHex(value)
+}
+
+fn listenDaemon(
+    $socketPath String,
+    $capabilities protocol.Capabilities,
+    expiry u64
+) Result<daemonListening, Error> {
+    const generated = identity.Generate() else error {
+        discard error
+        discard socketPath
+        discard capabilities
+        return .Err(.Storage)
+    }
+    const publicKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        discard socketPath
+        discard capabilities
+        return .Err(.Storage)
+    }
+    const tokenKey = generated.RawPublicKey.Copy() else error {
+        discard error
+        discard socketPath
+        discard capabilities
+        discard publicKey
+        return .Err(.Storage)
+    }
+    const privateKey = generated.PrivateKeyPEM.Copy() else error {
+        discard error
+        discard socketPath
+        discard capabilities
+        discard publicKey
+        discard tokenKey
+        return .Err(.Storage)
+    }
+    const listener = net.ListenLocal($socketPath) else error {
+        discard error
+        discard capabilities
+        discard publicKey
+        discard tokenKey
+        discard privateKey
+        return .Err(.Transport)
+    }
+    const candidates [1]token.Candidate = [
+        token.Candidate { IP = "127.0.0.1" Port = 1 }
+    ]
+    const credential = token.New(
+        $tokenKey,
+        candidates,
+        expiry,
+        ""
+    ) else error {
+        discard error
+        discard listener
+        discard capabilities
+        discard publicKey
+        discard privateKey
+        return .Err(.Storage)
+    }
+    const psk = credential.PSK.Copy() else error {
+        discard error
+        discard listener
+        discard capabilities
+        discard publicKey
+        discard privateKey
+        discard credential
+        return .Err(.Storage)
+    }
+    .Ok(daemonListening {
+        Listener = own daemonListener {
+            listener = listener
+            psk = psk
+            publicKey = publicKey
+            privateKey = privateKey
+            capabilities = capabilities
+            expiry = expiry
+            resume = NewResumeRegistry()
+        }
+        Token = credential
+    })
+}
+
+task connectDaemonToken(
+    $credential own token.Token,
+    $socketPath String
+) Result<own Client, Error> {
+    if credential.Expired() {
+        discard socketPath
+        return .Err(.Expired)
+    }
+    const token.Token {
+        Version
+        HostPublicKey
+        PSK
+        Candidates
+        SessionID
+        Expiry
+        Rendezvous
+    } = credential
+    discard Version
+    discard Candidates
+    discard SessionID
+    discard Expiry
+    discard Rendezvous
+    const connection = net.DialLocal(socketPath) else error {
+        discard error
+        discard HostPublicKey
+        discard PSK
+        return .Err(.Transport)
+    }
+    const secured = transport.LocalStream($connection, $"local") else error {
+        discard error
+        discard HostPublicKey
+        discard PSK
+        return .Err(.Transport)
+    }
+    const connecting = spawn connectSecured(
+        $secured,
+        $PSK,
+        $HostPublicKey
+    )
+    const result = $connecting.wait()
+    result
+}
+
+task acceptDaemonPeer(
+    $source own daemonListener
+) daemonAcceptOutcome {
+    const daemonListener {
+        listener
+        psk
+        publicKey
+        privateKey
+        capabilities
+        expiry
+        resume
+    } = source
+    const accepting = spawn net.AcceptLocal($listener)
+    const accepted = $accepting.wait()
+    const net.LocalAcceptOutcome { Listener Value } = accepted
+    const restored = own daemonListener {
+        listener = Listener
+        psk = psk
+        publicKey = publicKey
+        privateKey = privateKey
+        capabilities = capabilities
+        expiry = expiry
+        resume = resume
+    }
+    const connection = Value else error {
+        discard error
+        return daemonAcceptOutcome {
+            Listener = restored
+            Value = .Err(.Transport)
+        }
+    }
+    const secured = transport.LocalStream($connection, $"local") else error {
+        discard error
+        return daemonAcceptOutcome {
+            Listener = restored
+            Value = .Err(.Transport)
+        }
+    }
+    const authPSK = restored.psk.Copy() else error {
+        discard error
+        discard secured
+        return daemonAcceptOutcome {
+            Listener = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const authKey = restored.publicKey.Copy() else error {
+        discard error
+        discard authPSK
+        discard secured
+        return daemonAcceptOutcome {
+            Listener = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const authPrivateKey = restored.privateKey.Copy() else error {
+        discard error
+        discard authPSK
+        discard authKey
+        discard secured
+        return daemonAcceptOutcome {
+            Listener = restored
+            Value = .Err(.Storage)
+        }
+    }
+    const encodedCaps = protocol.EncodeCapabilities(
+        restored.capabilities
+    ) else error {
+        discard error
+        discard authPSK
+        discard authKey
+        discard authPrivateKey
+        discard secured
+        return daemonAcceptOutcome {
+            Listener = restored
+            Value = .Err(.Protocol)
+        }
+    }
+    const authenticating = spawn acceptPeer(
+        $secured,
+        $authPSK,
+        $authKey,
+        $authPrivateKey,
+        $"",
+        restored.expiry,
+        restored.resume.Handle(),
+        $encodedCaps
+    )
+    const peer = $authenticating.wait()
+    daemonAcceptOutcome { Listener = restored Value = peer }
+}
+
+task DialDaemon($connectionID String) Result<Option<own Client>, Error> {
+    const loading = spawn loadSessionInfo($daemonMetadataPath(connectionID))
+    const metadata = $loading.wait()
+    match metadata {
+        Err(error): match error {
+            NotFound: .Ok(.None)
+            _: .Err(.Storage)
+        }
+        Ok(info): {
+            const dialing = spawn dialSessionInfo($info)
+            const result = $dialing.wait()
+            result
+        }
+    }
+}
+
+task StartDaemon(
+    $remote own Client,
+    $connectionID String
+) Result<own Client, Error> {
+    const capabilities = remote.Capabilities()
+    const route = remote.handle.PeerAddress()
+    const expiry = time.Now().Unix() + 31536000
+    const directory = daemonDirectory()
+    const creating = spawn fs.CreatePrivateDirectory($directory)
+    const created = $creating.wait()
+    created else error {
+        discard error
+        discard remote
+        discard capabilities
+        return .Err(.Storage)
+    }
+    const socketPath = daemonSocketPath(connectionID)
+    discard fs.RemoveFile(socketPath)
+    const local = listenDaemon(
+        $text.Copy(socketPath),
+        $capabilities,
+        expiry
+    ) else error {
+        discard remote
+        return .Err(error)
+    }
+    const daemonListening { Listener Token } = local
+    const controller = Listener.listener.Control() else error {
+        discard error
+        discard Listener
+        discard remote
+        return .Err(.Transport)
+    }
+    const encoded = token.Encode($Token) else error {
+        discard error
+        discard controller
+        discard Listener
+        discard remote
+        return .Err(.Storage)
+    }
+    const info = own SessionInfo {
+        SessionID = text.Copy(connectionID)
+        Hostname = text.Copy(remote.capabilities.Hostname)
+        Route = route
+        OS = text.Copy(remote.capabilities.OS)
+        PID = process.CurrentID()
+        Started = time.Now().Unix()
+        tokenValue = text.Copy(encoded)
+        metadataPath = daemonMetadataPath(connectionID)
+    }
+    const metadataPath = text.Copy(info.metadataPath)
+    const saving = spawn saveSessionInfo($info)
+    const saved = $saving.wait()
+    saved else error {
+        discard error
+        discard controller
+        discard Listener
+        discard remote
+        return .Err(.Storage)
+    }
+    const Channel { sender as stop receiver } = channel<void>(1)
+    const supervisor = worker.NewSupervisor()
+    supervisor.Start(spawn serveDaemon(
+            $Listener,
+            $controller,
+            $remote,
+            stop.clone(),
+            $receiver
+        ))
+    const owner = own DaemonOwner {
+        supervisor = supervisor
+        stop = stop
+        metadataPath = metadataPath
+    }
+    const localToken = token.Decode(encoded) else error {
+        discard error
+        discard owner
+        return .Err(.Storage)
+    }
+    const connecting = spawn connectDaemonToken(
+        $localToken,
+        $socketPath
+    )
+    const connected = $connecting.wait()
+    const value = connected else error {
+        discard owner
+        return .Err(error)
+    }
+    var client = value
+    client.daemon = .Some(owner)
+    .Ok(client)
+}
+
+task ListSessions() Result<own collections.List<own SessionInfo>, DaemonError> {
+    const directory = daemonDirectory()
+    const opened = fs.OpenDir(directory)
+    var reader = match opened {
+        Ok(value): value
+        Err(error): match error {
+            NotFound: { return .Ok(collections.NewList<own SessionInfo>()) }
+            _: { return .Err(.Storage) }
+        }
+    }
+    var values = collections.NewList<own SessionInfo>()
+    var reading = true
+    while reading {
+        const next = reader.Next()
+        const name = next else error {
+            discard error
+            discard reader
+            discard values
+            return .Err(.Storage)
+        }
+        const value = match name {
+            None: {
+                reading = false
+                continue
+            }
+            Some(found): found
+        }
+        const destination = path.Join(text.Copy(directory), value)
+        const collecting = spawn collectSession($destination)
+        const selected = $collecting.wait()
+        match selected {
+            Some(info): values.PushFront($info)
+            None: {}
+        }
+    }
+    discard reader.Close()
+    .Ok(sortSessionInfo($values))
+}
+
+task CloseDaemon($prefix String) Result<own SessionInfo, DaemonError> {
+    const listed = spawn ListSessions()
+    const listedResult = $listed.wait()
+    const sessions = listedResult else error { return .Err(error) }
+    var pending = sessions
+    var selected Option<own SessionInfo> = .None
+    while !pending.IsEmpty() {
+        const current = sessionInfoValue(pending.PopFront())
+        if text.StartsWith(current.SessionID, prefix) {
+            match selected {
+                None: { selected = .Some(current) }
+                Some(previous): {
+                    discard previous
+                    discard current
+                    discard pending
+                    return .Err(.Ambiguous)
+                }
+            }
+        } else {
+            discard current
+        }
+    }
+    const info = match selected {
+        Some(value): value
+        None: { return .Err(.NotFound) }
+    }
+    const connected = spawn dialSessionInfo($copySessionInfo(info))
+    const clientResult = $connected.wait()
+    const optional = clientResult else error {
+        discard error
+        discard fs.RemoveFile(info.metadataPath)
+        return .Err(.Transport)
+    }
+    const client = match optional {
+        Some(value): value
+        None: {
+            discard fs.RemoveFile(info.metadataPath)
+            return .Err(.NotFound)
+        }
+    }
+    const closing = spawn requestDaemonControl($client, $"close")
+    const result = $closing.wait()
+    result else error {
+        discard error
+        return .Err(.Transport)
+    }
+    discard fs.RemoveFile(info.metadataPath)
+    .Ok(info)
+}
+
+fn EncodeSessions(
+    $sessions own collections.List<own SessionInfo>
+) Result<String, DaemonError> {
+    var pending = sessions
+    var array = json.NewArray()
+    while !pending.IsEmpty() {
+        const info = sessionInfoValue(pending.PopFront())
+        const object = publicSessionObject(info) else error {
+            discard error
+            discard pending
+            return .Err(.Storage)
+        }
+        array.Add($ .Object(object))
+    }
+    const encoded = json.Stringify(.Array(array)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}
+
+task serveDaemon(
+    $host own daemonListener,
+    $controller own net.TcpListenerController,
+    $remote own Client,
+    $stopRequests Sender<void>,
+    $stop Receiver<void>
+) void {
+    const remoteHandle = remote.Handle()
+    var listenerControl = controller
+    const Channel { sender receiver } = channel<daemonPeer>(16)
+    const accepts = worker.NewSupervisor()
+    accepts.Start(spawn acceptDaemonPeers($host, $sender))
+    const clients = worker.NewSupervisor()
+    var inbox = receiver
+    var stopping = stop
+    var active = true
+    while active {
+        select {
+            const peer = inbox.receive(): {
+                const daemonPeer { value } = peer
+                clients.Start(spawn serveDaemonPeer(
+                        $value,
+                        remoteHandle.Clone(),
+                        stopRequests.clone()
+                    ))
+            }
+            stopping.receive(): { active = false }
+            else error: {
+                discard error
+                active = false
+            }
+        }
+    }
+    discard listenerControl.Close()
+    discard listenerControl
+    const stoppingAccepts = accepts.CancelTask()
+    const stoppingClients = clients.CancelTask()
+    discard $stoppingAccepts.wait()
+    discard $stoppingClients.wait()
+    discard remoteHandle
+    discard stopRequests
+    CloseClient($remote)
+}
+
+task acceptDaemonPeers(
+    $host own daemonListener,
+    $peers Sender<daemonPeer>
+) void {
+    var active = host
+    while true {
+        const accepting = spawn acceptDaemonPeer($active)
+        const accepted = $accepting.wait()
+        const daemonAcceptOutcome { Listener Value } = accepted
+        active = Listener
+        const peer = Value else error {
+            discard error
+            discard active
+            discard peers
+            return
+        }
+        const sent = peers.send(daemonPeer { value = peer })
+        sent else error {
+            discard error
+            discard active
+            return
+        }
+    }
+}
+
+task serveDaemonPeer(
+    $peer own Peer,
+    $remote mux.Handle,
+    $stop Sender<void>
+) void {
+    var active = peer
+    const local = active.Handle()
+    const channels = worker.NewSupervisor()
+    var serving = true
+    while serving {
+        const accepting = spawn mux.AcceptChannel($local.Clone())
+        const result = $accepting.wait()
+        const channel = result else error {
+            discard error
+            serving = false
+            continue
+        }
+        const control = daemonControl(channel.Open)
+        match control {
+            Ping: channels.Start(spawn answerDaemonControl($channel))
+            Close: {
+                const answered = spawn answerDaemonControl($channel)
+                $answered.wait()
+                discard stop.send()
+                serving = false
+            }
+            Proxy: channels.Start(spawn proxyDaemonChannel(
+                    $channel,
+                    remote.Clone()
+                ))
+        }
+    }
+    discard local
+    discard remote
+    discard stop
+    ClosePeer($active)
+    const stopping = channels.CancelTask()
+    discard $stopping.wait()
+}
+
+enum daemonControlKind {
+    Ping
+    Close
+    Proxy
+}
+
+fn daemonControl(value protocol.Open) daemonControlKind {
+    if !controlKind(value.Kind) return .Proxy
+    if value.Target == "ping" return .Ping
+    if value.Target == "close" return .Close
+    .Proxy
+}
+
+task answerDaemonControl($channel mux.AcceptedChannel) void {
+    const mux.AcceptedChannel { Open Stream } = channel
+    discard Open
+    const mux.Stream { ID Reader Writer } = Stream
+    discard ID
+    discard Reader
+    const writing = spawn mux.WriteFrame($Writer, .Data, $bytes.FromText("ok"))
+    const outcome = $writing.wait()
+    const mux.WriteOutcome { Writer as completedWriter Value } = outcome
+    discard Value
+    const closing = spawn mux.CloseWriter($completedWriter)
+    const closed = $closing.wait()
+    discard closed
+}
+
+task proxyDaemonChannel(
+    $local mux.AcceptedChannel,
+    $remote mux.Handle
+) void {
+    const mux.AcceptedChannel { Open Stream as localStream } = local
+    const opening = spawn mux.OpenChannel($remote, $Open)
+    const opened = $opening.wait()
+    const remoteStream = opened else error {
+        discard error
+        discard localStream
+        return
+    }
+    const localControl = localStream.Control()
+    const remoteControl = remoteStream.Control()
+    const mux.Stream {
+        ID as LocalID
+        Reader as LocalReader
+        Writer as LocalWriter
+    } = localStream
+    const mux.Stream {
+        ID as RemoteID
+        Reader as RemoteReader
+        Writer as RemoteWriter
+    } = remoteStream
+    discard LocalID
+    discard RemoteID
+    var directions = worker.NewGroup<bool>(2)
+    directions.Add(spawn copyMux($LocalReader, $RemoteWriter)) else error {
+        discard error
+        discard RemoteReader
+        discard LocalWriter
+        closeDaemonStreams($localControl, $remoteControl)
+        const stopping = directions.CancelTask()
+        discard $stopping.wait()
+        return
+    }
+    directions.Add(spawn copyMux($RemoteReader, $LocalWriter)) else error {
+        discard error
+        closeDaemonStreams($localControl, $remoteControl)
+        const stopping = directions.CancelTask()
+        discard $stopping.wait()
+        return
+    }
+    const waiting = $directions.Next()
+    const completed = $waiting.wait()
+    const worker.GroupNext { Group Value } = completed
+    discard Value
+    const finishing = $Group.Next()
+    const finished = $finishing.wait()
+    const worker.GroupNext {
+        Group as completedGroup
+        Value as finalValue
+    } = finished
+    discard finalValue
+    closeDaemonStreams($localControl, $remoteControl)
+    const stopping = completedGroup.ShutdownTask()
+    discard $stopping.wait()
+}
+
+task copyMux(
+    $reader own mux.Reader,
+    $writer own mux.Writer
+) bool {
+    var source = reader
+    var destination = writer
+    var copying = true
+    while copying {
+        const reading = spawn mux.Read($source)
+        const outcome = $reading.wait()
+        const mux.ReadOutcome { Reader Value } = outcome
+        source = Reader
+        const chunk = Value else error {
+            discard error
+            copying = false
+            continue
+        }
+        const writing = spawn mux.WriteAll($destination, $chunk)
+        const written = $writing.wait()
+        const mux.WriteOutcome { Writer Value as writeValue } = written
+        destination = Writer
+        match writeValue {
+            Ok: {}
+            Err(error): {
+                discard error
+                copying = false
+            }
+        }
+    }
+    discard source
+    const closing = spawn mux.CloseWriter($destination)
+    const closed = $closing.wait()
+    discard closed
+    true
+}
+
+fn closeDaemonStreams(
+    $local mux.StreamControl,
+    $remote mux.StreamControl
+) void {
+    const closingLocal = spawn mux.CloseStream($local)
+    const closingRemote = spawn mux.CloseStream($remote)
+    discard $closingLocal.wait()
+    discard $closingRemote.wait()
+}
+
+task requestDaemonControl(
+    $client own Client,
+    $target String
+) Result<void, Error> {
+    var descriptor = protocol.NewOpen(.Control)
+    descriptor.Target = text.Copy(target)
+    const opening = spawn mux.OpenChannel(client.Handle(), $descriptor)
+    const opened = $opening.wait()
+    const stream = opened else error {
+        CloseClient($client)
+        return .Err(muxError(error))
+    }
+    const mux.Stream { ID Reader Writer } = stream
+    discard ID
+    discard Writer
+    const reading = spawn mux.ReadFrame($Reader)
+    const outcome = $reading.wait()
+    const mux.FrameReadOutcome { Reader as completedReader Value } = outcome
+    discard completedReader
+    CloseClient($client)
+    const frame = Value else error { return .Err(muxError(error)) }
+    const protocol.Frame { Type Payload } = frame
+    const result = match Type {
+        Data: daemonAcknowledgement($Payload)
+        _: .Err(.Protocol)
+    }
+    result
+}
+
+fn daemonAcknowledgement(
+    $value own bytes.Bytes
+) Result<void, Error> {
+    const message = value.Text() else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    if message == "ok" return .Ok
+    .Err(.Protocol)
+}
+
+task collectSession($destination String) Option<own SessionInfo> {
+    if !text.EndsWith(destination, ".json") return .None
+    const loading = spawn loadSessionInfo($text.Copy(destination))
+    const loaded = $loading.wait()
+    const info = loaded else error {
+        discard error
+        discard fs.RemoveFile(destination)
+        return .None
+    }
+    const checking = spawn probeSessionInfo($info)
+    const checked = $checking.wait()
+    match checked {
+        Some(value): .Some(value)
+        None: {
+            discard fs.RemoveFile(destination)
+            .None
+        }
+    }
+}
+
+task probeSessionInfo($info own SessionInfo) Option<own SessionInfo> {
+    const connected = spawn dialSessionInfo($copySessionInfo(info))
+    const result = $connected.wait()
+    const optional = result else error {
+        discard error
+        return .None
+    }
+    const client = match optional {
+        Some(value): value
+        None: { return .None }
+    }
+    const pinging = spawn requestDaemonControl($client, $"ping")
+    const pinged = $pinging.wait()
+    match pinged {
+        Ok: .Some(info)
+        Err(error): {
+            discard error
+            .None
+        }
+    }
+}
+
+task dialSessionInfo(
+    $info own SessionInfo
+) Result<Option<own Client>, Error> {
+    const SessionInfo {
+        SessionID
+        Hostname
+        Route
+        OS
+        PID
+        Started
+        tokenValue
+        metadataPath
+    } = info
+    const socketPath = daemonSocketPath(SessionID)
+    discard Hostname
+    discard Route
+    discard OS
+    discard PID
+    discard Started
+    discard metadataPath
+    const credential = token.Decode(tokenValue) else error {
+        discard error
+        return .Ok(.None)
+    }
+    const connecting = spawn connectDaemonToken($credential, $socketPath)
+    const connected = $connecting.wait()
+    match connected {
+        Ok(client): .Ok(.Some(client))
+        Err(error): {
+            discard error
+            .Ok(.None)
+        }
+    }
+}
+
+task saveSessionInfo($value own SessionInfo) Result<void, DaemonError> {
+    const directory = daemonDirectory()
+    const creating = spawn fs.CreatePrivateDirectory($directory)
+    const created = $creating.wait()
+    created else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const object = sessionObject(value) else error { return .Err(error) }
+    const encoded = json.Stringify(.Object(object)) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    const writing = spawn fs.WritePrivateTextAtomic(
+        $text.Copy(value.metadataPath),
+        $encoded,
+        1048576
+    )
+    const written = $writing.wait()
+    written else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+task loadSessionInfo($pathValue String) Result<own SessionInfo, DaemonError> {
+    const reading = spawn fs.ReadPrivateTextLimited(
+        $text.Copy(pathValue),
+        1048576
+    )
+    const loaded = $reading.wait()
+    const encoded = loaded else error {
+        return match error {
+            NotFound: .Err(.NotFound)
+            _: .Err(.Storage)
+        }
+    }
+    const parsed = json.Parse(encoded) else error {
+        discard error
+        return .Err(.InvalidState)
+    }
+    const root = match parsed {
+        Object(value): value
+        _: { return .Err(.InvalidState) }
+    }
+    var object = root
+    const sessionID = daemonText(&object, "session_id") else error {
+        return .Err(error)
+    }
+    const hostname = daemonText(&object, "hostname") else error {
+        return .Err(error)
+    }
+    const route = daemonText(&object, "route") else error {
+        return .Err(error)
+    }
+    const os = daemonText(&object, "os") else error { return .Err(error) }
+    const pid = daemonU64(&object, "pid") else error { return .Err(error) }
+    const started = daemonU64(&object, "started") else error {
+        return .Err(error)
+    }
+    const tokenValue = daemonText(&object, "token") else error {
+        return .Err(error)
+    }
+    .Ok(own SessionInfo {
+        SessionID = sessionID
+        Hostname = hostname
+        Route = route
+        OS = os
+        PID = pid
+        Started = started
+        tokenValue = tokenValue
+        metadataPath = text.Copy(pathValue)
+    })
+}
+
+fn sessionObject(
+    value SessionInfo
+) Result<own json.Object, DaemonError> {
+    var object = json.NewObject()
+    setDaemonText(&object, "session_id", value.SessionID) else error {
+        return .Err(error)
+    }
+    setDaemonText(&object, "hostname", value.Hostname) else error {
+        return .Err(error)
+    }
+    setDaemonText(&object, "route", value.Route) else error {
+        return .Err(error)
+    }
+    setDaemonText(&object, "os", value.OS) else error { return .Err(error) }
+    setDaemonNumber(&object, "pid", value.PID) else error {
+        return .Err(error)
+    }
+    setDaemonNumber(&object, "started", value.Started) else error {
+        return .Err(error)
+    }
+    setDaemonText(&object, "token", value.tokenValue) else error {
+        return .Err(error)
+    }
+    .Ok(object)
+}
+
+fn publicSessionObject(
+    value SessionInfo
+) Result<own json.Object, DaemonError> {
+    var object = json.NewObject()
+    setDaemonText(&object, "session_id", value.SessionID) else error {
+        return .Err(error)
+    }
+    setDaemonText(&object, "hostname", value.Hostname) else error {
+        return .Err(error)
+    }
+    setDaemonText(&object, "route", value.Route) else error {
+        return .Err(error)
+    }
+    setDaemonText(&object, "os", value.OS) else error { return .Err(error) }
+    setDaemonNumber(&object, "pid", value.PID) else error {
+        return .Err(error)
+    }
+    setDaemonNumber(&object, "started", value.Started) else error {
+        return .Err(error)
+    }
+    .Ok(object)
+}
+
+fn setDaemonText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, DaemonError> {
+    object.Set($text.Copy(key), $ .Text(text.Copy(value))) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn setDaemonNumber(
+    &object json.Object,
+    key String,
+    value u64
+) Result<void, DaemonError> {
+    object.Set($text.Copy(key), $ .Number(format.U64(value))) else error {
+        discard error
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn daemonText(
+    &object json.Object,
+    key String
+) Result<String, DaemonError> {
+    const selected = object.Take(key)
+    const value = match selected {
+        Some(found): found
+        None: { return .Err(.InvalidState) }
+    }
+    match value {
+        Text(found): .Ok(found)
+        _: .Err(.InvalidState)
+    }
+}
+
+fn daemonU64(
+    &object json.Object,
+    key String
+) Result<u64, DaemonError> {
+    const selected = object.Take(key)
+    const value = match selected {
+        Some(found): found
+        None: { return .Err(.InvalidState) }
+    }
+    const encoded = match value {
+        Number(found): found
+        _: { return .Err(.InvalidState) }
+    }
+    const parsed = parse.U64(encoded) else error {
+        discard error
+        return .Err(.InvalidState)
+    }
+    .Ok(parsed)
+}
+
+fn daemonDirectory() String {
+    const runtime = environmentValue("XDG_RUNTIME_DIR")
+    match runtime {
+        Some(root): path.Join(root, "remolo")
+        None: daemonHomeDirectory()
+    }
+}
+
+fn daemonHomeDirectory() String {
+    const local = environmentValue("LOCALAPPDATA")
+    match local {
+        Some(root): { return path.Join(root, "remolo") }
+        None: {}
+    }
+    const home = env.Home() else error {
+        discard error
+        return path.Join(path.Join(".cache", "remolo"), "sessions")
+    }
+    match home {
+        Some(root): path.Join(path.Join(path.Join(root, ".cache"), "remolo"), "sessions")
+        None: path.Join(path.Join(".cache", "remolo"), "sessions")
+    }
+}
+
+fn environmentValue(name String) Option<String> {
+    const result = env.Get(name) else error {
+        discard error
+        return .None
+    }
+    result
+}
+
+fn daemonMetadataPath(connectionID String) String {
+    path.Join(daemonDirectory(), connectionID + ".json")
+}
+
+fn daemonSocketPath(connectionID String) String {
+    path.Join(daemonDirectory(), connectionID + ".sock")
+}
+
+fn sessionInfoValue(
+    $value Option<own SessionInfo>
+) own SessionInfo {
+    match value {
+        Some(info): info
+        None: panic("session list invariant failed")
+    }
+}
+
+fn copySessionInfo(value SessionInfo) own SessionInfo {
+    own SessionInfo {
+        SessionID = text.Copy(value.SessionID)
+        Hostname = text.Copy(value.Hostname)
+        Route = text.Copy(value.Route)
+        OS = text.Copy(value.OS)
+        PID = value.PID
+        Started = value.Started
+        tokenValue = text.Copy(value.tokenValue)
+        metadataPath = text.Copy(value.metadataPath)
+    }
+}
+
+fn sortSessionInfo(
+    $values own collections.List<own SessionInfo>
+) own collections.List<own SessionInfo> {
+    var pending = values
+    var selected = collections.NewList<own SessionInfo>()
+    while !pending.IsEmpty() {
+        var best = sessionInfoValue(pending.PopFront())
+        var remaining = collections.NewList<own SessionInfo>()
+        while !pending.IsEmpty() {
+            const candidate = sessionInfoValue(pending.PopFront())
+            if text.Compare(candidate.SessionID, best.SessionID) < 0 {
+                remaining.PushFront($best)
+                best = candidate
+            } else {
+                remaining.PushFront($candidate)
+            }
+        }
+        selected.PushFront($best)
+        pending = reverseSessionInfo($remaining)
+    }
+    reverseSessionInfo($selected)
+}
+
+fn reverseSessionInfo(
+    $values own collections.List<own SessionInfo>
+) own collections.List<own SessionInfo> {
+    var pending = values
+    var result = collections.NewList<own SessionInfo>()
+    while !pending.IsEmpty() {
+        result.PushFront($sessionInfoValue(pending.PopFront()))
+    }
+    result
+}

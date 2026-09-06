@@ -1,0 +1,14 @@
+format foundation.package/v1
+name remolo.fusefs
+version 1.0.0
+language 1
+fcs standard
+source src
+test_source tests
+dependency remolo.mux 1.0.0 path ../mux
+dependency remolo.rpc 1.0.0 path ../rpc
+native_source native/fuse/remolo_fuse.c
+foreign c remolo-fuse 1.0.0 path native/fuse abi c/v1
+native_link fuse3 target linux
+native_link fuse target macos
+native_link pthread target linux

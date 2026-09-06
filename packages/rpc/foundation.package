@@ -1,0 +1,10 @@
+format foundation.package/v1
+name remolo.rpc
+version 1.0.0
+language 1
+fcs standard
+source src
+test_source tests
+dependency remolo.identity 1.0.0 path ../identity
+dependency remolo.mux 1.0.0 path ../mux
+dependency remolo.protocol 1.0.0 path ../protocol

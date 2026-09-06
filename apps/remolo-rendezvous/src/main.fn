@@ -1,0 +1,60 @@
+package remolo.rendezvous_server
+
+import foundation.web
+import std.concurrent
+import std.format
+import std.io
+
+fn writeError(value String) void {
+    const written = io.WriteStderrText(value)
+    match written {
+        Ok: {}
+        Err(error): { discard error }
+    }
+}
+
+fn serve($value own options) i32 {
+    const options { address port ttlNanoseconds help } = value
+    discard help
+    const application = BuildFoundationApplication(ttlNanoseconds) else error {
+        discard error
+        writeError("remolo-rendezvous: state initialization failed\n")
+        return 1
+    }
+    const opened = web.NewServer<FoundationWebError>(
+        $address,
+        port,
+        $application
+    ) else {
+        writeError("remolo-rendezvous: listen failed\n")
+        return 1
+    }
+    const server = opened
+    print("remolo-rendezvous: listening on port " + format.U64(server.Port()))
+    const source = concurrent.NewCancellationSource()
+    const serving = server.ServeUntil(source.Token())
+    const stopped = $serving.wait()
+    discard source
+    match stopped {
+        Ok(server): {
+            discard server
+            0
+        }
+        Err(error): {
+            discard error
+            1
+        }
+    }
+}
+
+fn main(args [String]) i32 {
+    const parsed = parseOptions(args) else error {
+        writeError("remolo-rendezvous: " + error + "\n" + usage())
+        return 2
+    }
+    if parsed.help {
+        print(usage())
+        return 0
+    }
+    serve($parsed)
+}

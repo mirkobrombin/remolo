@@ -1,0 +1,248 @@
+package remolo.rendezvous
+
+import remolo.token
+import std.collections
+import std.format
+import std.json
+import std.parse
+import std.text
+
+struct registration {
+    sessionID String
+    response String
+}
+
+fn takeText($value Option<json.Value>) Result<String, Error> {
+    match value {
+        None: .Err(.InvalidRequest)
+        Some(selected): match selected {
+            Text(textValue): .Ok(textValue)
+            _: .Err(.InvalidRequest)
+        }
+    }
+}
+
+fn takeObject($value json.Value) Result<own json.Object, Error> {
+    match value {
+        Object(object): .Ok(object)
+        _: .Err(.InvalidRequest)
+    }
+}
+
+fn parseObject(source String) Result<own json.Object, Error> {
+    const parsed = json.Parse(source) else {
+        return .Err(.InvalidRequest)
+    }
+    takeObject($parsed)
+}
+
+fn optionalText($value Option<json.Value>) Result<String, Error> {
+    match value {
+        None: .Ok("")
+        Some(selected): match selected {
+            Text(textValue): .Ok(textValue)
+            _: .Err(.InvalidRequest)
+        }
+    }
+}
+
+fn optionalPort($value Option<json.Value>) Result<u16, Error> {
+    match value {
+        None: .Ok(0)
+        Some(selected): match selected {
+            Number(number): {
+                const port = parse.U16(number) else {
+                    return .Err(.InvalidRequest)
+                }
+                .Ok(port)
+            }
+            _: .Err(.InvalidRequest)
+        }
+    }
+}
+
+fn decodeCandidate($value json.Value) Result<token.Candidate, Error> {
+    const parsed = takeObject($value) else error { return .Err(error) }
+    var object = parsed
+    const ip = optionalText(object.Take("ip")) else error {
+        return .Err(error)
+    }
+    const port = optionalPort(object.Take("port")) else error {
+        return .Err(error)
+    }
+    discard object
+    .Ok(token.Candidate { IP = ip Port = port })
+}
+
+fn requiredValue<T>($value Option<T>) T {
+    match value {
+        None: panic("rendezvous collection invariant failed")
+        Some(selected): selected
+    }
+}
+
+fn reverseCandidates(
+    $values own collections.List<token.Candidate>
+) own collections.List<token.Candidate> {
+    var source = values
+    var result = collections.NewList<token.Candidate>()
+    while source.Len() > 0 {
+        result.PushFront(requiredValue(source.PopFront()))
+    }
+    result
+}
+
+fn decodeCandidateArray(
+    $value json.Value
+) Result<own collections.List<token.Candidate>, Error> {
+    const array = match value {
+        Array(selected): selected
+        Null: { return .Ok(collections.NewList<token.Candidate>()) }
+        _: { return .Err(.InvalidRequest) }
+    }
+    var source = array
+    var reversed = collections.NewList<token.Candidate>()
+    while source.Len() > 0 {
+        const encoded = requiredValue(source.PopFront())
+        const candidate = decodeCandidate($encoded) else error {
+            return .Err(error)
+        }
+        reversed.PushFront($candidate)
+    }
+    .Ok(reverseCandidates($reversed))
+}
+
+fn candidateList(
+    $value Option<json.Value>
+) Result<own collections.List<token.Candidate>, Error> {
+    match value {
+        None: .Ok(collections.NewList<token.Candidate>())
+        Some(selected): decodeCandidateArray($selected)
+    }
+}
+
+fn setField(
+    &object json.Object,
+    $name String,
+    $value json.Value
+) Result<void, Error> {
+    object.Set($name, $value) else {
+        return .Err(.Storage)
+    }
+    .Ok
+}
+
+fn candidateObject(value token.Candidate) Result<own json.Object, Error> {
+    var object = json.NewObject()
+    setField(&object, "ip", .Text(text.Copy(value.IP))) else error {
+        return .Err(error)
+    }
+    setField(&object, "port", .Number(format.U16(value.Port))) else error {
+        return .Err(error)
+    }
+    .Ok(object)
+}
+
+fn encodeCandidates(
+    $values own collections.List<token.Candidate>
+) Result<String, Error> {
+    var source = values
+    var array = json.NewArray()
+    while !source.IsEmpty() {
+        const candidate = requiredValue(source.PopFront())
+        const object = candidateObject(candidate) else error {
+            return .Err(error)
+        }
+        array.Add(.Object(object))
+    }
+    var response = json.NewObject()
+    setField(&response, "candidates", .Array(array)) else error {
+        return .Err(error)
+    }
+    const encoded = json.Stringify(.Object(response)) else {
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}
+
+fn decodeRegistration(source String) Result<registration, Error> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const sessionID = takeText(object.Take("session_id")) else error {
+        return .Err(error)
+    }
+    if text.IsEmpty(sessionID) return .Err(.InvalidRequest)
+    const candidates = candidateList(object.Take("candidates")) else error {
+        return .Err(error)
+    }
+    discard object
+    const response = encodeCandidates($candidates) else error {
+        return .Err(error)
+    }
+    .Ok(registration { sessionID = sessionID response = response })
+}
+
+fn decodeLookup(
+    source String
+) Result<own collections.List<token.Candidate>, Error> {
+    const parsed = parseObject(source) else error { return .Err(error) }
+    var object = parsed
+    const selected = object.Take("candidates")
+    discard object
+    match selected {
+        None: .Err(.InvalidRequest)
+        Some(value): decodeCandidateArray($value)
+    }
+}
+
+fn copyCandidates(
+    values [token.Candidate]
+) own collections.List<token.Candidate> {
+    var reversed = collections.NewList<token.Candidate>()
+    var index = len(values)
+    while index > 0 {
+        index -= 1
+        reversed.PushFront(token.Candidate {
+            IP = text.Copy(values[index].IP)
+            Port = values[index].Port
+        })
+    }
+    reversed
+}
+
+fn encodeRegistration(
+    sessionID String,
+    candidates [token.Candidate]
+) Result<String, Error> {
+    const values = copyCandidates(candidates)
+    const response = encodeCandidates($values) else error {
+        return .Err(error)
+    }
+    const parsed = parseObject(response) else error { return .Err(error) }
+    var object = parsed
+    setField(&object, "session_id", .Text(text.Copy(sessionID))) else error {
+        return .Err(error)
+    }
+    const encoded = json.Stringify(.Object(object)) else {
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}
+
+fn encodeRegistrationCandidates(
+    sessionID String,
+    $candidates own collections.List<token.Candidate>
+) Result<String, Error> {
+    const response = encodeCandidates($candidates) else error {
+        return .Err(error)
+    }
+    const parsed = parseObject(response) else error { return .Err(error) }
+    var object = parsed
+    setField(&object, "session_id", .Text(text.Copy(sessionID))) else error {
+        return .Err(error)
+    }
+    const encoded = json.Stringify(.Object(object)) else {
+        return .Err(.Storage)
+    }
+    .Ok(encoded)
+}

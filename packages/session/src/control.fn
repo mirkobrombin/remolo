@@ -1,0 +1,73 @@
+package remolo.session
+
+import remolo.crypto
+import remolo.mux
+import remolo.protocol
+import std.bytes
+
+task writeRaw(
+    $writer own mux.Writer,
+    $value own bytes.Bytes
+) Result<own mux.Writer, Error> {
+    const pending = spawn mux.WriteAll($writer, $value)
+    const outcome = $pending.wait()
+    const mux.WriteOutcome { Writer Value } = outcome
+    match Value {
+        Ok: .Ok(Writer)
+        Err(error): {
+            discard Writer
+            .Err(muxError(error))
+        }
+    }
+}
+
+task readRaw(
+    $reader own mux.Reader,
+    length u64
+) Result<rawRead, Error> {
+    const pending = spawn mux.ReadExact($reader, length)
+    const outcome = $pending.wait()
+    const mux.ReadOutcome { Reader Value } = outcome
+    match Value {
+        Ok(value): .Ok(rawRead { reader = Reader value = value })
+        Err(error): {
+            discard Reader
+            .Err(muxError(error))
+        }
+    }
+}
+
+fn controlKind(value protocol.Kind) bool {
+    match value {
+        Control: true
+        _: false
+    }
+}
+
+fn handshakeError(error crypto.HandshakeError) Error {
+    match error {
+        InvalidCredential: .Authentication
+        InvalidMessage: .Protocol
+        AuthenticationFailed: .Authentication
+        Storage: .Storage
+        EntropyUnavailable: .Storage
+    }
+}
+
+fn muxError(error mux.Error) Error {
+    match error {
+        InvalidVersion: .Multiplex
+        InvalidType: .Multiplex
+        InvalidFlags: .Multiplex
+        InvalidStream: .Multiplex
+        InvalidLength: .Multiplex
+        DuplicateStream: .Multiplex
+        StreamsExhausted: .Multiplex
+        ReceiveWindowExceeded: .Multiplex
+        RemoteGoAway: .Multiplex
+        Reset: .Multiplex
+        Closed: .Transport
+        Protocol: .Protocol
+        Transport: .Transport
+    }
+}

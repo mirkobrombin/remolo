@@ -1,0 +1,148 @@
+package remolo.dirsync
+
+import std.bytes
+
+fn normalizedBlockSize(value u64) u64 {
+    if value == 0 return BlockSize()
+    value
+}
+
+fn writeLiteral(
+    &builder bytes.Builder,
+    source bytes.Bytes,
+    start u64,
+    end u64
+) Result<u64, Error> {
+    if end <= start return .Ok(0)
+    var offset = start
+    while offset < end {
+        var chunkEnd = offset + maxBlockData()
+        if chunkEnd > end {
+            chunkEnd = end
+        }
+        builder.WriteByte(1) else error {
+            discard error
+            return .Err(.TooLarge)
+        }
+        writeU32(&builder, chunkEnd - offset) else error {
+            return .Err(error)
+        }
+        const chunk = source.Slice(offset, chunkEnd) else error {
+            discard error
+            return .Err(.InvalidDelta)
+        }
+        builder.Write(chunk) else error {
+            discard error
+            discard chunk
+            return .Err(.TooLarge)
+        }
+        discard chunk
+        offset = chunkEnd
+    }
+    .Ok(end - start)
+}
+
+fn writeCopy(
+    &builder bytes.Builder,
+    index u64
+) Result<void, Error> {
+    if index > 4294967295 return .Err(.TooLarge)
+    builder.WriteByte(2) else error {
+        discard error
+        return .Err(.TooLarge)
+    }
+    writeU32(&builder, index)
+}
+
+fn writeU32(
+    &builder bytes.Builder,
+    value u64
+) Result<void, Error> {
+    if value > 4294967295 return .Err(.TooLarge)
+    builder.WriteByte((value >> 24) & 255) else error {
+        discard error
+        return .Err(.TooLarge)
+    }
+    builder.WriteByte((value >> 16) & 255) else error {
+        discard error
+        return .Err(.TooLarge)
+    }
+    builder.WriteByte((value >> 8) & 255) else error {
+        discard error
+        return .Err(.TooLarge)
+    }
+    builder.WriteByte(value & 255) else error {
+        discard error
+        return .Err(.TooLarge)
+    }
+    .Ok
+}
+
+fn readU32(value bytes.Bytes, offset u64) Result<u64, Error> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.InvalidDelta)
+    }
+    if offset + 4 > length return .Err(.InvalidDelta)
+    .Ok(
+        (byteValue(value, offset) << 24) |
+        (byteValue(value, offset + 1) << 16) |
+        (byteValue(value, offset + 2) << 8) |
+        byteValue(value, offset + 3)
+    )
+}
+
+fn byteValue(value bytes.Bytes, offset u64) u64 {
+    const result = value.At(offset) else error {
+        discard error
+        panic("dirsync byte boundary invariant failed")
+    }
+    result
+}
+
+fn maxBlockData() u64 {
+    64 * 1024 * 1024
+}
+
+fn deltaLimit(sourceLength u64) u64 {
+    sourceLength + ((sourceLength / maxBlockData()) + 2) * 5 + 1
+}
+
+fn deltaLiteralBytes(value bytes.Bytes) Result<u64, Error> {
+    const length = value.Len() else error {
+        discard error
+        return .Err(.InvalidDelta)
+    }
+    var offset u64 = 0
+    var literal u64 = 0
+    while offset < length {
+        const op = byteValue(value, offset)
+        offset += 1
+        if op == 3 {
+            if offset != length return .Err(.InvalidDelta)
+            return .Ok(literal)
+        }
+        if op == 1 {
+            const size = readU32(value, offset) else error {
+                return .Err(error)
+            }
+            offset += 4
+            if size > maxBlockData() || offset + size > length {
+                return .Err(.InvalidDelta)
+            }
+            literal += size
+            offset += size
+            continue
+        }
+        if op == 2 {
+            const block = readU32(value, offset) else error {
+                return .Err(error)
+            }
+            discard block
+            offset += 4
+            continue
+        }
+        return .Err(.InvalidDelta)
+    }
+    .Err(.InvalidDelta)
+}

@@ -1,0 +1,103 @@
+package remolo.protocol
+
+import std.bytes
+
+fn expectPayload(actual bytes.Bytes, expected String) void {
+    const wanted = bytes.FromText(expected)
+    expect(bytes.ConstantTimeEqual(actual, wanted))
+}
+
+test "frames preserve type and payload" {
+    const encoded = EncodeFrame(.Data, bytes.FromText("some output")) else error {
+        discard error
+        fail("frame encoding failed")
+    }
+    const decoded = DecodeFrame(encoded) else error {
+        discard error
+        fail("frame decoding failed")
+    }
+    match decoded.Type {
+        Data: {}
+        _: fail("frame type changed")
+    }
+    expectPayload(decoded.Payload, "some output")
+}
+
+test "empty control frames round trip" {
+    const encoded = EncodeFrame(.Ping, bytes.FromText("")) else error {
+        discard error
+        fail("empty frame encoding failed")
+    }
+    const decoded = DecodeFrame(encoded) else error {
+        discard error
+        fail("empty frame decoding failed")
+    }
+    match decoded.Type {
+        Ping: {}
+        _: fail("empty frame type changed")
+    }
+    const length = decoded.Payload.Len() else error {
+        discard error
+        fail("payload length failed")
+    }
+    expect(length == 0)
+}
+
+test "frames reject short headers" {
+    match DecodeFrame(bytes.FromText("bad")) {
+        Ok(value): {
+            discard value
+            fail("short header was accepted")
+        }
+        Err(error): match error {
+            Truncated: {}
+            _: fail("wrong short header error")
+        }
+    }
+}
+
+test "frames reject unknown types" {
+    const opened = bytes.NewBuilder(5) else {
+        fail("test builder failed")
+    }
+    var builder = opened
+    builder.WriteByte(42) else { fail("test header failed") }
+    builder.WriteByte(0) else { fail("test header failed") }
+    builder.WriteByte(0) else { fail("test header failed") }
+    builder.WriteByte(0) else { fail("test header failed") }
+    builder.WriteByte(0) else { fail("test header failed") }
+    const encoded = builder.Finish() else { fail("test frame failed") }
+    match DecodeFrame(encoded) {
+        Ok(value): {
+            discard value
+            fail("unknown frame type was accepted")
+        }
+        Err(error): match error {
+            UnknownType: {}
+            _: fail("wrong unknown type error")
+        }
+    }
+}
+
+test "frames reject oversized lengths before allocation" {
+    const opened = bytes.NewBuilder(5) else {
+        fail("test builder failed")
+    }
+    var builder = opened
+    builder.WriteByte(1) else { fail("test header failed") }
+    builder.WriteByte(1) else { fail("test header failed") }
+    builder.WriteByte(0) else { fail("test header failed") }
+    builder.WriteByte(0) else { fail("test header failed") }
+    builder.WriteByte(1) else { fail("test header failed") }
+    const encoded = builder.Finish() else { fail("test frame failed") }
+    match DecodeFrame(encoded) {
+        Ok(value): {
+            discard value
+            fail("oversized frame was accepted")
+        }
+        Err(error): match error {
+            PayloadTooLarge: {}
+            _: fail("wrong oversized frame error")
+        }
+    }
+}

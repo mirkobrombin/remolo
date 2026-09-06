@@ -1,0 +1,211 @@
+package remolo.desktop
+
+import remolo.mux
+import remolo.protocol
+import std.collections
+import std.desktop as platformDesktop
+
+task Serve($channel mux.AcceptedChannel) Result<void, Error> {
+    const mux.AcceptedChannel { Open Stream } = channel
+    if !desktopKind(Open.Kind) {
+        discard Open
+        discard Stream
+        return .Err(.Protocol)
+    }
+    discard Open
+    const mux.Stream { ID Reader Writer } = Stream
+    discard ID
+    const result = platformDesktop.OpenCapture()
+    match result {
+        Ok(active): {
+            const serving = spawn serveNative($Reader, $Writer, $active)
+            const served = $serving.wait()
+            served
+        }
+        Err(error): {
+            discard error
+            const synthetic = NewSyntheticCapturer(1280, 720)
+            const serving = spawn serveSynthetic($Reader, $Writer, $synthetic)
+            const served = $serving.wait()
+            served
+        }
+    }
+}
+
+task serveNative(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $capturer own platformDesktop.Capturer
+) Result<void, Error> {
+    const width = capturer.Width
+    const height = capturer.Height
+    const negotiated = spawn desktopNegotiate($reader, $writer, width, height)
+    const result = $negotiated.wait()
+    const exchange = result else error {
+        discard capturer
+        return .Err(error)
+    }
+    const desktopExchange { Reader Writer Selection } = exchange
+    if webRTCMode(Selection.Mode) {
+        const serving = spawn serveWebRTCNative(
+            $Reader,
+            $Writer,
+            $capturer,
+            Selection.FPS
+        )
+        const served = $serving.wait()
+        return served
+    }
+    const input = startInput($Reader)
+    var active = capturer
+    var destination = Writer
+    var encoder = NewEncoder(Selection.Mode)
+    while true {
+        const pending = spawn platformDesktop.Capture($active)
+        const outcome = $pending.wait()
+        const platformDesktop.CaptureOutcome {
+            Capturer
+            Value
+        } = outcome
+        active = Capturer
+        const frame = Value else error {
+            discard error
+            discard destination
+            discard input
+            discard active
+            return .Err(.Capture)
+        }
+        const encoded = EncodeFrame(&encoder, $frame) else error {
+            discard input
+            discard active
+            discard destination
+            return .Err(error)
+        }
+        const sending = spawn desktopSend($destination, .Data, $encoded)
+        const sent = $sending.wait()
+        const next = sent else error {
+            discard input
+            discard active
+            return .Err(error)
+        }
+        destination = next
+        const delay = spawn desktopDelay(Selection.FPS)
+        $delay.wait()
+    }
+    .Ok
+}
+
+task serveSynthetic(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    $capturer own SyntheticCapturer
+) Result<void, Error> {
+    const negotiated = spawn desktopNegotiate(
+        $reader,
+        $writer,
+        capturer.Width(),
+        capturer.Height()
+    )
+    const result = $negotiated.wait()
+    const exchange = result else error {
+        discard capturer
+        return .Err(error)
+    }
+    const desktopExchange { Reader Writer Selection } = exchange
+    if webRTCMode(Selection.Mode) {
+        const serving = spawn serveWebRTCSynthetic(
+            $Reader,
+            $Writer,
+            $capturer,
+            Selection.FPS
+        )
+        const served = $serving.wait()
+        return served
+    }
+    const input = startInput($Reader)
+    var active = capturer
+    var destination = Writer
+    var encoder = NewEncoder(Selection.Mode)
+    while true {
+        const frame = active.Capture() else error {
+            discard input
+            discard destination
+            discard error
+            return .Err(.Capture)
+        }
+        const encoded = EncodeFrame(&encoder, $frame) else error {
+            discard input
+            discard destination
+            return .Err(error)
+        }
+        const sending = spawn desktopSend($destination, .Data, $encoded)
+        const sent = $sending.wait()
+        const next = sent else error {
+            discard input
+            return .Err(error)
+        }
+        destination = next
+        const delay = spawn desktopDelay(Selection.FPS)
+        $delay.wait()
+    }
+    .Ok
+}
+
+struct desktopExchange {
+    Reader own mux.Reader
+    Writer own mux.Writer
+    Selection Select
+}
+
+task desktopNegotiate(
+    $reader own mux.Reader,
+    $writer own mux.Writer,
+    width u64,
+    height u64
+) Result<desktopExchange, Error> {
+    const hello = EncodeHello($desktopHello(width, height)) else error {
+        discard reader
+        discard writer
+        return .Err(error)
+    }
+    const sending = spawn desktopSend($writer, .JSON, $hello)
+    const sent = $sending.wait()
+    const destination = sent else error {
+        discard reader
+        return .Err(error)
+    }
+    const reading = spawn mux.ReadFrame($reader)
+    const outcome = $reading.wait()
+    const mux.FrameReadOutcome { Reader Value } = outcome
+    const frame = Value else error {
+        discard error
+        discard Reader
+        discard destination
+        return .Err(.Closed)
+    }
+    const protocol.Frame { Type Payload } = frame
+    if !jsonFrame(Type) {
+        discard Payload
+        discard Reader
+        discard destination
+        return .Err(.Protocol)
+    }
+    const selection = DecodeSelect(Payload) else error {
+        discard Reader
+        discard destination
+        return .Err(error)
+    }
+    .Ok(desktopExchange {
+        Reader = Reader
+        Writer = destination
+        Selection = selection
+    })
+}
+
+fn desktopHello(width u64, height u64) own Hello {
+    var modes = collections.NewList<Mode>()
+    modes.PushFront(.Diff)
+    modes.PushFront(.Screenshot)
+    modes.PushFront(.WebRTC)
+    own Hello { Modes = modes Width = width Height = height }
+}

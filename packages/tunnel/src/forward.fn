@@ -1,0 +1,243 @@
+package remolo.tunnel
+
+import foundation.worker
+import remolo.mux
+import remolo.protocol
+import std.net
+import std.text
+
+struct LocalForward {
+    listener own net.TcpListener
+    handle mux.Handle
+    target String
+
+    // Reports the local port, including an operating-system-selected port.
+    fn Port(self) u64 {
+        self.listener.Port
+    }
+
+    // Creates independent control for stopping the local accept loop.
+    fn Control(self) Result<own net.TcpListenerController, Error> {
+        const controller = self.listener.Control() else error {
+            discard error
+            return .Err(.Listen)
+        }
+        .Ok(controller)
+    }
+}
+
+struct SocksForward {
+    listener own net.TcpListener
+    handle mux.Handle
+
+    // Reports the local port, including an operating-system-selected port.
+    fn Port(self) u64 {
+        self.listener.Port
+    }
+
+    // Creates independent control for stopping the SOCKS accept loop.
+    fn Control(self) Result<own net.TcpListenerController, Error> {
+        const controller = self.listener.Control() else error {
+            discard error
+            return .Err(.Listen)
+        }
+        .Ok(controller)
+    }
+}
+
+fn ListenLocal(
+    $handle mux.Handle,
+    $address String,
+    port u64,
+    $target String
+) Result<own LocalForward, Error> {
+    const listener = net.Listen($address, port) else error {
+        discard error
+        discard handle
+        discard target
+        return .Err(.Listen)
+    }
+    .Ok(own LocalForward {
+        listener = listener
+        handle = handle
+        target = target
+    })
+}
+
+fn ListenSocks(
+    $handle mux.Handle,
+    $address String,
+    port u64
+) Result<own SocksForward, Error> {
+    const listener = net.Listen($address, port) else error {
+        discard error
+        discard handle
+        return .Err(.Listen)
+    }
+    .Ok(own SocksForward { listener = listener handle = handle })
+}
+
+task ServeLocal($forward own LocalForward) Result<void, Error> {
+    const LocalForward { listener handle target } = forward
+    var active = listener
+    const clients = worker.NewSupervisor()
+    while true {
+        const accepting = spawn net.Accept($active)
+        const accepted = $accepting.wait()
+        const net.AcceptOutcome { Listener Value } = accepted
+        active = Listener
+        match Value {
+            Ok(connection): clients.Start(spawn serveLocalConnection(
+                    $connection,
+                    $handle.Clone(),
+                    $text.Copy(target)
+                ))
+            Err(error): {
+                const stopped = acceptStopped(error)
+                discard active
+                discard handle
+                discard target
+                if stopped {
+                    const stopping = clients.ShutdownTask()
+                    discard $stopping.wait()
+                    return .Ok
+                }
+                const stopping = clients.CancelTask()
+                discard $stopping.wait()
+                return .Err(.Accept)
+            }
+        }
+    }
+    .Ok
+}
+
+task ServeSocks($forward own SocksForward) Result<void, Error> {
+    const SocksForward { listener handle } = forward
+    var active = listener
+    const clients = worker.NewSupervisor()
+    while true {
+        const accepting = spawn net.Accept($active)
+        const accepted = $accepting.wait()
+        const net.AcceptOutcome { Listener Value } = accepted
+        active = Listener
+        match Value {
+            Ok(connection): clients.Start(spawn serveSocksConnection(
+                    $connection,
+                    $handle.Clone()
+                ))
+            Err(error): {
+                const stopped = acceptStopped(error)
+                discard active
+                discard handle
+                if stopped {
+                    const stopping = clients.ShutdownTask()
+                    discard $stopping.wait()
+                    return .Ok
+                }
+                const stopping = clients.CancelTask()
+                discard $stopping.wait()
+                return .Err(.Accept)
+            }
+        }
+    }
+    .Ok
+}
+
+fn acceptStopped(error net.Error) bool {
+    match error {
+        Closed: true
+        _: false
+    }
+}
+
+task ServeForward($handle mux.Handle) Result<void, Error> {
+    const accepting = spawn mux.AcceptChannel($handle)
+    const acceptedResult = $accepting.wait()
+    const accepted = acceptedResult else error {
+        discard error
+        return .Err(.Multiplex)
+    }
+    const serving = spawn ServeForwardChannel($accepted)
+    const result = $serving.wait()
+    result
+}
+
+task ServeForwardChannel(
+    $accepted mux.AcceptedChannel
+) Result<void, Error> {
+    const mux.AcceptedChannel { Open Stream } = accepted
+    const protocol.Open {
+        Kind
+        Cols
+        Rows
+        Command
+        Env
+        Term
+        Dir
+        Target
+        ResumeID
+    } = Open
+    discard Cols
+    discard Rows
+    discard Command
+    discard Env
+    discard Term
+    discard Dir
+    discard ResumeID
+    match Kind {
+        Forward: {}
+        _: {
+            discard Stream
+            discard Target
+            return .Err(.Multiplex)
+        }
+    }
+    const endpoint = net.ParseEndpoint(Target) else error {
+        discard error
+        discard Stream
+        return .Err(.InvalidAddress)
+    }
+    const net.Endpoint { Host Port } = endpoint
+    const connecting = spawn net.Connect($Host, u64.From(Port))
+    const connected = $connecting.wait()
+    const connection = connected else error {
+        discard error
+        discard Stream
+        return .Err(.Connect)
+    }
+    const splicing = spawn Splice($Stream, $connection)
+    const result = $splicing.wait()
+    result
+}
+
+task openForward(
+    $handle mux.Handle,
+    $target String
+) Result<mux.Stream, Error> {
+    var descriptor = protocol.NewOpen(.Forward)
+    descriptor.Target = target
+    const opening = spawn mux.OpenChannel($handle, $descriptor)
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        return .Err(.Multiplex)
+    }
+    .Ok(stream)
+}
+
+task serveLocalConnection(
+    $connection own net.TcpConnection,
+    $handle mux.Handle,
+    $target String
+) void {
+    const opening = spawn openForward($handle, $target)
+    const opened = $opening.wait()
+    const stream = opened else error {
+        discard error
+        discard connection
+        return
+    }
+    const splicing = spawn Splice($stream, $connection)
+    const result = $splicing.wait()
+    discard result
+}

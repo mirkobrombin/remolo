@@ -1,0 +1,349 @@
+package remolo.dirsync
+
+import std.bytes
+import std.format
+import std.json
+import std.parse
+import std.text
+
+fn EncodeManifest(
+    $value own Manifest
+) Result<ManifestEncoding, Error> {
+    var manifest = value
+    var entries = json.NewObject()
+    var restored = newManifest()
+    while manifest.Len() > 0 {
+        const entry = requiredEntry(manifest.Take())
+        const encoded = encodeEntry(entry) else error {
+            discard restored
+            discard manifest
+            return .Err(error)
+        }
+        entries.Set($text.Copy(entry.Path), $encoded) else error {
+            discard error
+            discard restored
+            discard manifest
+            return .Err(.Encoding)
+        }
+        restored.add($entry)
+    }
+    restored.sort()
+    discard manifest
+    const encoded = json.Stringify($ .Object(entries)) else error {
+        discard error
+        discard restored
+        return .Err(.Encoding)
+    }
+    .Ok(ManifestEncoding {
+        Manifest = restored
+        Data = bytes.FromText(encoded)
+    })
+}
+
+fn DecodeManifest(source bytes.Bytes) Result<own Manifest, Error> {
+    const textValue = source.Text() else error {
+        discard error
+        return .Err(.InvalidManifest)
+    }
+    const parsed = json.Parse(textValue) else error {
+        discard error
+        return .Err(.InvalidManifest)
+    }
+    var fields = match parsed {
+        Object(value): value
+        _: { return .Err(.InvalidManifest) }
+    }
+    if fields.Len() > 1000000 return .Err(.TooLarge)
+    var manifest = newManifest()
+    while fields.Len() > 0 {
+        const path = requiredString(fields.FirstKey())
+        if !validRelativePath(path) {
+            discard manifest
+            return .Err(.InvalidManifest)
+        }
+        const value = requiredJSON(fields.Take(path))
+        const entry = decodeEntry(path, $value) else error {
+            discard manifest
+            return .Err(error)
+        }
+        manifest.add($entry)
+    }
+    manifest.sort()
+    .Ok(manifest)
+}
+
+fn encodeEntry(value Entry) Result<json.Value, Error> {
+    var object = json.NewObject()
+    setJSONU64(&object, "kind", entryKindNumber(value.Kind)) else {
+        return .Err(.Encoding)
+    }
+    setEntryNumbers(&object, value) else error { return .Err(error) }
+    setEntryText(&object, value) else error { return .Err(error) }
+    if value.DirectoryLink {
+        object.Set($text.Copy("directory"), $ .Bool(true)) else error {
+            discard error
+            return .Err(.Encoding)
+        }
+    }
+    .Ok(.Object(object))
+}
+
+fn setEntryNumbers(
+    &object json.Object,
+    value Entry
+) Result<void, Error> {
+    if value.Size > 0 {
+        setJSONU64(&object, "size", value.Size) else {
+            return .Err(.Encoding)
+        }
+    }
+    if value.Modified > 0 {
+        setJSONU64(&object, "mtime", value.Modified) else {
+            return .Err(.Encoding)
+        }
+    }
+    if value.Permissions > 0 {
+        setJSONU32(&object, "mode", value.Permissions) else {
+            return .Err(.Encoding)
+        }
+    }
+    .Ok
+}
+
+fn setEntryText(
+    &object json.Object,
+    value Entry
+) Result<void, Error> {
+    if !text.IsEmpty(value.SHA256) {
+        setJSONText(&object, "sha256", value.SHA256) else {
+            return .Err(.Encoding)
+        }
+    }
+    if !text.IsEmpty(value.Target) {
+        setJSONText(&object, "target", value.Target) else {
+            return .Err(.Encoding)
+        }
+    }
+    .Ok
+}
+
+fn decodeEntry(path String, $value json.Value) Result<Entry, Error> {
+    var object = match value {
+        Object(found): found
+        _: { return .Err(.InvalidManifest) }
+    }
+    const kindValue = takeRequiredU64(&object, "kind") else {
+        return .Err(.InvalidManifest)
+    }
+    const kind = entryKind(kindValue) else {
+        return .Err(.InvalidManifest)
+    }
+    const size = takeOptionalU64(&object, "size") else {
+        return .Err(.InvalidManifest)
+    }
+    const modified = takeOptionalU64(&object, "mtime") else {
+        return .Err(.InvalidManifest)
+    }
+    const permissions = takeOptionalU32(&object, "mode") else {
+        return .Err(.InvalidManifest)
+    }
+    const digest = takeOptionalText(&object, "sha256") else {
+        return .Err(.InvalidManifest)
+    }
+    const target = takeOptionalText(&object, "target") else {
+        return .Err(.InvalidManifest)
+    }
+    const directoryLink = takeOptionalBool(&object, "directory") else {
+        return .Err(.InvalidManifest)
+    }
+    if isFile(kind) && !text.IsEmpty(digest) && text.ByteLen(digest) != 64 {
+        return .Err(.InvalidManifest)
+    }
+    if isFile(kind) && size > 9223372036854775807 {
+        return .Err(.InvalidManifest)
+    }
+    if !isFile(kind) && size != 0 return .Err(.InvalidManifest)
+    if isSymbolicLink(kind) && text.IsEmpty(target) {
+        return .Err(.InvalidManifest)
+    }
+    if !isSymbolicLink(kind) && !text.IsEmpty(target) {
+        return .Err(.InvalidManifest)
+    }
+    if !isSymbolicLink(kind) && directoryLink {
+        return .Err(.InvalidManifest)
+    }
+    .Ok(Entry {
+        Path = text.Copy(path)
+        Kind = kind
+        Size = size
+        Modified = modified
+        Permissions = permissions
+        SHA256 = digest
+        Target = target
+        DirectoryLink = directoryLink
+    })
+}
+
+fn entryKindNumber(value EntryKind) u64 {
+    match value {
+        File: 0
+        Directory: 1
+        SymbolicLink: 2
+    }
+}
+
+fn entryKind(value u64) Result<EntryKind, Error> {
+    if value == 0 return .Ok(.File)
+    if value == 1 return .Ok(.Directory)
+    if value == 2 return .Ok(.SymbolicLink)
+    .Err(.InvalidManifest)
+}
+
+fn validRelativePath(value String) bool {
+    const length = text.ByteLen(value)
+    if length == 0 || length > 32768 return false
+    if byteAt(value, 0) == 47 || text.Contains(value, "\\") return false
+    var start u64 = 0
+    var offset u64 = 0
+    while offset <= length {
+        if offset == length || byteAt(value, offset) == 47 {
+            const part = text.Slice(value, start, offset) else error {
+                discard error
+                return false
+            }
+            if text.IsEmpty(part) || part == "." || part == ".." return false
+            start = offset + 1
+        }
+        offset += 1
+    }
+    true
+}
+
+fn setJSONText(
+    &object json.Object,
+    key String,
+    value String
+) Result<void, Error> {
+    object.Set($text.Copy(key), $ .Text(text.Copy(value))) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok
+}
+
+fn setJSONU64(
+    &object json.Object,
+    key String,
+    value u64
+) Result<void, Error> {
+    object.Set($text.Copy(key), $ .Number(format.U64(value))) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok
+}
+
+fn setJSONU32(
+    &object json.Object,
+    key String,
+    value u32
+) Result<void, Error> {
+    object.Set($text.Copy(key), $ .Number(format.U32(value))) else error {
+        discard error
+        return .Err(.Encoding)
+    }
+    .Ok
+}
+
+fn takeRequiredU64(
+    &object json.Object,
+    key String
+) Result<u64, Error> {
+    match object.Take(key) {
+        None: .Err(.InvalidManifest)
+        Some(value): jsonU64($value)
+    }
+}
+
+fn takeOptionalU64(
+    &object json.Object,
+    key String
+) Result<u64, Error> {
+    match object.Take(key) {
+        None: .Ok(0)
+        Some(value): jsonU64($value)
+    }
+}
+
+fn takeOptionalU32(
+    &object json.Object,
+    key String
+) Result<u32, Error> {
+    match object.Take(key) {
+        None: .Ok(0)
+        Some(value): match value {
+            Number(found): {
+                const parsed = parse.U32(found) else error {
+                    discard error
+                    return .Err(.InvalidManifest)
+                }
+                if parsed > 511 return .Err(.InvalidManifest)
+                .Ok(parsed)
+            }
+            _: .Err(.InvalidManifest)
+        }
+    }
+}
+
+fn takeOptionalText(
+    &object json.Object,
+    key String
+) Result<String, Error> {
+    match object.Take(key) {
+        None: .Ok("")
+        Some(value): match value {
+            Text(found): .Ok(found)
+            _: .Err(.InvalidManifest)
+        }
+    }
+}
+
+fn takeOptionalBool(
+    &object json.Object,
+    key String
+) Result<bool, Error> {
+    match object.Take(key) {
+        None: .Ok(false)
+        Some(value): match value {
+            Bool(found): .Ok(found)
+            _: .Err(.InvalidManifest)
+        }
+    }
+}
+
+fn jsonU64($value json.Value) Result<u64, Error> {
+    match value {
+        Number(found): {
+            const parsed = parse.U64(found) else error {
+                discard error
+                return .Err(.InvalidManifest)
+            }
+            .Ok(parsed)
+        }
+        _: .Err(.InvalidManifest)
+    }
+}
+
+fn requiredString($value Option<String>) String {
+    match value {
+        None: panic("dirsync JSON object invariant failed")
+        Some(found): found
+    }
+}
+
+fn requiredJSON($value Option<json.Value>) json.Value {
+    match value {
+        None: panic("dirsync JSON value invariant failed")
+        Some(found): found
+    }
+}

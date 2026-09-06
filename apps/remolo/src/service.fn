@@ -1,0 +1,373 @@
+package remolo.cli
+
+import std.env
+import std.fs
+import std.path
+import std.platform
+import std.process
+import std.text
+
+struct serviceOptions {
+    identity String
+    arguments String
+}
+
+fn defaultServiceOptions() own serviceOptions {
+    own serviceOptions { identity = "" arguments = "--mdns" }
+}
+
+fn parseServiceInstall(args [String]) Result<own serviceOptions, failure> {
+    var options = defaultServiceOptions()
+    var index usize = 2
+    while index < len(args) {
+        const name = argument(args, index)
+        if name != "--identity" && name != "--args" {
+            return .Err(invalid("unknown service install option: " + name))
+        }
+        const value = optionValue(args, index, name) else error {
+            return .Err(error)
+        }
+        if containsServiceControl(value) {
+            return .Err(invalid(name + " contains a control character"))
+        }
+        if name == "--identity" {
+            options.identity = value
+        } else {
+            options.arguments = value
+        }
+        index += 2
+    }
+    .Ok(options)
+}
+
+fn containsServiceControl(value String) bool {
+    text.Contains(value, "\n") || text.Contains(value, "\r") ||
+        text.Contains(value, "\t")
+}
+
+fn serviceHome() Result<String, failure> {
+    const loaded = env.Home() else error {
+        discard error
+        return .Err(failed("could not find the user home directory"))
+    }
+    match loaded {
+        Some(value): .Ok(value)
+        None: .Err(failed("could not find the user home directory"))
+    }
+}
+
+fn serviceIdentity(home String, configured String) String {
+    if !text.IsEmpty(configured) return text.Copy(configured)
+    path.Join(home, ".config/remolo/host.key")
+}
+
+fn writeServiceText(
+    &builder text.Builder,
+    value String
+) Result<void, failure> {
+    const written = builder.Write(value) else error {
+        discard error
+        return .Err(failed("could not encode the service definition"))
+    }
+    discard written
+    .Ok
+}
+
+fn appendEscaped(
+    &builder text.Builder,
+    value String,
+    xml bool
+) Result<void, failure> {
+    var start u64 = 0
+    var index u64 = 0
+    const length = text.ByteLen(value)
+    while index < length {
+        const byte = text.ByteAt(value, index) else error {
+            discard error
+            return .Err(failed("could not encode the service definition"))
+        }
+        const replacement = escapedByte(byte, xml)
+        match replacement {
+            None: {}
+            Some(encoded): {
+                writeServiceSlice(&builder, value, start, index) else error {
+                    return .Err(error)
+                }
+                writeServiceText(&builder, encoded) else error { return .Err(error) }
+                start = index + 1
+            }
+        }
+        index += 1
+    }
+    writeServiceSlice(&builder, value, start, length)
+}
+
+fn escapedByte(value u64, xml bool) Option<String> {
+    if xml {
+        if value == 38 return .Some("&amp;")
+        if value == 60 return .Some("&lt;")
+        if value == 62 return .Some("&gt;")
+        if value == 34 return .Some("&quot;")
+        if value == 39 return .Some("&apos;")
+        return .None
+    }
+    if value == 92 return .Some("\\\\")
+    if value == 34 return .Some("\\\"")
+    if value == 37 return .Some("%%")
+    .None
+}
+
+fn writeServiceSlice(
+    &builder text.Builder,
+    value String,
+    start u64,
+    end u64
+) Result<void, failure> {
+    if start == end return .Ok
+    const part = text.Slice(value, start, end) else error {
+        discard error
+        return .Err(failed("could not encode the service definition"))
+    }
+    writeServiceText(&builder, part)
+}
+
+fn systemdUnit(
+    executable String,
+    identity String,
+    arguments String
+) Result<String, failure> {
+    var builder = text.NewBuilder()
+    writeServiceText(&builder,
+        "[Unit]\nDescription=remolo host (remote control endpoint)\n" +
+        "After=network-online.target\nWants=network-online.target\n\n" +
+        "[Service]\nType=simple\nExecStart=\""
+    ) else error { return .Err(error) }
+    appendEscaped(&builder, executable, false) else error { return .Err(error) }
+    writeServiceText(&builder, "\" host --identity \"") else error {
+        return .Err(error)
+    }
+    appendEscaped(&builder, identity, false) else error { return .Err(error) }
+    writeServiceText(&builder,
+        "\" " + arguments + "\nRestart=on-failure\nRestartSec=3\n\n" +
+        "[Install]\nWantedBy=default.target\n"
+    ) else error { return .Err(error) }
+    const encoded = builder.Finish() else error {
+        discard error
+        return .Err(failed("could not encode the systemd unit"))
+    }
+    .Ok(encoded)
+}
+
+fn launchdUnit(
+    executable String,
+    identity String,
+    arguments String
+) Result<String, failure> {
+    var builder = text.NewBuilder()
+    writeServiceText(&builder,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" " +
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
+        "<plist version=\"1.0\"><dict>\n" +
+        "  <key>Label</key><string>in.bromb.remolo.host</string>\n" +
+        "  <key>ProgramArguments</key>\n  <array><string>"
+    ) else error { return .Err(error) }
+    appendEscaped(&builder, executable, true) else error { return .Err(error) }
+    writeServiceText(
+        &builder,
+        "</string><string>host</string><string>--identity</string><string>"
+    ) else error {
+        return .Err(error)
+    }
+    appendEscaped(&builder, identity, true) else error { return .Err(error) }
+    writeServiceText(&builder, "</string><string>") else error {
+        return .Err(error)
+    }
+    appendEscaped(&builder, arguments, true) else error { return .Err(error) }
+    writeServiceText(&builder,
+        "</string></array>\n  <key>RunAtLoad</key><true/>\n" +
+        "  <key>KeepAlive</key><true/>\n</dict></plist>\n"
+    ) else error { return .Err(error) }
+    const encoded = builder.Finish() else error {
+        discard error
+        return .Err(failed("could not encode the launchd agent"))
+    }
+    .Ok(encoded)
+}
+
+fn runServiceProcess(program String, arguments [String]) Result<i32, failure> {
+    const noEnvironment [0]String = []
+    const output = process.Run(
+        program,
+        arguments,
+        noEnvironment,
+        $process.DefaultOptions()
+    ) else error {
+        discard error
+        return .Err(failed("could not run " + program))
+    }
+    writeStdoutBytes(output.Stdout) else error { return .Err(error) }
+    writeStderrBytes(output.Stderr) else error { return .Err(error) }
+    .Ok(output.ExitCode)
+}
+
+fn writeServiceFile(destination String, value String) Result<void, failure> {
+    fs.WriteTextAtomic(destination, value, 1048576) else error {
+        discard error
+        return .Err(failed("could not write " + destination))
+    }
+    writeStdoutText("remolo: wrote " + destination + "\n")
+}
+
+fn installSystemd(
+    home String,
+    executable String,
+    identity String,
+    arguments String
+) Result<i32, failure> {
+    const directory = path.Join(home, ".config/systemd/user")
+    fs.CreateDirectory(directory) else error {
+        discard error
+        return .Err(failed("could not create " + directory))
+    }
+    const unitPath = path.Join(directory, "remolo-host.service")
+    const unit = systemdUnit(executable, identity, arguments) else error {
+        return .Err(error)
+    }
+    writeServiceFile(unitPath, unit) else error { return .Err(error) }
+    const reload = ["--user", "daemon-reload"]
+    const reloaded = runServiceProcess("systemctl", reload) else error {
+        return .Err(error)
+    }
+    if reloaded != 0 return .Err(failed("systemctl daemon-reload failed"))
+    const enable = ["--user", "enable", "--now", "remolo-host.service"]
+    const enabled = runServiceProcess("systemctl", enable) else error {
+        return .Err(error)
+    }
+    if enabled != 0 {
+        writeStdoutText(
+            "remolo: could not auto-start; run: systemctl --user enable " +
+            "--now remolo-host.service\n"
+        ) else error { return .Err(error) }
+        return .Ok(0)
+    }
+    writeStdoutText(
+        "remolo: service enabled and started.\n" +
+        "remolo: read the session token with: journalctl --user " +
+        "-u remolo-host -f\n"
+    ) else error { return .Err(error) }
+    .Ok(0)
+}
+
+fn installLaunchd(
+    home String,
+    executable String,
+    identity String,
+    arguments String
+) Result<i32, failure> {
+    const directory = path.Join(home, "Library/LaunchAgents")
+    fs.CreateDirectory(directory) else error {
+        discard error
+        return .Err(failed("could not create " + directory))
+    }
+    const plistPath = path.Join(directory, "in.bromb.remolo.host.plist")
+    const plist = launchdUnit(executable, identity, arguments) else error {
+        return .Err(error)
+    }
+    writeServiceFile(plistPath, plist) else error { return .Err(error) }
+    const unload = ["unload", text.Copy(plistPath)]
+    const unloaded = runServiceProcess("launchctl", unload)
+    match unloaded {
+        Ok(code): { discard code }
+        Err(error): { discard error }
+    }
+    const load = ["load", text.Copy(plistPath)]
+    const loaded = runServiceProcess("launchctl", load) else error {
+        return .Err(error)
+    }
+    if loaded != 0 return .Err(failed("launchctl load failed"))
+    writeStdoutText("remolo: launchd agent loaded and started.\n") else error {
+        return .Err(error)
+    }
+    .Ok(0)
+}
+
+fn runServiceInstall(args [String]) Result<i32, failure> {
+    const options = parseServiceInstall(args) else error { return .Err(error) }
+    const serviceOptions { identity arguments } = options
+    const home = serviceHome() else error { return .Err(error) }
+    const selectedIdentity = serviceIdentity(home, identity)
+    const executable = process.Executable() else error {
+        discard error
+        return .Err(failed("could not locate the remolo executable"))
+    }
+    match platform.Current() {
+        Linux: installSystemd(home, executable, selectedIdentity, arguments)
+        MacOS: installLaunchd(home, executable, selectedIdentity, arguments)
+        Windows: .Err(failed(
+                "service install is not automated on windows; run remolo host " +
+                "under the service manager"
+            ))
+    }
+}
+
+fn removeServiceFile(value String) Result<void, failure> {
+    match fs.RemoveFile(value) {
+        Ok: .Ok
+        Err(error): match error {
+            NotFound: .Ok
+            _: .Err(failed("could not remove " + value))
+        }
+    }
+}
+
+fn uninstallSystemd(home String) Result<i32, failure> {
+    const disable = ["--user", "disable", "--now", "remolo-host.service"]
+    const disabled = runServiceProcess("systemctl", disable)
+    match disabled {
+        Ok(code): { discard code }
+        Err(error): { discard error }
+    }
+    const unit = path.Join(home, ".config/systemd/user/remolo-host.service")
+    removeServiceFile(unit) else error { return .Err(error) }
+    const reload = ["--user", "daemon-reload"]
+    const reloaded = runServiceProcess("systemctl", reload) else error {
+        return .Err(error)
+    }
+    if reloaded != 0 return .Err(failed("systemctl daemon-reload failed"))
+    .Ok(0)
+}
+
+fn uninstallLaunchd(home String) Result<i32, failure> {
+    const plist = path.Join(home, "Library/LaunchAgents/in.bromb.remolo.host.plist")
+    const unload = ["unload", text.Copy(plist)]
+    const unloaded = runServiceProcess("launchctl", unload)
+    match unloaded {
+        Ok(code): { discard code }
+        Err(error): { discard error }
+    }
+    removeServiceFile(plist) else error { return .Err(error) }
+    .Ok(0)
+}
+
+fn runServiceUninstall(args [String]) Result<i32, failure> {
+    if len(args) != 2 return .Err(invalid("service uninstall accepts no options"))
+    const home = serviceHome() else error { return .Err(error) }
+    const removed = match platform.Current() {
+        Linux: uninstallSystemd(home)
+        MacOS: uninstallLaunchd(home)
+        Windows: .Err(failed("nothing to uninstall on windows"))
+    } else error { return .Err(error) }
+    writeStdoutText("remolo: service removed.\n") else error {
+        return .Err(error)
+    }
+    .Ok(removed)
+}
+
+fn runService(args [String]) Result<i32, failure> {
+    if len(args) < 2 return .Err(invalid("service requires install or uninstall"))
+    const operation = argument(args, 1)
+    if operation == "install" return runServiceInstall(args)
+    if operation == "uninstall" return runServiceUninstall(args)
+    .Err(invalid("unknown service action: " + operation))
+}

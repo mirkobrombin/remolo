@@ -1,0 +1,172 @@
+package remolo.mux
+
+import remolo.protocol
+import std.bytes
+
+struct AcceptedChannel {
+    Open protocol.Open
+    Stream Stream
+}
+
+struct FrameReadOutcome {
+    Reader own Reader
+    Value Result<protocol.Frame, Error>
+}
+
+task OpenChannel(
+    $handle Handle,
+    $descriptor protocol.Open
+) Result<Stream, Error> {
+    const opening = handle.Open()
+    const openedResult = $opening.wait()
+    const opened = openedResult else error { return .Err(error) }
+    const Stream { ID Reader Writer } = opened
+    const encoded = protocol.EncodeOpenFrame($descriptor) else error {
+        discard Reader
+        discard Writer
+        discard error
+        return .Err(.Protocol)
+    }
+    const pending = spawn WriteAll($Writer, $encoded)
+    const written = $pending.wait()
+    const WriteOutcome { Writer as restored Value } = written
+    match Value {
+        Ok: .Ok(Stream { ID = ID Reader = Reader Writer = restored })
+        Err(error): {
+            discard Reader
+            discard restored
+            .Err(error)
+        }
+    }
+}
+
+task AcceptChannel($handle Handle) Result<AcceptedChannel, Error> {
+    const accepting = handle.Accept()
+    const acceptedResult = $accepting.wait()
+    const accepted = acceptedResult else error { return .Err(error) }
+    const Stream { ID Reader Writer } = accepted
+    const reading = spawn ReadFrame($Reader)
+    const outcome = $reading.wait()
+    const FrameReadOutcome { Reader as restored Value } = outcome
+    const frame = Value else error {
+        discard restored
+        discard Writer
+        return .Err(error)
+    }
+    const protocol.Frame { Type Payload } = frame
+    const descriptor = match Type {
+        JSON: protocol.DecodeOpen(Payload)
+        _: .Err(.InvalidFrame)
+    } else error {
+        discard restored
+        discard Writer
+        discard error
+        return .Err(.Protocol)
+    }
+    .Ok(AcceptedChannel {
+        Open = descriptor
+        Stream = Stream { ID = ID Reader = restored Writer = Writer }
+    })
+}
+
+task WriteFrame(
+    $writer own Writer,
+    frameType protocol.FrameType,
+    $payload own bytes.Bytes
+) WriteOutcome {
+    const encoded = protocol.EncodeFrame(frameType, payload)
+    discard payload
+    match encoded {
+        Ok(value): {
+            const pending = spawn WriteAll($writer, $value)
+            const result = $pending.wait()
+            result
+        }
+        Err(error): {
+            discard error
+            WriteOutcome { Writer = writer Value = .Err(.Protocol) }
+        }
+    }
+}
+
+task ReadFrame($reader own Reader) FrameReadOutcome {
+    const headerPending = spawn ReadExact($reader, 5)
+    const headerOutcome = $headerPending.wait()
+    const ReadOutcome { Reader as afterHeader Value as headerValue } =
+        headerOutcome
+    const header = headerValue else error {
+        return FrameReadOutcome { Reader = afterHeader Value = .Err(error) }
+    }
+    const length = protocolLength(header) else error {
+        discard error
+        return FrameReadOutcome {
+            Reader = afterHeader
+            Value = .Err(.Protocol)
+        }
+    }
+    if length > protocol.MaxFramePayload() {
+        return FrameReadOutcome {
+            Reader = afterHeader
+            Value = .Err(.Protocol)
+        }
+    }
+    const bodyPending = spawn ReadExact($afterHeader, length)
+    const bodyOutcome = $bodyPending.wait()
+    const ReadOutcome { Reader Value as bodyValue } = bodyOutcome
+    const body = bodyValue else error {
+        return FrameReadOutcome { Reader = Reader Value = .Err(error) }
+    }
+    const opened = bytes.NewBuilder(length + 5) else error {
+        discard error
+        return FrameReadOutcome {
+            Reader = Reader
+            Value = .Err(.Transport)
+        }
+    }
+    var builder = opened
+    builder.Write(header) else error {
+        discard error
+        return FrameReadOutcome {
+            Reader = Reader
+            Value = .Err(.Transport)
+        }
+    }
+    builder.Write(body) else error {
+        discard error
+        return FrameReadOutcome {
+            Reader = Reader
+            Value = .Err(.Transport)
+        }
+    }
+    const encoded = builder.Finish() else error {
+        discard error
+        return FrameReadOutcome {
+            Reader = Reader
+            Value = .Err(.Transport)
+        }
+    }
+    const decoded = protocol.DecodeFrame(encoded) else error {
+        discard error
+        return FrameReadOutcome {
+            Reader = Reader
+            Value = .Err(.Protocol)
+        }
+    }
+    FrameReadOutcome { Reader = Reader Value = .Ok(decoded) }
+}
+
+fn protocolLength(value bytes.Bytes) Result<u64, Error> {
+    const first = protocolByte(value, 1) else error { return .Err(error) }
+    const second = protocolByte(value, 2) else error { return .Err(error) }
+    const third = protocolByte(value, 3) else error { return .Err(error) }
+    const fourth = protocolByte(value, 4) else error { return .Err(error) }
+    .Ok(first << 24 | second << 16 | third << 8 | fourth)
+}
+
+fn protocolByte(value bytes.Bytes, index u64) Result<u64, Error> {
+    const result = value.At(index) else error {
+        discard error
+        return .Err(.Protocol)
+    }
+    .Ok(result)
+}
