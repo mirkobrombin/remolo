@@ -228,6 +228,130 @@ jobs:
             done
           done < <(find apps packages -name foundation.package -print | sort)
 
+  portable-linux:
+    name: Portable Linux ${{ matrix.arch }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: ubuntu-24.04
+            openssl_target: linux-x86_64
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            openssl_target: linux-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: source
+          persist-credentials: false
+
+      - name: Checkout Foundation Lang
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mirkobrombin/foundation-lang
+          ref: eb31584b36506df0e8e3839c4e6408e62ac172f9
+          path: toolchain
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          wget -qO "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
+          chmod +x "$RUNNER_TEMP/llvm.sh"
+          sudo "$RUNNER_TEMP/llvm.sh" 21
+          sudo apt-get install --no-install-recommends -y \
+            libfuse3-dev libzstd-dev llvm-21-dev zlib1g-dev
+          echo "LLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+      - name: Build static OpenSSL
+        run: |
+          mkdir -p "$RUNNER_TEMP/deps"
+          cd "$RUNNER_TEMP/deps"
+          curl --fail --location --remote-name \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.6/openssl-3.5.6.tar.gz
+          echo "deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736  openssl-3.5.6.tar.gz" \
+            | shasum -a 256 --check
+          tar -xzf openssl-3.5.6.tar.gz
+          cd openssl-3.5.6
+          ./Configure "${{ matrix.openssl_target }}" \
+            no-shared no-tests no-module no-jitter \
+            --prefix="$RUNNER_TEMP/deps/openssl-prefix"
+          make -j"$(getconf _NPROCESSORS_ONLN)"
+          make install_sw
+
+      - name: Configure static compiler driver
+        run: |
+          include="$RUNNER_TEMP/deps/openssl-prefix/include"
+          openssl_lib="$RUNNER_TEMP/deps/openssl-prefix/lib"
+          openssl_lib64="$RUNNER_TEMP/deps/openssl-prefix/lib64"
+          compiler="$RUNNER_TEMP/foundation-cc"
+          cat > "$compiler" <<'EOF'
+          #!/bin/sh
+          if [ "${FOUNDATION_STATIC_EXECUTABLE:-0}" = "1" ]; then
+            exec cc -static -L"$FOUNDATION_OPENSSL_LIB" \
+              -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+          fi
+          exec cc -L"$FOUNDATION_OPENSSL_LIB" \
+            -L"$FOUNDATION_OPENSSL_LIB64" "$@"
+          EOF
+          chmod +x "$compiler"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          echo "CPATH=$include" >> "$GITHUB_ENV"
+          echo "FOUNDATION_CC=$compiler" >> "$GITHUB_ENV"
+          echo "FOUNDATION_OPENSSL_LIB=$openssl_lib" >> "$GITHUB_ENV"
+          echo "FOUNDATION_OPENSSL_LIB64=$openssl_lib64" >> "$GITHUB_ENV"
+
+      - name: Build Foundation compiler
+        run: |
+          cmake -S toolchain -B toolchain/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$FOUNDATION_CC" \
+            -DLLVM_DIR="$LLVM_DIR"
+          cmake --build toolchain/build --target foundationc --parallel 3
+
+      - name: Build portable executable
+        working-directory: source
+        env:
+          FOUNDATION_STATIC_EXECUTABLE: 1
+        run: |
+          compiler="$GITHUB_WORKSPACE/toolchain/build/foundationc"
+          provider="$GITHUB_WORKSPACE/toolchain/providers/openssl"
+          mkdir -p build artifact
+          "$compiler" build apps/remolo -o build/remolo \
+            --backend llvm \
+            --native "$provider/foundation_openssl.c" \
+            --native "$provider/foundation_openssl_quic.c" \
+            --native-link ssl \
+            --native-link crypto \
+            --native-link z \
+            --native-link zstd
+          strip build/remolo
+          if readelf -l build/remolo | grep -q 'INTERP'; then
+            echo "portable executable contains a program interpreter" >&2
+            exit 1
+          fi
+          if readelf -d build/remolo 2>&1 | grep -q 'NEEDED'; then
+            echo "portable executable contains a shared dependency" >&2
+            exit 1
+          fi
+          build/remolo --version
+          install -m 0755 build/remolo artifact/remolo
+          tar -C artifact -czf "remolo-linux-${{ matrix.arch }}.tar.gz" remolo
+          sha256sum "remolo-linux-${{ matrix.arch }}.tar.gz" \
+            > "remolo-linux-${{ matrix.arch }}.tar.gz.sha256"
+
+      - name: Upload portable executable
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remolo-linux-${{ matrix.arch }}
+          path: |
+            source/remolo-linux-${{ matrix.arch }}.tar.gz
+            source/remolo-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
   windows:
     name: ${{ matrix.name }}
     timeout-minutes: 240
