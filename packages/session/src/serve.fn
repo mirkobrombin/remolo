@@ -165,10 +165,8 @@ task ServeHostWithPolicy(
         const HostAcceptOutcome { Host as restored Value } = accepted
         active = restored
         const peer = Value else error {
-            discard active
-            const stopping = peers.CancelTask()
-            discard $stopping.wait()
-            return .Err(error)
+            discard error
+            continue
         }
         if policy.Approve {
             const address = peer.Handle().PeerAddress()
@@ -230,9 +228,8 @@ task ServeRelayHostWithPolicy(
         const RelayHostAcceptOutcome { Host Value } = accepted
         active = Host
         const peer = Value else error {
-            discard active
-            discard rootPath
-            return .Err(error)
+            discard error
+            continue
         }
         if policy.Approve {
             const address = peer.Handle().PeerAddress()

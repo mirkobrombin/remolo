@@ -136,6 +136,54 @@ test "client and host authenticate over pinned multiplexed TLS" {
     expect(host.Close())
 }
 
+test "host accepts a valid client after failed authentication" {
+    const expiry = time.Now().Unix() + 3600
+    const listening = ListenLocal($testCapabilities(), expiry) else error {
+        panic(sessionFailure(error))
+    }
+    const ListeningHost { Host Token } = listening
+    const encoded = token.Encode($Token) else error {
+        discard error
+        fail("token encoding failed")
+    }
+    const decoded = token.Decode(encoded) else error {
+        discard error
+        fail("token decoding failed")
+    }
+    var rejected = decoded
+    const accepted = token.Decode(encoded) else error {
+        discard error
+        fail("token decoding failed")
+    }
+    const replacement = bytes.Random(32) else error {
+        discard error
+        fail("token key generation failed")
+    }
+    const original = replace rejected.PSK with replacement
+    discard original
+
+    const serving = spawn ServeHost($Host, $".", true, true)
+    const rejecting = spawn Connect($rejected)
+    match $rejecting.wait() {
+        Ok(client): {
+            CloseClient($client)
+            fail("client with the wrong session key connected")
+        }
+        Err(error): {
+            if !authenticationFailure(error) {
+                fail("wrong failed authentication error")
+            }
+        }
+    }
+    const connecting = spawn Connect($accepted)
+    const client = $connecting.wait() else error {
+        panic(sessionFailure(error))
+    }
+    CloseClient($client)
+    const served = $serving.wait()
+    served else error { panic(sessionFailure(error)) }
+}
+
 test "daemon proxy preserves output after client input closes" {
     const connectionID = "daemon-proxy-half-close-test"
     const metadataPath = daemonMetadataPath(connectionID)
