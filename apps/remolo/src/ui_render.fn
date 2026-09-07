@@ -1,7 +1,7 @@
 package remolo.cli
 
+import foundation.ui
 import foundation.worker
-import remolo.ui
 import std.text
 
 fn renderUI(
@@ -64,14 +64,14 @@ fn renderUI(
 
 fn renderRail(&window ui.Window, &state uiState, height f32) void {
     window.Row(44.0, 1)
-    window.Brand()
+    window.ApplicationIcon()
     window.Space(2.0)
     window.Row(44.0, 1)
-    if window.IconButton(0, "Connect", isPage(state.page, .Connect), true) {
+    if window.IconButton(.Link, "Connect", isPage(state.page, .Connect), true) {
         state.page = .Connect
     }
     window.Row(44.0, 1)
-    if window.IconButton(1, "Share this machine", isPage(state.page, .Host), true) {
+    if window.IconButton(.Share, "Share this machine", isPage(state.page, .Host), true) {
         state.page = .Host
     }
     window.Space(14.0)
@@ -79,7 +79,7 @@ fn renderRail(&window ui.Window, &state uiState, height f32) void {
     window.Space(14.0)
     window.Row(44.0, 1)
     if window.IconButton(
-        2,
+        .Terminal,
         "Terminal",
         isPage(state.page, .Terminal),
         state.terminalAvailable
@@ -88,7 +88,7 @@ fn renderRail(&window ui.Window, &state uiState, height f32) void {
     }
     window.Row(44.0, 1)
     if window.IconButton(
-        3,
+        .Folder,
         "Files",
         isPage(state.page, .Files),
         state.filesAvailable
@@ -97,7 +97,7 @@ fn renderRail(&window ui.Window, &state uiState, height f32) void {
     }
     window.Row(44.0, 1)
     if window.IconButton(
-        4,
+        .Display,
         "Desktop",
         isPage(state.page, .Desktop),
         state.desktopAvailable
@@ -110,7 +110,7 @@ fn renderRail(&window ui.Window, &state uiState, height f32) void {
         Dark: "Use light theme"
         Light: "Use dark theme"
     }
-    if window.IconButton(5, themeLabel, false, true) {
+    if window.IconButton(.Theme, themeLabel, false, true) {
         state.theme = match state.theme {
             Dark: .Light
             Light: .Dark

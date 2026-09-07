@@ -1,9 +1,9 @@
 package remolo.cli
 
+import foundation.ui
 import foundation.worker
 import remolo.desktop
 import remolo.rpc
-import remolo.ui
 import std.collections
 import std.format
 import std.text
@@ -397,24 +397,31 @@ fn renderDesktopPage(
         return
     }
     window.Row(height, 1)
-    if state.desktopFrame {
-        window.Image()
-        const inputs = collectUIDesktopInputs(&window)
-        match inputs {
-            Ok(events): {
-                if !events.IsEmpty() {
-                    dispatchUIDesktopInput(&state, $events)
-                } else {
-                    discard events
+    match state.desktopSurface {
+        None: {
+            window.Label("Waiting for the first frame...", .Muted, true)
+        }
+        Some(surface): {
+            window.DrawSurface(surface) else error {
+                discard error
+                state.status = "The remote frame could not be displayed."
+                return
+            }
+            const inputs = collectUIDesktopInputs(&window, surface)
+            match inputs {
+                Ok(events): {
+                    if !events.IsEmpty() {
+                        dispatchUIDesktopInput(&state, $events)
+                    } else {
+                        discard events
+                    }
+                }
+                Err(error): {
+                    discard error
+                    state.status = "Desktop input is unavailable."
                 }
             }
-            Err(error): {
-                discard error
-                state.status = "Desktop input is unavailable."
-            }
         }
-    } else {
-        window.Label("Waiting for the first frame...", .Muted, true)
     }
 }
 

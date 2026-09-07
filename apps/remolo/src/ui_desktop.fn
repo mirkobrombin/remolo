@@ -1,8 +1,8 @@
 package remolo.cli
 
+import foundation.ui
 import remolo.desktop
 import remolo.mux
-import remolo.ui
 import std.collections
 
 task pumpUIDesktop(
@@ -87,15 +87,19 @@ task sendUIDesktopInputs(
 }
 
 fn collectUIDesktopInputs(
-    &window ui.Window
+    &window ui.Window,
+    surface ui.Surface
 ) Result<own collections.List<desktop.InputEvent>, ui.Error> {
     var reversed = collections.NewList<desktop.InputEvent>()
     var polling = true
     while polling {
-        const input = window.PollDesktopInput() else error { return .Err(error) }
+        const input = window.PollSurfaceInput(surface) else error { return .Err(error) }
         match input {
             None: { polling = false }
-            Some(value): reversed.PushFront(uiDesktopInput(value))
+            Some(value): match uiDesktopInput(value) {
+                None: {}
+                Some(event): reversed.PushFront(event)
+            }
         }
     }
     .Ok(reverseUIDesktopInputs($reversed))
@@ -119,20 +123,26 @@ fn desktopInputValue($value Option<desktop.InputEvent>) desktop.InputEvent {
     }
 }
 
-fn uiDesktopInput(value ui.DesktopInput) desktop.InputEvent {
-    desktop.InputEvent {
-        Type = match value.Type {
-            MouseMove: .MouseMove
-            MouseButton: .MouseButton
-            Key: .Key
-            Wheel: .Wheel
-        }
-        X = value.X
-        Y = value.Y
-        Button = value.Button
-        Key = value.Key
-        Down = value.Down
-        Delta = value.Delta
+fn uiDesktopInput(value ui.SurfaceInput) Option<desktop.InputEvent> {
+    const kind = match value.Type {
+        MouseMove: Option<desktop.InputKind>.Some(.MouseMove)
+        MouseButton: Option<desktop.InputKind>.Some(.MouseButton)
+        Key: Option<desktop.InputKind>.Some(.Key)
+        Wheel: Option<desktop.InputKind>.Some(.Wheel)
+        Text: Option<desktop.InputKind>.None
+        MouseLeave: Option<desktop.InputKind>.None
+    }
+    match kind {
+        None: .None
+        Some(selected): .Some(desktop.InputEvent {
+            Type = selected
+            X = value.X
+            Y = value.Y
+            Button = value.Button
+            Key = value.Key
+            Down = value.Down
+            Delta = value.Delta
+        })
     }
 }
 

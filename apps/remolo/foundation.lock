@@ -1,6 +1,8 @@
 format foundation.lock/v1
 root remolo.cli 1.0.0
 target linux
+foreign c remolo-icon 1.0.0 path native abi c/v1 sha256:05d2a2277084f766cdc9462ea5247467546f6a3b4bcdfbe222cf6847cb80fcd7
+package foundation.ui.sdl 1.1.0 sha256:02eb3c1858c55e317f3afe83fbfb1f907743045f2a96090d510453174ccff205 sdk providers/sdl
 package remolo.codec 1.0.0 sha256:0b669009e86d2d19ad75fb45e813fbc25b11c68889b94a2bc9e5a74dadda0f70 path ../../packages/codec
 package remolo.config 1.0.0 sha256:7dafae0b4613e0b37711675b86aac214f3d80ef8070f899e0976f93534bc1a84 path ../../packages/config
 package remolo.crypto 1.0.0 sha256:3ea8b896bdd067940c183f08860421c535179e35b1cf5e7e773d1c6cd0865dca path ../../packages/crypto
@@ -20,7 +22,7 @@ package remolo.session 1.0.0 sha256:e36e70f8e004a667bb184b97143ea9d3654d52034972
 package remolo.token 1.0.0 sha256:801b2dbc7ab324d450e49f652e63b50fe383f399cc6ecc5ee1ad865da820884c path ../../packages/token
 package remolo.transport 1.0.0 sha256:85de38aef8a4062981b3b999eaee877ce6a983d9a28e27682779cf427bdeb3ea path ../../packages/transport
 package remolo.tunnel 1.0.0 sha256:4e1c7ded5ec720af9c28a5c015cf6cd8e3d905eab84613f43f37825e6154ea13 path ../../packages/tunnel
-package remolo.ui 1.0.0 sha256:60ee9616d73cb718c5ff2961d4e3b1c30fd0c6de738a093bb86880a1572331b0 path ../../packages/ui
+edge remolo.cli foundation.ui.sdl
 edge remolo.cli remolo.config
 edge remolo.cli remolo.desktop
 edge remolo.cli remolo.dirsync
@@ -29,7 +31,6 @@ edge remolo.cli remolo.protocol
 edge remolo.cli remolo.rpc
 edge remolo.cli remolo.session
 edge remolo.cli remolo.token
-edge remolo.cli remolo.ui
 edge remolo.desktop remolo.mux
 edge remolo.desktop remolo.protocol
 edge remolo.dirsync remolo.mux

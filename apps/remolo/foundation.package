@@ -5,6 +5,8 @@ language 1
 fcs standard
 source src
 test_source tests
+native_source native/icon.c
+foreign c remolo-icon 1.0.0 path native abi c/v1
 dependency remolo.dirsync 1.0.0 path ../../packages/dirsync
 dependency remolo.fusefs 1.0.0 path ../../packages/fusefs
 dependency remolo.config 1.0.0 path ../../packages/config
@@ -13,4 +15,4 @@ dependency remolo.protocol 1.0.0 path ../../packages/protocol
 dependency remolo.rpc 1.0.0 path ../../packages/rpc
 dependency remolo.session 1.0.0 path ../../packages/session
 dependency remolo.token 1.0.0 path ../../packages/token
-dependency remolo.ui 1.0.0 path ../../packages/ui
+dependency foundation.ui.sdl 1.1.0 sdk providers/sdl

@@ -1,9 +1,9 @@
 package remolo.cli
 
+import foundation.ui
 import foundation.worker
 import remolo.desktop
 import remolo.rpc
-import remolo.ui
 import std.bytes
 import std.collections
 import std.format
@@ -100,7 +100,7 @@ struct uiState {
     filesLoading bool
     desktopOpen bool
     desktopOpening bool
-    desktopFrame bool
+    desktopSurface Option<ui.Surface>
 }
 
 fn newUIState() own uiState {
@@ -129,7 +129,7 @@ fn newUIState() own uiState {
         filesLoading = false
         desktopOpen = false
         desktopOpening = false
-        desktopFrame = false
+        desktopSurface = .None
     }
 }
 
@@ -227,18 +227,36 @@ fn applyUIEvent(
         }
         DesktopFrame(value): {
             const desktop.DecodedFrame { Width Height Pixels } = value
-            window.UpdateImage(Width, Height, $Pixels) else error {
+            const surface = match state.desktopSurface {
+                None: {
+                    const created = window.CreateSurface() else error {
+                        discard error
+                        discard Pixels
+                        state.status = "The remote frame surface could not be created."
+                        return
+                    }
+                    state.desktopSurface = .Some(created)
+                    created
+                }
+                Some(active): active
+            }
+            window.UpdateSurface(surface, Width, Height, $Pixels) else error {
                 discard error
                 state.status = "The remote frame could not be displayed."
                 return
             }
-            state.desktopFrame = true
         }
         DesktopFailed(message): {
-            window.ReleaseDesktopControl()
+            const selected = replace state.desktopSurface with .None
+            match selected {
+                None: {}
+                Some(surface): {
+                    discard window.ReleaseSurfaceInput(surface)
+                    discard window.DestroySurface(surface)
+                }
+            }
             state.desktopOpen = false
             state.desktopOpening = false
-            state.desktopFrame = false
             state.status = message
         }
     }

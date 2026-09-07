@@ -1,7 +1,7 @@
 package remolo.cli
 
+import foundation.ui.sdl
 import foundation.worker
-import remolo.ui
 
 fn runUI(args [String]) Result<i32, failure> {
     if len(args) != 1 return .Err(invalid("ui accepts no arguments"))
@@ -10,11 +10,16 @@ fn runUI(args [String]) Result<i32, failure> {
 }
 
 task runUILoop() Result<i32, failure> {
-    const opened = ui.Open("Remolo", 1180, 760) else error {
+    const opened = sdl.Open("Remolo", 1180, 760) else error {
         discard error
         return .Err(failed("could not open the native interface"))
     }
     var window = opened
+    setApplicationIcon(&window) else error {
+        discard error
+        discard window
+        return .Err(failed("could not load the application icon"))
+    }
     var state = newUIState()
     const Channel { sender receiver } = channel<uiEvent>(32)
     var eventSender = sender
