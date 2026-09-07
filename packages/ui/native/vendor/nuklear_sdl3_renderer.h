@@ -451,7 +451,12 @@ nk_sdl_handle_event(struct nk_context* ctx, SDL_Event *evt)
         case SDL_EVENT_KEY_DOWN:
             {
                 int down = evt->type == SDL_EVENT_KEY_DOWN;
-                int ctrl_down = evt->key.mod & SDL_KMOD_CTRL;
+                SDL_Keymod modifiers = (SDL_Keymod)(evt->key.mod | SDL_GetModState());
+#if defined(__APPLE__)
+                int ctrl_down = (modifiers & SDL_KMOD_GUI) != 0;
+#else
+                int ctrl_down = (modifiers & SDL_KMOD_CTRL) != 0;
+#endif
 
                 switch(evt->key.key)
                 {
@@ -537,6 +542,13 @@ nk_sdl_handle_event(struct nk_context* ctx, SDL_Event *evt)
             {
                 nk_glyph glyph;
                 nk_size len;
+                SDL_Keymod modifiers = SDL_GetModState();
+#if defined(__APPLE__)
+                if ((modifiers & SDL_KMOD_GUI) != 0) return 1;
+#else
+                if ((modifiers & SDL_KMOD_CTRL) != 0 &&
+                    (modifiers & SDL_KMOD_ALT) == 0) return 1;
+#endif
                 NK_ASSERT(evt->text.text);
                 len = SDL_strlen(evt->text.text);
                 NK_ASSERT(len <= NK_UTF_SIZE);

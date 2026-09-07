@@ -12,6 +12,7 @@
 #define NK_INCLUDE_FONT_BAKING
 #define NK_INCLUDE_STANDARD_VARARGS
 #define NK_INCLUDE_VERTEX_BUFFER_OUTPUT
+#define NK_BUTTON_TRIGGER_ON_RELEASE
 
 #define NK_INT8 Sint8
 #define NK_UINT8 Uint8
@@ -421,6 +422,71 @@ static char *remolo_ui_text(const fdn_string *value) {
     return copy;
 }
 
+static void remolo_ui_copy_selection(struct nk_context *context,
+                                     struct nk_text_edit *edit) {
+    nk_rune rune;
+    int glyph_length;
+    const int begin = NK_MIN(edit->select_start, edit->select_end);
+    const int end = NK_MAX(edit->select_start, edit->select_end);
+    const char *text;
+    if (begin == end || context->clip.copy == NULL) return;
+    text = nk_str_at_const(&edit->string, begin, &rune, &glyph_length);
+    context->clip.copy(context->clip.userdata, text, end - begin);
+}
+
+static void remolo_ui_sync_edit(struct nk_window *window,
+                                struct nk_text_edit *edit, char *buffer,
+                                uint64_t capacity) {
+    const nk_size length = edit->string.buffer.allocated;
+    buffer[NK_MIN(length, (nk_size)capacity - 1)] = '\0';
+    window->edit.cursor = edit->cursor;
+    window->edit.sel_start = edit->select_start;
+    window->edit.sel_end = edit->select_end;
+    window->edit.mode = edit->mode;
+    window->edit.scrollbar.x = (nk_uint)edit->scrollbar.x;
+    window->edit.scrollbar.y = (nk_uint)edit->scrollbar.y;
+}
+
+static void remolo_ui_edit_menu(remolo_ui *ui, struct nk_window *window,
+                                struct nk_rect bounds, char *buffer,
+                                uint64_t capacity) {
+    struct nk_text_edit *edit = &ui->context->text_edit;
+    const bool selected = edit->select_start != edit->select_end;
+    const bool paste_available = SDL_HasClipboardText();
+    bool changed = false;
+    if (!nk_contextual_begin(ui->context, 0, nk_vec2(172.0f, 152.0f), bounds)) {
+        return;
+    }
+    nk_layout_row_dynamic(ui->context, 32.0f, 1);
+    if (!selected) {
+        nk_widget_disable_begin(ui->context);
+        ui->context->style.contextual_button.color_factor_background = 1.0f;
+    }
+    if (nk_contextual_item_label(ui->context, "Cut", NK_TEXT_LEFT)) {
+        remolo_ui_copy_selection(ui->context, edit);
+        changed = nk_textedit_cut(edit);
+    }
+    if (nk_contextual_item_label(ui->context, "Copy", NK_TEXT_LEFT)) {
+        remolo_ui_copy_selection(ui->context, edit);
+    }
+    if (!selected) nk_widget_disable_end(ui->context);
+    if (!paste_available) {
+        nk_widget_disable_begin(ui->context);
+        ui->context->style.contextual_button.color_factor_background = 1.0f;
+    }
+    if (nk_contextual_item_label(ui->context, "Paste", NK_TEXT_LEFT)) {
+        ui->context->clip.paste(ui->context->clip.userdata, edit);
+        changed = true;
+    }
+    if (!paste_available) nk_widget_disable_end(ui->context);
+    if (nk_contextual_item_label(ui->context, "Select all", NK_TEXT_LEFT)) {
+        nk_textedit_select_all(edit);
+        changed = true;
+    }
+    if (changed) remolo_ui_sync_edit(window, edit, buffer, capacity);
+    nk_contextual_end(ui->context);
+}
+
 static void remolo_ui_apply_theme(remolo_ui *ui, bool light) {
     struct nk_color table[NK_COLOR_COUNT];
     const struct nk_color background = light ? nk_rgb(247, 249, 252) : nk_rgb(15, 24, 40);
@@ -464,9 +530,25 @@ static void remolo_ui_apply_theme(remolo_ui *ui, bool light) {
     ui->context->style.window.padding = nk_vec2(24.0f, 0.0f);
     ui->context->style.window.spacing = nk_vec2(8.0f, 8.0f);
     ui->context->style.window.border = 0.0f;
+    ui->context->style.window.rounding = 8.0f;
     ui->context->style.window.group_padding = nk_vec2(16.0f, 16.0f);
+    ui->context->style.window.contextual_border = 1.0f;
+    ui->context->style.window.contextual_border_color = border;
+    ui->context->style.window.contextual_padding = nk_vec2(6.0f, 6.0f);
     ui->context->style.button.rounding = 6.0f;
     ui->context->style.button.padding = nk_vec2(12.0f, 8.0f);
+    ui->context->style.contextual_button.normal = nk_style_item_color(background);
+    ui->context->style.contextual_button.hover = nk_style_item_color(raised);
+    ui->context->style.contextual_button.active = nk_style_item_color(accent);
+    ui->context->style.contextual_button.border_color = border;
+    ui->context->style.contextual_button.text_background = background;
+    ui->context->style.contextual_button.text_normal = text;
+    ui->context->style.contextual_button.text_hover = text;
+    ui->context->style.contextual_button.text_active = background;
+    ui->context->style.contextual_button.border = 0.0f;
+    ui->context->style.contextual_button.rounding = 5.0f;
+    ui->context->style.contextual_button.padding = nk_vec2(10.0f, 7.0f);
+    ui->context->style.contextual_button.disabled_factor = 0.48f;
     ui->context->style.edit.rounding = 6.0f;
     ui->context->style.edit.border = 1.0f;
     ui->context->style.edit.padding = nk_vec2(12.0f, 8.0f);
@@ -1172,6 +1254,8 @@ int32_t remolo_ui_edit(uint64_t handle, const fdn_string *name,
     remolo_ui_edit_state *state;
     uint64_t length;
     nk_flags flags;
+    struct nk_rect bounds;
+    struct nk_window *window;
     if (ui == NULL || name == NULL || value == NULL || result == NULL ||
         changed == NULL || committed == NULL || name->length == 0 ||
         name->length >= REMOLO_UI_EDIT_NAME_CAPACITY ||
@@ -1194,8 +1278,17 @@ int32_t remolo_ui_edit(uint64_t handle, const fdn_string *name,
     }
     flags = (nk_flags)NK_EDIT_FIELD | (nk_flags)NK_EDIT_CLIPBOARD |
             (nk_flags)NK_EDIT_SIG_ENTER;
+    bounds = nk_widget_bounds(ui->context);
+    window = ui->context->current;
+    if (nk_input_is_mouse_click_in_rect(&ui->context->input, NK_BUTTON_LEFT,
+                                        bounds) ||
+        nk_input_is_mouse_click_in_rect(&ui->context->input, NK_BUTTON_RIGHT,
+                                        bounds)) {
+        nk_edit_focus(ui->context, flags);
+    }
     flags = nk_edit_string_zero_terminated(ui->context, flags, state->buffer,
                                            (int)state->capacity, nk_filter_default);
+    remolo_ui_edit_menu(ui, window, bounds, state->buffer, state->capacity);
     fdn_string_drop(result);
     *result = foundation_runtime_string_copy(
         &(fdn_string){state->buffer, SDL_strlen(state->buffer), 0});
