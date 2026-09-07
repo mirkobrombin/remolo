@@ -15,6 +15,7 @@ enum Theme {
 
 enum FrameState {
     Active
+    Idle
     Closing
 }
 
@@ -48,6 +49,13 @@ struct TextEdit {
     Committed bool
 }
 
+struct TerminalFrame {
+    Input String
+    Columns u64
+    Rows u64
+    Resized bool
+}
+
 struct Size {
     Width u64
     Height u64
@@ -67,7 +75,11 @@ extern c fn setThemeNative(handle u64, theme u64) i32 as remolo_ui_set_theme
 extern c fn sizeNative(handle u64, &width u64, &height u64) i32 as remolo_ui_size
 extern c fn beginRootNative(handle u64) bool as remolo_ui_begin_root
 extern c fn endRootNative(handle u64) void as remolo_ui_end_root
-extern c fn titlebarNative(handle u64) void as remolo_ui_titlebar
+extern c fn titlebarNative(
+    handle u64,
+    title String,
+    subtitle String
+) void as remolo_ui_titlebar
 extern c fn rowNative(handle u64, height f32, columns u64) void as remolo_ui_row
 extern c fn rowBeginNative(handle u64, height f32, columns u64) void as remolo_ui_row_begin
 extern c fn rowPushNative(handle u64, ratio f32) void as remolo_ui_row_push
@@ -91,11 +103,23 @@ extern c fn iconButtonNative(
 ) bool as remolo_ui_icon_button
 extern c fn headingNative(handle u64, value String) void as remolo_ui_heading
 extern c fn labelNative(handle u64, value String, tone u64, wrap bool) void as remolo_ui_label
-extern c fn terminalTextNative(
+extern c fn terminalBufferNative(
     handle u64,
-    value String,
-    minimumHeight f32
-) void as remolo_ui_terminal_text
+    length u64,
+    &capacity u64
+) *u8 as remolo_ui_terminal_buffer
+extern c fn terminalCommitNative(
+    handle u64,
+    length u64
+) i32 as remolo_ui_terminal_commit
+extern c fn terminalNative(
+    handle u64,
+    height f32,
+    &input String,
+    &columns u64,
+    &rows u64,
+    &resized bool
+) i32 as remolo_ui_terminal
 extern c fn buttonNative(
     handle u64,
     value String,
@@ -155,6 +179,7 @@ struct Window {
         const value = beginFrameNative(self.handle)
         if value == 0 return .Ok(.Active)
         if value == 1 return .Ok(.Closing)
+        if value == 2 return .Ok(.Idle)
         .Err(errorFor(value))
     }
 
@@ -174,8 +199,8 @@ struct Window {
         beginRootNative(self.handle)
     }
 
-    fn Titlebar(&self) void {
-        titlebarNative(self.handle)
+    fn Titlebar(&self, title String, subtitle String) void {
+        titlebarNative(self.handle, title, subtitle)
     }
 
     fn EndRoot(&self) void {
@@ -244,8 +269,55 @@ struct Window {
         labelNative(self.handle, value, labelToneValue(tone), wrap)
     }
 
-    fn TerminalText(&self, value String, minimumHeight f32) void {
-        terminalTextNative(self.handle, value, minimumHeight)
+    fn UpdateTerminal(
+        &self,
+        $value own bytes.Bytes
+    ) Result<void, Error> {
+        const length = value.Len() else error {
+            discard error
+            discard value
+            return .Err(.Invalid)
+        }
+        if length == 0 {
+            discard value
+            return status(terminalCommitNative(self.handle, 0))
+        }
+        // SAFETY: terminalBufferNative returns window-owned storage with capacity bytes.
+        unsafe {
+            var capacity u64 = 0
+            const destination = terminalBufferNative(self.handle, length, &capacity)
+            if isNull(destination) {
+                discard value
+                return .Err(.Failed)
+            }
+            value.CopyToRaw(destination, capacity) else error {
+                discard error
+                return .Err(.Failed)
+            }
+        }
+        status(terminalCommitNative(self.handle, length))
+    }
+
+    fn Terminal(&self, height f32) Result<TerminalFrame, Error> {
+        var input = ""
+        var columns u64 = 0
+        var rows u64 = 0
+        var resized = false
+        const value = terminalNative(
+            self.handle,
+            height,
+            &input,
+            &columns,
+            &rows,
+            &resized
+        )
+        if value != 0 return .Err(errorFor(value))
+        .Ok(TerminalFrame {
+            Input = input
+            Columns = columns
+            Rows = rows
+            Resized = resized
+        })
     }
 
     fn Button(&self, value String, selected bool, primary bool) bool {

@@ -34,26 +34,30 @@ fn renderUI(
     }
     window.PushColumn(0.935)
     if window.BeginGroup("workspace") {
-        window.BeginRow(height - 24.0, 3)
-        window.PushColumn(0.04)
-        window.Empty()
-        window.PushColumn(0.95)
-        if window.BeginGroup("content") {
-            window.Space(20.0)
-            renderCurrentPage(&window, &state, workers, $events, height - 44.0)
-            window.EndGroup()
+        window.Space(8.0)
+        if remotePage(state.page) {
+            renderCurrentPage(&window, &state, workers, $events, height - 56.0)
         } else {
-            discard events
+            window.BeginRow(height - 80.0, 3)
+            window.PushColumn(0.06)
+            window.Empty()
+            window.PushColumn(0.88)
+            if window.BeginGroup("content") {
+                renderCurrentPage(&window, &state, workers, $events, height - 112.0)
+                window.EndGroup()
+            } else {
+                discard events
+            }
+            window.PushColumn(0.06)
+            window.Empty()
+            window.EndRow()
         }
-        window.PushColumn(0.01)
-        window.Empty()
-        window.EndRow()
         window.EndGroup()
     } else {
         discard events
     }
     window.EndRow()
-    window.Titlebar()
+    window.Titlebar(pageTitle(state.page), pageSubtitle(state))
     window.EndRoot()
     .Ok
 }
@@ -140,15 +144,28 @@ fn renderCurrentPage(
     }
 }
 
-fn renderRemoteHeader(&window ui.Window, state uiState, title String) void {
-    window.Row(44.0, 1)
-    window.Heading(title)
-    window.Row(34.0, 1)
-    window.Label(
-        state.remoteName + "  " + state.remotePlatform + " / " + state.remoteArchitecture,
-        .Accent,
-        true
-    )
+fn remotePage(value uiPage) bool {
+    match value {
+        Terminal: true
+        Files: true
+        Desktop: true
+        _: false
+    }
+}
+
+fn pageTitle(value uiPage) String {
+    match value {
+        Connect: "Reach another machine"
+        Host: "Share this machine"
+        Terminal: "Terminal"
+        Files: "Files"
+        Desktop: "Desktop"
+    }
+}
+
+fn pageSubtitle(state uiState) String {
+    if !remotePage(state.page) || text.IsEmpty(state.remoteName) return ""
+    state.remoteName + "  " + state.remotePlatform + " / " + state.remoteArchitecture
 }
 
 fn renderConnectionStatus(&window ui.Window, state uiState) void {

@@ -4,10 +4,21 @@ import std.bytes
 
 struct Decoder {
     previous Option<own bytes.Bytes>
+    width u64
+    height u64
+    ready bool
 }
 
 fn NewDecoder() own Decoder {
-    own Decoder { previous = .None }
+    own Decoder { previous = .None width = 0 height = 0 ready = false }
+}
+
+fn unchangedDiff(decoder Decoder, source bytes.Bytes) bool {
+    if frameLength(source) != 17 || frameByte(source, 0) != 2 return false
+    if frameU32(source, 13) != 0 return false
+    if frameU32(source, 1) != decoder.width return false
+    if frameU32(source, 5) != decoder.height return false
+    decoder.ready
 }
 
 fn DecodeFrame(
@@ -20,6 +31,47 @@ fn DecodeFrame(
     if kind == 1 return decodeFullFrame(&decoder, $source)
     if kind == 2 return decodeDiffFrame(&decoder, $source)
     .Err(.InvalidFrame)
+}
+
+fn DecodePixels(
+    &decoder Decoder,
+    $source own bytes.Bytes
+) Result<own DecodedFrame, Error> {
+    const length = frameLength(source)
+    if length < 17 return .Err(.InvalidFrame)
+    const kind = frameByte(source, 0)
+    if kind == 1 return decodeFullPixels(&decoder, $source)
+    if kind == 2 return decodeDiffPixels(&decoder, $source)
+    .Err(.InvalidFrame)
+}
+
+fn decodeFullPixels(
+    &decoder Decoder,
+    $source own bytes.Bytes
+) Result<own DecodedFrame, Error> {
+    const frame = DecodeFullFrame(source) else error { return .Err(error) }
+    const decoded = DecodePNG(frame.Image) else error {
+        discard frame
+        return .Err(error)
+    }
+    const DecodedFrame { Width Height Pixels } = decoded
+    if Width != frame.Width || Height != frame.Height {
+        discard Pixels
+        discard frame
+        return .Err(.InvalidFrame)
+    }
+    discard frame
+    const next = Pixels.Copy() else error {
+        discard error
+        discard Pixels
+        return .Err(.Storage)
+    }
+    const previous = replace decoder.previous with .Some(next)
+    discard previous
+    decoder.width = Width
+    decoder.height = Height
+    decoder.ready = true
+    .Ok(own DecodedFrame { Width = Width Height = Height Pixels = Pixels })
 }
 
 fn decodeFullFrame(
@@ -39,6 +91,9 @@ fn decodeFullFrame(
     }
     const previous = replace decoder.previous with .Some(pixels)
     discard previous
+    decoder.width = frame.Width
+    decoder.height = frame.Height
+    decoder.ready = true
     .Ok(frame)
 }
 
@@ -46,12 +101,32 @@ fn decodeDiffFrame(
     &decoder Decoder,
     $source own bytes.Bytes
 ) Result<own EncodedFrame, Error> {
-    const length = frameLength(source)
     const width = frameU32(source, 1)
     const height = frameU32(source, 5)
     const sequence = frameU32(source, 9)
+    const decoded = decodeDiffPixels(&decoder, $source) else error {
+        return .Err(error)
+    }
+    const DecodedFrame { Width Height Pixels } = decoded
+    const image = EncodePNG(Width, Height, Pixels) else error { return .Err(error) }
+    .Ok(own EncodedFrame {
+        Sequence = sequence
+        Width = width
+        Height = height
+        Image = image
+    })
+}
+
+fn decodeDiffPixels(
+    &decoder Decoder,
+    $source own bytes.Bytes
+) Result<own DecodedFrame, Error> {
+    const length = frameLength(source)
+    const width = frameU32(source, 1)
+    const height = frameU32(source, 5)
     const count = frameU32(source, 13)
     const baseline = replace decoder.previous with .None
+    decoder.ready = false
     const previous = match baseline {
         Some(found): found
         None: { return .Err(.InvalidFrame) }
@@ -90,12 +165,13 @@ fn decodeDiffFrame(
         return .Err(.Storage)
     }
     decoder.previous = .Some(next)
-    const image = EncodePNG(width, height, pixels) else error { return .Err(error) }
-    .Ok(own EncodedFrame {
-        Sequence = sequence
+    decoder.width = width
+    decoder.height = height
+    decoder.ready = true
+    .Ok(own DecodedFrame {
         Width = width
         Height = height
-        Image = image
+        Pixels = pixels
     })
 }
 

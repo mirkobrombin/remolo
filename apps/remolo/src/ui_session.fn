@@ -18,7 +18,10 @@ struct uiDesktopSession {
 }
 
 task connectFromUI($value String, $events Sender<uiEvent>) void {
-    const connected = connectToken(value) else error {
+    const connected = connectTokenDedicatedWith(
+        value,
+        $session.DefaultConnectOptions()
+    ) else error {
         discard events.send($ .ConnectionFailed(message = text.Copy(error.message)))
         return
     }
@@ -91,6 +94,25 @@ task serveUISession(
                                 discard error
                                 discard events.send($ .TerminalFailed(
                                         message = "The terminal was closed."
+                                    ))
+                            }
+                        }
+                    }
+                }
+            }
+            TerminalResize(value): {
+                const uiTerminalSize { columns rows } = value
+                const selected = replace terminal with .None
+                match selected {
+                    None: {}
+                    Some(active): {
+                        const resized = resizeUITerminal($active, columns, rows)
+                        match resized {
+                            Ok(restored): { terminal = .Some(restored) }
+                            Err(error): {
+                                discard error
+                                discard events.send($ .TerminalFailed(
+                                        message = "The terminal could not be resized."
                                     ))
                             }
                         }

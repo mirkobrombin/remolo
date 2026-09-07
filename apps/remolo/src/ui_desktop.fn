@@ -12,9 +12,9 @@ task pumpUIDesktop(
     var source = reader
     var activeEvents = events
     while true {
-        const reading = spawn desktop.Read($source)
+        const reading = spawn desktop.ReadDecoded($source)
         const outcome = $reading.wait()
-        const desktop.ReadOutcome { Reader Value } = outcome
+        const desktop.DecodedReadOutcome { Reader Value } = outcome
         source = Reader
         const event = Value else error {
             discard error
@@ -24,20 +24,9 @@ task pumpUIDesktop(
         }
         match event {
             Frame(value): {
-                const desktop.EncodedFrame { Sequence Width Height Image } = value
-                discard Sequence
-                discard Width
-                discard Height
-                const decoded = desktop.DecodePNG(Image) else error {
-                    discard error
-                    discard source
-                    discard activeEvents.send($ .DesktopFailed(
-                            message = "The remote frame was invalid."
-                        ))
-                    return
-                }
-                discard activeEvents.send($ .DesktopFrame(value = decoded))
+                discard activeEvents.send($ .DesktopFrame(value = value))
             }
+            Unchanged: {}
             Exit: {
                 discard source
                 discard activeEvents.send($ .DesktopFailed(message = "Desktop session ended."))
@@ -50,7 +39,7 @@ task pumpUIDesktop(
 fn openUIDesktop(
     $handle mux.Handle
 ) Result<own desktop.RemoteDesktop, desktop.Error> {
-    const opening = spawn desktop.Open($handle, 15)
+    const opening = spawn desktop.OpenMode($handle, .Diff, 15)
     const result = $opening.wait()
     result
 }

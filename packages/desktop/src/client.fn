@@ -53,6 +53,17 @@ struct ReadOutcome {
     Value Result<Event, Error>
 }
 
+enum DecodedEvent {
+    Frame(value own DecodedFrame)
+    Unchanged
+    Exit
+}
+
+struct DecodedReadOutcome {
+    Reader own Reader
+    Value Result<DecodedEvent, Error>
+}
+
 task Open(
     $handle mux.Handle,
     fps u64
@@ -215,6 +226,95 @@ task Read($reader own Reader) ReadOutcome {
                     decoder = Decoder
                 }
                 Value = Value
+            }
+        }
+    }
+}
+
+task ReadDecoded($reader own Reader) DecodedReadOutcome {
+    const Reader { source decoder } = reader
+    match source {
+        Mux(value): {
+            var active = decoder
+            const reading = spawn mux.ReadFrame($value)
+            const outcome = $reading.wait()
+            const mux.FrameReadOutcome { Reader Value } = outcome
+            var restored = own Reader {
+                source = .Mux(value = Reader)
+                decoder = active
+            }
+            const frame = Value else error {
+                discard error
+                return DecodedReadOutcome { Reader = restored Value = .Err(.Closed) }
+            }
+            const protocol.Frame { Type Payload } = frame
+            match Type {
+                Data: {
+                    if unchangedDiff(restored.decoder, Payload) {
+                        discard Payload
+                        return DecodedReadOutcome {
+                            Reader = restored
+                            Value = .Ok(.Unchanged)
+                        }
+                    }
+                    const decoded = DecodePixels(
+                        &restored.decoder,
+                        $Payload
+                    ) else error {
+                        return DecodedReadOutcome {
+                            Reader = restored
+                            Value = .Err(error)
+                        }
+                    }
+                    DecodedReadOutcome {
+                        Reader = restored
+                        Value = .Ok(.Frame(value = $decoded))
+                    }
+                }
+                Exit: {
+                    discard Payload
+                    DecodedReadOutcome { Reader = restored Value = .Ok(.Exit) }
+                }
+                EOF: {
+                    discard Payload
+                    DecodedReadOutcome { Reader = restored Value = .Ok(.Exit) }
+                }
+                _: {
+                    discard Payload
+                    DecodedReadOutcome { Reader = restored Value = .Err(.Protocol) }
+                }
+            }
+        }
+        RTC(value): {
+            const reading = spawn readRTCFrame($value, $decoder)
+            const outcome = $reading.wait()
+            const rtcFrameOutcome { Reader Decoder Value } = outcome
+            const restored = own Reader {
+                source = .RTC(value = Reader)
+                decoder = Decoder
+            }
+            const event = Value else error {
+                return DecodedReadOutcome { Reader = restored Value = .Err(error) }
+            }
+            match event {
+                Exit: DecodedReadOutcome {
+                    Reader = restored
+                    Value = .Ok(.Exit)
+                }
+                Frame(value): {
+                    const decoded = DecodePNG(value.Image) else error {
+                        discard value
+                        return DecodedReadOutcome {
+                            Reader = restored
+                            Value = .Err(error)
+                        }
+                    }
+                    discard value
+                    DecodedReadOutcome {
+                        Reader = restored
+                        Value = .Ok(.Frame(value = $decoded))
+                    }
+                }
             }
         }
     }

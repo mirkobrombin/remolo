@@ -137,6 +137,36 @@ test "diff decoder rebuilds complete PNG frames" {
     expect(frameByte(pixels.pixels, 7) == 255)
 }
 
+test "diff decoder exposes pixels without rebuilding a PNG" {
+    var encoder = NewEncoder(.Diff)
+    var decoder = NewDecoder()
+    const first = EncodeFrame(&encoder, $testFrame()) else {
+        fail("first frame encode failed")
+    }
+    const firstDecoded = DecodePixels(&decoder, $first) else {
+        fail("first pixel decode failed")
+    }
+    expect(firstDecoded.Width == 2)
+    expect(firstDecoded.Height == 1)
+    expect(frameByte(firstDecoded.Pixels, 0) == 255)
+
+    const second = EncodeFrame(&encoder, $changedTestFrame()) else {
+        fail("second frame encode failed")
+    }
+    const secondDecoded = DecodePixels(&decoder, $second) else {
+        fail("second pixel decode failed")
+    }
+    expect(frameByte(secondDecoded.Pixels, 4) == 0)
+    expect(frameByte(secondDecoded.Pixels, 5) == 0)
+    expect(frameByte(secondDecoded.Pixels, 6) == 255)
+    expect(frameByte(secondDecoded.Pixels, 7) == 255)
+
+    const unchanged = EncodeFrame(&encoder, $changedTestFrame()) else {
+        fail("unchanged frame encode failed")
+    }
+    expect(unchangedDiff(decoder, unchanged))
+}
+
 test "synthetic capture advances the frame" {
     var capturer = NewSyntheticCapturer(2, 1)
     const first = capturer.Capture() else { fail("first capture failed") }

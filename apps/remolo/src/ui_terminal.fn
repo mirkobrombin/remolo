@@ -35,6 +35,24 @@ fn writeUITerminal(
     })
 }
 
+fn resizeUITerminal(
+    $active own uiTerminalSession,
+    columns u16,
+    rows u16
+) Result<own uiTerminalSession, session.Error> {
+    const uiTerminalSession { writer controller } = active
+    const resizing = spawn session.ResizePTY($writer, columns, rows)
+    const resized = $resizing.wait()
+    const restored = resized else error {
+        discard controller
+        return .Err(error)
+    }
+    .Ok(own uiTerminalSession {
+        writer = restored
+        controller = controller
+    })
+}
+
 task pumpUITerminal(
     $reader own session.PTYReader,
     $events Sender<uiEvent>
@@ -54,23 +72,15 @@ task pumpUITerminal(
         }
         match event {
             Data(value): {
-                const decoded = value.Text()
-                const output = match decoded {
-                    Ok(found): found
-                    Err(error): {
-                        discard error
-                        "[binary terminal output]\n"
-                    }
-                }
-                discard activeEvents.send($ .TerminalOutput(value = output))
+                discard activeEvents.send($ .TerminalOutput(value = value))
             }
             Exit(value): {
                 const protocol.Exit { Code Error } = value
                 discard Error
                 discard source
-                discard activeEvents.send($ .TerminalOutput(
-                        value = "\n[session exited " + format.I32(Code) + "]\n"
-                    ))
+                discard activeEvents.send($ .TerminalOutput(value = bytes.FromText(
+                            "\n[session exited " + format.I32(Code) + "]\n"
+                        )))
                 discard activeEvents.send($ .TerminalFailed(message = "Terminal session ended."))
                 return
             }

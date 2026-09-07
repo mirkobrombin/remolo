@@ -1,11 +1,12 @@
 package remolo.cli
 
+import foundation.worker
 import remolo.desktop
 import remolo.rpc
 import remolo.ui
+import std.bytes
 import std.collections
 import std.format
-import std.text
 
 enum uiPage {
     Connect
@@ -42,9 +43,15 @@ struct uiTransfer {
     remotePath String
 }
 
+struct uiTerminalSize {
+    columns u16
+    rows u16
+}
+
 enum uiCommand {
     OpenTerminal
     TerminalInput(value String)
+    TerminalResize(value uiTerminalSize)
     ListFiles(path String)
     Upload(value uiTransfer)
     Download(value uiTransfer)
@@ -58,7 +65,7 @@ enum uiEvent {
     HostReady(value uiHostReady)
     HostFailed(message String)
     TerminalOpened
-    TerminalOutput(value String)
+    TerminalOutput(value own bytes.Bytes)
     TerminalFailed(message String)
     FilesLoaded(value own collections.List<rpc.DirEntry>)
     FilesFailed(message String)
@@ -84,8 +91,7 @@ struct uiState {
     desktopAvailable bool
     commands Option<Sender<uiCommand>>
     terminalOpen bool
-    terminalOutput String
-    terminalInput String
+    terminalOpening bool
     remotePath String
     localPath String
     transferRemotePath String
@@ -93,6 +99,7 @@ struct uiState {
     filesLoaded bool
     filesLoading bool
     desktopOpen bool
+    desktopOpening bool
     desktopFrame bool
 }
 
@@ -113,8 +120,7 @@ fn newUIState() own uiState {
         desktopAvailable = false
         commands = .None
         terminalOpen = false
-        terminalOutput = ""
-        terminalInput = ""
+        terminalOpening = false
         remotePath = "."
         localPath = ""
         transferRemotePath = ""
@@ -122,11 +128,17 @@ fn newUIState() own uiState {
         filesLoaded = false
         filesLoading = false
         desktopOpen = false
+        desktopOpening = false
         desktopFrame = false
     }
 }
 
-fn applyUIEvent(&window ui.Window, &state uiState, $event uiEvent) void {
+fn applyUIEvent(
+    &window ui.Window,
+    &state uiState,
+    workers worker.Supervisor,
+    $event uiEvent
+) void {
     match event {
         Connected(value): {
             const uiConnected {
@@ -147,6 +159,20 @@ fn applyUIEvent(&window ui.Window, &state uiState, $event uiEvent) void {
             state.desktopAvailable = remoteDesktop
             state.commands = .Some(commands)
             state.status = "Connected and ready."
+            if terminal {
+                state.page = .Terminal
+                state.terminalOpening = true
+                state.status = "Opening the terminal channel..."
+                dispatchUICommand(&state, workers, $ .OpenTerminal)
+                return
+            }
+            if files {
+                state.page = .Files
+                return
+            }
+            if remoteDesktop {
+                state.page = .Desktop
+            }
         }
         ConnectionFailed(message): {
             state.connection = .Failed
@@ -164,11 +190,22 @@ fn applyUIEvent(&window ui.Window, &state uiState, $event uiEvent) void {
         }
         TerminalOpened: {
             state.terminalOpen = true
+            state.terminalOpening = false
             state.status = "Terminal channel open."
         }
-        TerminalOutput(value): appendTerminalOutput(&state, value)
+        TerminalOutput(value): {
+            const updated = window.UpdateTerminal($value)
+            match updated {
+                Ok: {}
+                Err(error): {
+                    discard error
+                    state.status = "Terminal output could not be displayed."
+                }
+            }
+        }
         TerminalFailed(message): {
             state.terminalOpen = false
+            state.terminalOpening = false
             state.status = message
         }
         FilesLoaded(value): {
@@ -185,6 +222,7 @@ fn applyUIEvent(&window ui.Window, &state uiState, $event uiEvent) void {
         FileOperation(message): { state.status = message }
         DesktopOpened: {
             state.desktopOpen = true
+            state.desktopOpening = false
             state.status = "Desktop channel open."
         }
         DesktopFrame(value): {
@@ -199,25 +237,11 @@ fn applyUIEvent(&window ui.Window, &state uiState, $event uiEvent) void {
         DesktopFailed(message): {
             window.ReleaseDesktopControl()
             state.desktopOpen = false
+            state.desktopOpening = false
             state.desktopFrame = false
             state.status = message
         }
     }
-}
-
-fn appendTerminalOutput(&state uiState, value String) void {
-    const combined = state.terminalOutput + value
-    const length = text.ByteLen(combined)
-    if length <= 262144 {
-        state.terminalOutput = combined
-        return
-    }
-    const trimmed = text.Slice(combined, length - 196608, length) else error {
-        discard error
-        state.terminalOutput = text.Copy(value)
-        return
-    }
-    state.terminalOutput = trimmed
 }
 
 fn isPage(value uiPage, expected uiPage) bool {

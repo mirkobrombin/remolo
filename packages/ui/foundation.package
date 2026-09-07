@@ -6,6 +6,7 @@ fcs standard
 source src
 test_source tests
 native_source native/ui.c
+native_source native/terminal_emulator.c
 native_link SDL3
 native_link m target linux
 native_link pthread target linux

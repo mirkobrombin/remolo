@@ -31,38 +31,42 @@ task runUILoop() Result<i32, failure> {
             discard $stopping.wait()
             return .Err(failed("the native interface stopped"))
         }
+        var dirty = false
         match frame {
             Closing: { running = false }
-            Active: {
-                select {
-                    const received = eventReceiver.receive(): {
-                        applyUIEvent(&window, &state, $received)
-                    }
-                    timeout 16.milliseconds: {}
-                    else error: { discard error }
-                }
-                const rendered = renderUI(
-                    &window,
-                    &state,
-                    workers,
-                    eventSender.clone()
-                )
-                match rendered {
-                    Ok: {
-                        const ended = window.EndFrame()
-                        match ended {
-                            Ok: {}
-                            Err(error): {
-                                discard error
-                                running = false
-                            }
-                        }
-                    }
+            Active: { dirty = true }
+            Idle: {}
+        }
+        if !running continue
+        select {
+            const received = eventReceiver.receive(): {
+                applyUIEvent(&window, &state, workers, $received)
+                dirty = true
+            }
+            timeout 16.milliseconds: {}
+            else error: { discard error }
+        }
+        if !dirty continue
+        const rendered = renderUI(
+            &window,
+            &state,
+            workers,
+            eventSender.clone()
+        )
+        match rendered {
+            Ok: {
+                const ended = window.EndFrame()
+                match ended {
+                    Ok: {}
                     Err(error): {
                         discard error
                         running = false
                     }
                 }
+            }
+            Err(error): {
+                discard error
+                running = false
             }
         }
     }
